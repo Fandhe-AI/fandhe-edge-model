@@ -1,5 +1,5 @@
-//! `infer` の時間・RSS の安全上限を子プロセス境界で強制する監督層（REQ-39・TASK-39.5-3・#577。
-//! 親 issue #576 の二層化のうち「安全上限」側）。
+//! `infer`・`evaluate` の時間・RSS の安全上限を子プロセス境界で強制する監督層（REQ-39・TASK-39.5-3・#577。
+//! 親 issue #576 の二層化のうち「安全上限」側。`evaluate` は追加学習の GiB 級 shard を読むため、#662 で対象に加えた）。
 //!
 //! # 役割と呼び出し文脈
 //!
@@ -41,13 +41,15 @@
 //!   worker のガード検査と協調的な期限は実際の `kind` で効く
 //! - `kind` を読めない・許可外のときは厳しい上限（10 秒・2 GiB）に落とす（本来のエラーは worker が出す）
 
-use crate::args::{InferArgs, InferSource};
+use crate::args::{EvaluateArgs, InferArgs, InferSource};
 use crate::error_report::default_message;
 use crate::infer_batch::{
     MAX_INFER_BATCH_OUTPUT_DURATION, OutputWatchdog, SINGLE_HARD_LIMIT_GRACE,
 };
 use crate::infer_guard::peek_checked_kind;
 use crate::output::write_error_report;
+use crate::project::Project;
+use crate::stages::train::load_trained;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_guard::resource::{
     DEFAULT_STDERR_CAP, GuardRunError, GuardedCommand, GuardedRunOutcome, MAX_OUTPUT_CAP,
@@ -68,7 +70,7 @@ pub const WORKER_ENV: &str = "FANDHE_EDGE_INFER_WORKER";
 // ponytail: 暫定 2 秒。種類ごとの時間上限（#578・#435）に上乗せする固定値で、大きいパッケージの起動が長引くなら見直す。
 pub const SUPERVISOR_GRACE: Duration = Duration::from_secs(2);
 
-/// 現在のプロセスが worker か。
+/// 現在のプロセスが worker か（`infer`・`evaluate` 共通）。
 #[must_use]
 pub fn is_worker() -> bool {
     std::env::var_os(WORKER_ENV).is_some_and(|v| v == "1")
@@ -91,12 +93,55 @@ pub fn supervisor_config(
             MAX_INFER_BATCH_DURATION.saturating_add(MAX_INFER_BATCH_OUTPUT_DURATION)
         }
     };
+    config_with(inner, limits)
+}
+
+/// `evaluate` の監督設定（REQ-39・REQ-41・#662。RSS は `limits.memory()`）。
+///
+/// 親の時間上限は `2 × limits.time() + 2 × MAX_INFER_BATCH_DURATION + SUPERVISOR_GRACE`。内訳:
+/// - `2 × limits.time()`: パイプライン構築が 2 回ある（適用権を取る前の試し組み立てと、取得後の再構築。
+///   どちらも `infer` の 1 件上限と同じく「読み込み込み」の上限を 1 回ぶんずつ見込む）
+/// - `2 × MAX_INFER_BATCH_DURATION`: 1 件ずつの推論の期限が 2 回ある（validation の校正と、凍結 test への適用）
+///
+/// `--previous-project-dir`・`--seed-run-project` は保存済みの記録を読むだけで推論しないので数えない。
+/// 値は種類が 10 秒の既存 3 種で 1222 秒、追加学習（60 秒）で 1322 秒（どちらも `MAX_TIME_LIMIT` 3600 秒以内）。
+///
+/// # Errors
+/// 上限が範囲外（定数から作るため通常は起きない）。
+pub fn evaluate_config(limits: SafetyLimits) -> Result<RunConfig, ResourceConfigError> {
+    let inner = limits
+        .time()
+        .get()
+        .saturating_mul(2)
+        .saturating_add(MAX_INFER_BATCH_DURATION.saturating_mul(2));
+    config_with(inner, limits)
+}
+
+fn config_with(inner: Duration, limits: SafetyLimits) -> Result<RunConfig, ResourceConfigError> {
     RunConfig::new(
         TimeLimit::new(inner.saturating_add(SUPERVISOR_GRACE))?,
         MAX_OUTPUT_CAP,
         DEFAULT_STDERR_CAP,
     )
     .map(|c| c.with_memory_limit(limits.memory()))
+}
+
+/// 監督する処理の種類（上限超過・監督失敗の message の語彙を分ける。固定語彙）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Workload {
+    /// `infer`。
+    Inference,
+    /// `evaluate`（REQ-39・#662）。
+    Evaluation,
+}
+
+impl Workload {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Inference => "inference",
+            Self::Evaluation => "evaluation",
+        }
+    }
 }
 
 fn runtime_error() -> ErrorReport {
@@ -106,19 +151,22 @@ fn runtime_error() -> ErrorReport {
     )
 }
 
-fn supervisor_failed(e: GuardRunError) -> ErrorReport {
+fn supervisor_failed(w: Workload, e: GuardRunError) -> ErrorReport {
     ErrorReport::new(
         ExitCode::RuntimeError,
-        format!("inference supervisor failed: {}", e.code()),
+        format!("{} supervisor failed: {}", w.noun(), e.code()),
     )
 }
 
-fn limit_report(e: &ResourceLimitExceeded) -> ErrorReport {
-    let message = match e.kind() {
-        ResourceKind::Memory => "inference memory limit exceeded",
-        _ => "inference time limit exceeded",
+fn limit_report(w: Workload, e: &ResourceLimitExceeded) -> ErrorReport {
+    let what = match e.kind() {
+        ResourceKind::Memory => "memory",
+        _ => "time",
     };
-    ErrorReport::new(ExitCode::LimitExceeded, message)
+    ErrorReport::new(
+        ExitCode::LimitExceeded,
+        format!("{} {what} limit exceeded", w.noun()),
+    )
 }
 
 /// `infer` を worker として起動し、時間・RSS を監視して結果を `out` へ中継する。
@@ -133,7 +181,60 @@ pub fn run<W: Write>(
 ) -> io::Result<ExitCode> {
     let limits = peek_checked_kind(cwd, &args.package)
         .map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(k.as_str()));
-    let prepared = supervisor_config(&args.source, limits)
+    launch(
+        out,
+        Workload::Inference,
+        supervisor_config(&args.source, limits),
+        raw_args,
+        cwd,
+    )
+}
+
+/// `evaluate` を worker として起動し、時間・RSS を監視して結果を `out` へ中継する（REQ-39・REQ-41・#662）。
+///
+/// RSS・時間の上限は候補の `kind`（`result.json` の再検証済みリクエストから読む）で選ぶ。読めない・
+/// 許可外なら厳しい上限に落とし、本来のエラーは worker が出す（`infer` と同じ扱い）。
+///
+/// worker が kill されたとき、最終 test の台帳に適用ロックが残っていれば完了記録（`done-*.lock`）が無く
+/// 評価は未成功のまま。再評価は `AlreadyApplied` で拒否され、`package` も配布を許さない（既存の
+/// 適用権消費後の失敗と同じ fail-closed）。私用のステージング（`$TMPDIR/fandhe-edge-eval-*`）は
+/// best effort の Drop 頼みなので kill では残りうる（0700。評価データと ONNX の複製を含む）。
+///
+/// # Errors
+/// `out` への書き込み失敗（呼び出し側は exit 70 に写す）。
+pub fn run_evaluate<W: Write>(
+    out: &mut W,
+    args: &EvaluateArgs,
+    raw_args: impl IntoIterator<Item = OsString>,
+    cwd: &Path,
+) -> io::Result<ExitCode> {
+    let limits =
+        peek_evaluate_kind(cwd, args).map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(&k));
+    launch(
+        out,
+        Workload::Evaluation,
+        evaluate_config(limits),
+        raw_args,
+        cwd,
+    )
+}
+
+/// 親が種類別の上限を選ぶために、対象候補の `kind` だけを読む（失敗は `None`）。
+fn peek_evaluate_kind(cwd: &Path, args: &EvaluateArgs) -> Option<String> {
+    let project = Project::open(cwd, &args.project_dir).ok()?;
+    let (request, _) = load_trained(&project, args.candidate).ok()??;
+    Some(request.kind().to_string())
+}
+
+/// 自分自身を worker として起動し、`config` で監視して中継する。
+fn launch<W: Write>(
+    out: &mut W,
+    workload: Workload,
+    config: Result<RunConfig, ResourceConfigError>,
+    raw_args: impl IntoIterator<Item = OsString>,
+    cwd: &Path,
+) -> io::Result<ExitCode> {
+    let prepared = config
         .map_err(|_| GuardRunError::InvalidConfig)
         .and_then(|config| {
             let exe = std::env::current_exe().map_err(|_| GuardRunError::Spawn)?;
@@ -146,8 +247,10 @@ pub fn run<W: Write>(
             Ok((cmd, config))
         });
     match prepared {
-        Ok((cmd, config)) => run_supervised(out, &mut io::stderr().lock(), &cmd, &config),
-        Err(e) => write_error_report(out, &supervisor_failed(e)),
+        Ok((cmd, config)) => {
+            run_supervised_as(workload, out, &mut io::stderr().lock(), &cmd, &config)
+        }
+        Err(e) => write_error_report(out, &supervisor_failed(workload, e)),
     }
 }
 
@@ -156,6 +259,20 @@ pub fn run<W: Write>(
 /// # Errors
 /// `out` への書き込み失敗。
 pub fn run_supervised<W: Write, E: Write>(
+    out: &mut W,
+    err: &mut E,
+    cmd: &GuardedCommand,
+    config: &RunConfig,
+) -> io::Result<ExitCode> {
+    run_supervised_as(Workload::Inference, out, err, cmd, config)
+}
+
+/// [`run_supervised`] の処理種別つき（上限超過・監督失敗の message の語彙だけが変わる）。
+///
+/// # Errors
+/// `out` への書き込み失敗。
+pub fn run_supervised_as<W: Write, E: Write>(
+    workload: Workload,
     out: &mut W,
     err: &mut E,
     cmd: &GuardedCommand,
@@ -175,9 +292,11 @@ pub fn run_supervised<W: Write, E: Write>(
                 output.stdout_truncated(),
             )
         }
-        Ok(GuardedRunOutcome::LimitExceeded(e)) => write_error_report(out, &limit_report(&e)),
+        Ok(GuardedRunOutcome::LimitExceeded(e)) => {
+            write_error_report(out, &limit_report(workload, &e))
+        }
         Ok(_) => write_error_report(out, &runtime_error()),
-        Err(e) => write_error_report(out, &supervisor_failed(e)),
+        Err(e) => write_error_report(out, &supervisor_failed(workload, e)),
     }
 }
 
@@ -256,6 +375,55 @@ mod tests {
         assert_eq!(f.memory_limit(), Some(25_769_803_776));
     }
 
+    /// REQ-39・REQ-41・#662: `evaluate` の親の時間は `2 × limits.time() + 2 × 600 秒 + 2 秒`。
+    /// 既存 3 種と未知の種類は 1222 秒・2 GiB、追加学習は 1322 秒・24 GiB。
+    #[test]
+    fn req39_evaluate_config_is_1222_seconds_for_byte_kinds_and_1322_for_qwen2_lora() {
+        for kind in ["c1", "c3", "autoregressive", "unknown"] {
+            let c = evaluate_config(safety_limits_for_kind(kind)).unwrap();
+            assert_eq!(c.time_limit(), Duration::from_secs(1222));
+            assert_eq!(c.memory_limit(), Some(2_147_483_648));
+        }
+        let c = evaluate_config(safety_limits_for_kind("qwen2_lora")).unwrap();
+        assert_eq!(c.time_limit(), Duration::from_secs(1322));
+        assert_eq!(c.memory_limit(), Some(25_769_803_776));
+        // kind を読めなかったときの厳しい側は byte kind と同じ値になる。
+        let s = evaluate_config(SafetyLimits::STRICT).unwrap();
+        assert_eq!(s.time_limit(), Duration::from_secs(1222));
+        assert_eq!(s.memory_limit(), Some(2_147_483_648));
+    }
+
+    /// REQ-39・#662: `evaluate` の上限超過・監督失敗の message は `evaluation` の固定語彙。
+    #[test]
+    fn req39_evaluate_messages_use_evaluation_vocabulary() {
+        let t = limit_report(
+            Workload::Evaluation,
+            &ResourceLimitExceeded::time(Duration::from_secs(1), Duration::from_secs(2), true),
+        );
+        assert_eq!(t.code, ExitCode::LimitExceeded);
+        assert_eq!(t.message, "evaluation time limit exceeded");
+        let m = limit_report(
+            Workload::Evaluation,
+            &ResourceLimitExceeded::memory(
+                Duration::from_secs(1),
+                1,
+                2,
+                Duration::from_secs(1),
+                true,
+            ),
+        );
+        assert_eq!(m.message, "evaluation memory limit exceeded");
+        let f = supervisor_failed(Workload::Evaluation, GuardRunError::Spawn);
+        assert_eq!(f.code, ExitCode::RuntimeError);
+        assert_eq!(
+            f.message,
+            format!(
+                "evaluation supervisor failed: {}",
+                GuardRunError::Spawn.code()
+            )
+        );
+    }
+
     #[test]
     fn req39_relay_passes_through_every_exit_code_bytes_unchanged() {
         for c in ExitCode::ALL {
@@ -290,20 +458,22 @@ mod tests {
 
     #[test]
     fn req39_limit_report_distinguishes_time_and_memory() {
-        let t = limit_report(&ResourceLimitExceeded::time(
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-            true,
-        ));
+        let t = limit_report(
+            Workload::Inference,
+            &ResourceLimitExceeded::time(Duration::from_secs(1), Duration::from_secs(2), true),
+        );
         assert_eq!(t.code, ExitCode::LimitExceeded);
         assert_eq!(t.message, "inference time limit exceeded");
-        let m = limit_report(&ResourceLimitExceeded::memory(
-            Duration::from_secs(1),
-            1,
-            2,
-            Duration::from_secs(1),
-            true,
-        ));
+        let m = limit_report(
+            Workload::Inference,
+            &ResourceLimitExceeded::memory(
+                Duration::from_secs(1),
+                1,
+                2,
+                Duration::from_secs(1),
+                true,
+            ),
+        );
         assert_eq!(m.code, ExitCode::LimitExceeded);
         assert_eq!(m.message, "inference memory limit exceeded");
     }
@@ -315,7 +485,7 @@ mod tests {
             GuardRunError::Spawn,
             GuardRunError::MemoryProbe,
         ] {
-            let r = supervisor_failed(e);
+            let r = supervisor_failed(Workload::Inference, e);
             assert_eq!(r.code, ExitCode::RuntimeError);
             assert_eq!(
                 r.message,
