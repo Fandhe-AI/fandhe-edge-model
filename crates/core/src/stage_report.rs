@@ -990,6 +990,7 @@ enum RebuildReasonReport {
         new: JudgmentType,
     },
     BaseModelChanged,
+    InstructionChanged,
 }
 
 /// `register --previous-project-dir` の作り直し判定（`RegisterReport` の `rebuild` 欄。
@@ -1051,6 +1052,9 @@ impl RebuildReport {
                             }
                         }
                         RebuildReason::BaseModelChanged => RebuildReasonReport::BaseModelChanged,
+                        RebuildReason::InstructionChanged => {
+                            RebuildReasonReport::InstructionChanged
+                        }
                     })
                     .collect(),
                 BTreeSet::new(),
@@ -2230,6 +2234,7 @@ mod tests {
                     new: JudgmentType::TestOnlyAlternate,
                 },
                 RebuildReason::BaseModelChanged,
+                RebuildReason::InstructionChanged,
             ])
             .expect("non-empty"),
         );
@@ -2239,7 +2244,7 @@ mod tests {
                 .to_json_line()
                 .expect("json"),
             format!(
-                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{}\",\"options\":3,\"evaluation_defined\":true,\"rebuild\":{{\"decision\":\"required\",\"previous_definition_sha256\":\"{}\",\"reasons\":[{{\"kind\":\"option_ids_changed\",\"added\":[\"b\",\"d\"],\"removed\":[\"c\"]}},{{\"kind\":\"judgment_type_changed\",\"old\":\"single_select\",\"new\":\"test_only_alternate\"}},{{\"kind\":\"base_model_changed\"}}],\"display_name_changed\":[],\"description_changed\":[],\"training_data_changed\":true,\"evaluation_data_changed\":null}}}}",
+                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{}\",\"options\":3,\"evaluation_defined\":true,\"rebuild\":{{\"decision\":\"required\",\"previous_definition_sha256\":\"{}\",\"reasons\":[{{\"kind\":\"option_ids_changed\",\"added\":[\"b\",\"d\"],\"removed\":[\"c\"]}},{{\"kind\":\"judgment_type_changed\",\"old\":\"single_select\",\"new\":\"test_only_alternate\"}},{{\"kind\":\"base_model_changed\"}},{{\"kind\":\"instruction_changed\"}}],\"display_name_changed\":[],\"description_changed\":[],\"training_data_changed\":true,\"evaluation_data_changed\":null}}}}",
                 "ab".repeat(32),
                 "cd".repeat(32)
             )

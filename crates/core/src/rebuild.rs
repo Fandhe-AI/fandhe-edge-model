@@ -236,6 +236,9 @@ pub enum RebuildReason {
     /// 片側だけ `base_model` を持つ場合を含む。`name`・`license`・`origin` だけの差は
     /// 重みが同一のため含めない。#667・REQ-20・REQ-41）。
     BaseModelChanged,
+    /// `instruction`（qwen2_lora の system プロンプトの説明）の追加・削除・内容の変更
+    /// （#670・REQ-20・REQ-41）。学習結果とパッケージの採点グラフが変わるため。
+    InstructionChanged,
 }
 
 /// 新旧定義を比較し、作り直しの要否を判定する
@@ -366,7 +369,7 @@ fn compare_definitions(old: &Definition, new: &Definition) -> RebuildDecision {
 }
 
 /// 新旧の同一性を比較し、作り直しが必要になる理由を集める（内部実装）。
-/// 理由の並びは OptionIds → JudgmentType → BaseModel の固定順にし、結果を決定的にする。
+/// 理由の並びは OptionIds → JudgmentType → BaseModel → Instruction の固定順にし、結果を決定的にする。
 fn classify_change(old_def: &Definition, new_def: &Definition) -> Vec<RebuildReason> {
     let (old, new) = (&old_def.identity(), &new_def.identity());
     let mut reasons = Vec::new();
@@ -389,6 +392,10 @@ fn classify_change(old_def: &Definition, new_def: &Definition) -> Vec<RebuildRea
     // 比較のキーは重みの実体（sha256 表）。name 等の表記差では作り直さない（#667）。
     if old_def.base_model().map(|b| b.sha256()) != new_def.base_model().map(|b| b.sha256()) {
         reasons.push(RebuildReason::BaseModelChanged);
+    }
+
+    if old_def.instruction() != new_def.instruction() {
+        reasons.push(RebuildReason::InstructionChanged);
     }
 
     reasons
@@ -1162,5 +1169,39 @@ mod tests {
     fn req20_issue667_without_base_model_decision_unchanged() {
         let d = decide_rebuild(&definition_a(), &definition_a()).expect("失敗しないはず");
         assert!(matches!(d, RebuildDecision::Unchanged { .. }), "{d:?}");
+    }
+
+    fn with_instruction(text: Option<&str>) -> Definition {
+        let extra = text.map_or(String::new(), |t| format!(r#", "instruction": "{t}""#));
+        let json = DEFINITION_A_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(r#""io": {{ "input": "bytes" }}{extra}"#),
+            1,
+        );
+        Definition::parse(&json).expect("valid なはず")
+    }
+
+    /// REQ-20・#670: instruction の追加・削除・内容変更はいずれも `Required([InstructionChanged])`。
+    #[test]
+    fn req20_issue670_instruction_change_requires_rebuild() {
+        for (old, new) in [(None, Some("a")), (Some("a"), None), (Some("a"), Some("b"))] {
+            match decide_rebuild(&with_instruction(old), &with_instruction(new))
+                .expect("失敗しないはず")
+            {
+                RebuildDecision::Required(r) => {
+                    assert_eq!(r.reasons(), &[RebuildReason::InstructionChanged]);
+                }
+                other => panic!("Required を期待したが {other:?} だった"),
+            }
+        }
+    }
+
+    /// REQ-20・#670: instruction が同じなら判定は変わらない（`Unchanged`）。
+    #[test]
+    fn req20_issue670_same_instruction_is_unchanged() {
+        for t in [None, Some("a")] {
+            let d = decide_rebuild(&with_instruction(t), &with_instruction(t)).expect("ok");
+            assert!(matches!(d, RebuildDecision::Unchanged { .. }), "{d:?}");
+        }
     }
 }
