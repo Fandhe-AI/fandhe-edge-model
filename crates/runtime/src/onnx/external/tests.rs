@@ -485,3 +485,74 @@ fn req32_sink_bulk_convert_timing_635() {
         eprintln!("per-element {name} 256MiB: {:?}", t.elapsed());
     }
 }
+
+/// 3 shard（各 1 つの f32 テンソル）と、そのグラフ。
+fn three_shards(d: &Dir) -> (GraphProto, Vec<ExternalShard>) {
+    let inits = [
+        ext_tensor("a", &[2], 1, "a.bin", 0, 8),
+        ext_tensor("b", &[2], 1, "b.bin", 0, 8),
+        ext_tensor("c", &[2], 1, "c.bin", 0, 8),
+    ];
+    let g = decode(&inits, &FT).unwrap();
+    let s = vec![
+        d.shard("a.bin", &f32s(&[1.0, 2.0])),
+        d.shard("b.bin", &f32s(&[3.0, 4.0])),
+        d.shard("c.bin", &f32s(&[5.0, 6.0])),
+    ];
+    (g, s)
+}
+
+#[test]
+fn req39_parallel_third_shard_sha256_mismatch_is_integrity_mismatch_675() {
+    let d = Dir::new();
+    let (mut g, mut s) = three_shards(&d);
+    s[2].sha256 = Sha256Digest::of_bytes(b"other");
+    assert_eq!(
+        code(resolve_external_with(&mut g, s, &lim(), 3)),
+        "integrity_mismatch"
+    );
+}
+
+#[test]
+fn req39_parallel_returns_youngest_shard_error_675() {
+    // 1 つ目は sha256 不一致、3 つ目は読み取り失敗（別のエラー）。若い番号のエラーが返る
+    for threads in [1, 3] {
+        let d = Dir::new();
+        let (mut g, mut s) = three_shards(&d);
+        s[0].sha256 = Sha256Digest::of_bytes(b"other");
+        // 3 つ目: 書き込み専用で開き直し、read を失敗させる
+        let p = d.0.join("c.bin");
+        s[2].file = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        let e = resolve_external_with(&mut g, s, &lim(), threads).unwrap_err();
+        assert_eq!(e.code(), "integrity_mismatch", "threads={threads}");
+    }
+}
+
+#[test]
+fn req28_req32_parallel_load_matches_serial_675() {
+    let load = |threads: usize| {
+        let d = Dir::new();
+        let a = f32s(&[1.5, -2.0, 3.25]);
+        let b = [0x80u8, 0x3f, 0x00, 0x40, 0x40, 0xc0].to_vec();
+        let c = (-7i64).to_le_bytes().to_vec();
+        let inits = [
+            ext_tensor("f", &[3], 1, "a.bin", 0, 12),
+            ext_tensor("h", &[3], 16, "b.bin", 0, 6),
+            ext_tensor("i", &[1], 7, "c.bin", 0, 8),
+        ];
+        let mut g = decode(&inits, &FT).unwrap();
+        let s = vec![
+            d.shard("a.bin", &a),
+            d.shard("b.bin", &b),
+            d.shard("c.bin", &c),
+        ];
+        resolve_external_with(&mut g, s, &lim(), threads).unwrap();
+        g.initializers
+            .iter()
+            .map(|t| format!("{:?}", t.data))
+            .collect::<Vec<_>>()
+    };
+    let (one, three) = (load(1), load(3));
+    assert_eq!(one, three);
+    assert!(one[0].contains("1.5") && one[1].contains("16256") && one[2].contains("-7"));
+}

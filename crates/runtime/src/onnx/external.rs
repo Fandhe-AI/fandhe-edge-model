@@ -17,7 +17,8 @@
 //!   不一致なら復号済みの値をすべて捨てる（fail-closed）。ONNX 内の `checksum` は信用しない
 //! - 資源: 件数・shard ごとの fstat サイズ・合計を、1 バイトも読む前に上限と照合する。
 //!   参照範囲の重なりを拒否し（同じ領域を何度も参照させて確保量を増幅させない）、確保は
-//!   `try_reserve_exact`。shard は固定長バッファで 1 回だけ流し読みし、生バイトの全量を保持しない
+//!   `try_reserve_exact`。shard は固定長バッファで 1 回だけ流し読みし、生バイトの全量を保持しない。
+//!   shard 単位で並列に読む（#675）。確保は読む前に済んでおり、並列で増えるのはスレッドごとのバッファだけ
 //! - 保持形式: bf16 は `u16` のまま保持する（f32 へ全量展開すると1.5B で約 6.2 GB〔推定〕となり、
 //!   当時の RSS 安全上限 8 GiB に近かった。#581。現行の上限は 24 GiB〔#654〕）。f32 への展開は Gemm・Gather のカーネル内（#416・#417）。RSS の実測は #421・#435
 
@@ -166,12 +167,146 @@ fn read_err(location: &str, source: std::io::Error) -> OnnxLoadError {
     })
 }
 
+/// shard 1 つ分の仕事（番号・shard・fstat サイズ・復号先の組）。
+type Job<'a> = (usize, &'a ExternalShard, u64, &'a mut Vec<(u64, u64, Sink)>);
+
+/// 全 shard を `threads` 本（shard 数が上限）で読む。shard i は worker i % threads が担当する。
+/// 早期打ち切りはせず全 shard を読み切り、最も若い番号の shard のエラーを返す（どのエラーが返るかを
+/// 実行ごとに揺らさない）。spawn した worker が 1 つでも panic したら、その worker の残りの job は
+/// 実行されず通常エラーの有無が割り当てで揺れるため、ほかのエラーより優先して `LimitExceeded` を返す
+/// （fail-closed。スレッドの生成に失敗したときも同じ）。呼び出しスレッド側の panic は直列版と同じくそのまま伝わる。
+fn stream_shards(
+    shards: &[ExternalShard],
+    sizes: &[u64],
+    groups: &mut [Vec<(u64, u64, Sink)>],
+    threads: usize,
+) -> Result<(), OnnxLoadError> {
+    let threads = threads.min(shards.len()).max(1);
+    let mut buckets: Vec<Vec<Job>> = (0..threads).map(|_| Vec::new()).collect();
+    for (i, (shard, parts)) in shards.iter().zip(groups.iter_mut()).enumerate() {
+        let size = sizes.get(i).copied().unwrap_or(0);
+        if let Some(b) = buckets.get_mut(i % threads) {
+            b.push((i, shard, size, parts));
+        }
+    }
+    let mut errs: Vec<(usize, OnnxLoadError)> = Vec::new();
+    let mut panicked = false;
+    std::thread::scope(|sc| {
+        let mut rest = buckets.into_iter();
+        let own = rest.next().unwrap_or_default();
+        let mut handles = Vec::new();
+        for bucket in rest {
+            // 生成に失敗した bucket は読まれないため、panic と同じく fail-closed にする
+            match std::thread::Builder::new().spawn_scoped(sc, move || run_jobs(bucket)) {
+                Ok(h) => handles.push(h),
+                Err(_) => panicked = true,
+            }
+        }
+        errs.extend(run_jobs(own));
+        // 短絡せず全件 join する
+        for h in handles {
+            match h.join() {
+                Ok(e) => errs.extend(e),
+                Err(_) => panicked = true,
+            }
+        }
+    });
+    if panicked {
+        return Err(OnnxLoadError::LimitExceeded);
+    }
+    match errs.into_iter().min_by_key(|(i, _)| *i) {
+        Some((_, e)) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// bucket の job を順に流し読みし、失敗した shard の（番号, エラー）を集めて返す。
+fn run_jobs(jobs: Vec<Job>) -> Vec<(usize, OnnxLoadError)> {
+    jobs.into_iter()
+        .filter_map(|(i, shard, size, parts)| {
+            stream_shard(shard, size, parts).err().map(|e| (i, e))
+        })
+        .collect()
+}
+
+/// shard 1 つを先頭から 1 回だけ流し読みし、sha256 を計算しながら `parts`（範囲順・重ならない）へ
+/// 復号して配る。サイズ超過・sha256 不一致は完全性の違反として返す（REQ-39）。
+fn stream_shard(
+    shard: &ExternalShard,
+    size: u64,
+    parts: &mut [(u64, u64, Sink)],
+) -> Result<(), OnnxLoadError> {
+    let mut file = &shard.file;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| read_err(&shard.location, e))?;
+    let mut mine = parts.iter_mut().peekable();
+    let mut hasher = Sha256Stream::new();
+    let mut buf = [0u8; BUF_BYTES];
+    let mut pos: u64 = 0;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| read_err(&shard.location, e))?;
+        if n == 0 {
+            break;
+        }
+        let chunk = buf.get(..n).ok_or(OnnxLoadError::UnsupportedTensor)?;
+        let next_pos = pos.saturating_add(n as u64);
+        // fstat 後に伸びたファイルは拒否（時間・メモリの上限を守る）
+        if next_pos > size {
+            return Err(OnnxLoadError::File(FsError::TooLarge {
+                path: PathBuf::from(&shard.location),
+                size: next_pos,
+                limit: size,
+            }));
+        }
+        hasher.update(chunk);
+        // このチャンクと重なる参照へ配る
+        while let Some((off, len, sink)) = mine.peek_mut() {
+            let (off, end) = (*off, *off + *len);
+            if off >= next_pos {
+                break;
+            }
+            let lo = off.max(pos) - pos;
+            let hi = end.min(next_pos) - pos;
+            if lo < hi {
+                // lo・hi は 64 KiB 以下（チャンク内の位置）
+                if let Some(part) = chunk.get(lo as usize..hi as usize) {
+                    sink.push(part);
+                }
+            }
+            if end <= next_pos {
+                mine.next();
+            } else {
+                break;
+            }
+        }
+        pos = next_pos;
+    }
+    // 縮んだ・差し替えられた場合も含め、完全性の違反として扱う
+    if pos != size || hasher.finish() != shard.sha256 {
+        return Err(OnnxLoadError::IntegrityMismatch);
+    }
+    Ok(())
+}
+
 /// グラフの `External` を、閉じ込め済みの shard から読んだ値へ置き換える。成功時、`External` は
 /// 1 つも残らない。失敗時は `graph` の中身を信用してはならない（呼び出し側は捨てる）。
 pub(super) fn resolve_external(
     graph: &mut GraphProto,
     shards: Vec<ExternalShard>,
     limits: &ExternalDataLimits,
+) -> Result<(), OnnxLoadError> {
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    resolve_external_with(graph, shards, limits, threads)
+}
+
+/// [`resolve_external`] の本体。読み込みスレッド数を引数に取る（テストで 1 と複数を比べるため）。
+fn resolve_external_with(
+    graph: &mut GraphProto,
+    shards: Vec<ExternalShard>,
+    limits: &ExternalDataLimits,
+    threads: usize,
 ) -> Result<(), OnnxLoadError> {
     // 1. 件数
     if shards.len() > limits.max_shards {
@@ -249,60 +384,31 @@ pub(super) fn resolve_external(
             *slot = Some(Sink::new(e)?);
         }
     }
-    // 7・8. shard ごとに 1 回だけ流し読みし、読みながらハッシュ・復号する
-    for (si, shard) in shards.iter().enumerate() {
-        let size = sizes.get(si).copied().unwrap_or(0);
-        let mut file = &shard.file;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| read_err(&shard.location, e))?;
-        let mut mine = refs.iter().filter(|r| r.0 == si).peekable();
-        let mut hasher = Sha256Stream::new();
-        let mut buf = [0u8; BUF_BYTES];
-        let mut pos: u64 = 0;
-        loop {
-            let n = file
-                .read(&mut buf)
-                .map_err(|e| read_err(&shard.location, e))?;
-            if n == 0 {
-                break;
+    // 7・8. shard ごとに 1 回だけ流し読みし、読みながらハッシュ・復号する（shard 単位で並列。#675）。
+    // refs は (shard, offset) 順なので、sinks から取り出した組も shard 内で範囲順に並ぶ
+    let mut groups: Vec<Vec<(u64, u64, Sink)>> = shards.iter().map(|_| Vec::new()).collect();
+    let mut group_tis: Vec<Vec<usize>> = shards.iter().map(|_| Vec::new()).collect();
+    for &(si, off, len, ti) in &refs {
+        let sink = sinks
+            .get_mut(ti)
+            .and_then(Option::take)
+            .ok_or(OnnxLoadError::UnsupportedTensor)?;
+        groups
+            .get_mut(si)
+            .ok_or(OnnxLoadError::UnsupportedTensor)?
+            .push((off, len, sink));
+        group_tis
+            .get_mut(si)
+            .ok_or(OnnxLoadError::UnsupportedTensor)?
+            .push(ti);
+    }
+    stream_shards(&shards, &sizes, &mut groups, threads)?;
+    // 全 shard が通ったので、Sink を元の initializer 位置へ戻す
+    for (parts, tis) in groups.into_iter().zip(group_tis) {
+        for ((_, _, sink), ti) in parts.into_iter().zip(tis) {
+            if let Some(slot) = sinks.get_mut(ti) {
+                *slot = Some(sink);
             }
-            let chunk = buf.get(..n).ok_or(OnnxLoadError::UnsupportedTensor)?;
-            let next_pos = pos.saturating_add(n as u64);
-            // fstat 後に伸びたファイルは拒否（時間・メモリの上限を守る）
-            if next_pos > size {
-                return Err(OnnxLoadError::File(FsError::TooLarge {
-                    path: PathBuf::from(&shard.location),
-                    size: next_pos,
-                    limit: size,
-                }));
-            }
-            hasher.update(chunk);
-            // このチャンクと重なる参照へ配る（refs は範囲順で重ならない）
-            while let Some(&&(_, off, len, ti)) = mine.peek() {
-                let end = off + len;
-                if off >= next_pos {
-                    break;
-                }
-                let lo = off.max(pos) - pos;
-                let hi = end.min(next_pos) - pos;
-                if lo < hi {
-                    // lo・hi は 64 KiB 以下（チャンク内の位置）
-                    let part = chunk.get(lo as usize..hi as usize);
-                    if let (Some(Some(sink)), Some(part)) = (sinks.get_mut(ti), part) {
-                        sink.push(part);
-                    }
-                }
-                if end <= next_pos {
-                    mine.next();
-                } else {
-                    break;
-                }
-            }
-            pos = next_pos;
-        }
-        // 縮んだ・差し替えられた場合も含め、完全性の違反として扱う
-        if pos != size || hasher.finish() != shard.sha256 {
-            return Err(OnnxLoadError::IntegrityMismatch);
         }
     }
     // 9. 置き換え（全 shard が通ってから）
