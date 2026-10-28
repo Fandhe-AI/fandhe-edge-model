@@ -24,8 +24,8 @@
 //!   名前・経路・サイズ（64 KiB。学習ワーカーの `MAX_BASE_MODEL_CONFIG_BYTES` と同値）だけを確かめてストリームで
 //!   ハッシュする。重み・`tokenizer.json` は [`open_base_model_file`] の検査を通したバイト列をハッシュする
 //!
-//! ponytail: 形式判定のため上限（重み 5 GiB・他 1 GiB）までメモリへ読み切る（`check_open_file` の方式）。
-//! RSS が問題になれば safetensors はヘッダーだけの検査へ切り替える（#435）。
+//! 起動前照合の重み（safetensors）はヘッダーだけ検査して本体を固定長バッファでハッシュする（#672）。
+//! ponytail: `tokenizer.json` と [`open_base_model_file`] は上限（1 GiB・重み 5 GiB）までメモリへ読み切る。
 //! ハードリンクで外部ファイルを指すメンバーは経路では検出できない（必要なら `st_nlink > 1` を拒否）。
 
 use crate::file_size::{
@@ -42,13 +42,19 @@ use crate::package::ConfinedPackage;
 /// 上限緩和はオーナー判断 2026-10-27（上限の見直しを一任）・#665。
 pub const MAX_BASE_MODEL_FILE_BYTES: u64 = 5 << 30;
 
+use fandhe_edge_core::base_model_format::{check_safetensors_prefix, safetensors_header_end};
 use fandhe_edge_core::definition::BASE_MODEL_CONFIG_FILE;
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::hash::Sha256Stream;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read as _;
 use std::path::Path;
+
+/// ストリーム読み込みのバッファ長（1 MiB）。重みのサイズによらず RSS はこの長さ＋ヘッダー（最大 16 MiB）で頭打ち。
+const STREAM_BUFFER_BYTES: usize = 1 << 20;
 
 /// `config.json` の 1 ファイル上限（64 KiB。学習ワーカーの `MAX_BASE_MODEL_CONFIG_BYTES` と同値。#628）。
 pub const MAX_BASE_MODEL_CONFIG_BYTES: u64 = 64 * 1024;
@@ -182,13 +188,111 @@ pub fn verify_base_model_sha256(
         let got = if name == BASE_MODEL_CONFIG_FILE {
             sha256_config(dir, member)?
         } else {
-            Sha256Digest::of_bytes(open_base_model_file(dir, member)?.as_bytes())
+            sha256_streaming(dir, name)?
         };
         if &got != want {
             return Err(BaseModelFileRejection::Sha256Mismatch);
         }
     }
     Ok(())
+}
+
+/// 重み（safetensors）は先頭ヘッダーだけで形式を検査し、本体は固定長バッファで読みながらハッシュする
+/// （全体を保持しない。#672）。`tokenizer.json` は従来どおり [`open_base_model_file`] の検査を通す。
+/// 検査順序・拒否の終了コードは [`open_base_model_file`] と同じ（名前 → 経路 → サイズ → 形式）。
+fn sha256_streaming(
+    dir: &ConfinedPackage,
+    name: &str,
+) -> Result<Sha256Digest, BaseModelFileRejection> {
+    let member = Path::new(name);
+    let expected = expected_format(member).ok_or(BaseModelFileRejection::NameNotAllowed)?;
+    if expected != FileFormat::Safetensors {
+        return Ok(Sha256Digest::of_bytes(
+            open_base_model_file(dir, member)?.as_bytes(),
+        ));
+    }
+    let file = dir
+        .open_regular_member(member)
+        .map_err(|e| BaseModelFileRejection::Path {
+            exit_code: e.exit_code(),
+            reason_code: e.reason_code(),
+        })?;
+    let size = check_file_size_unclamped(&file, MAX_BASE_MODEL_FILE_BYTES)
+        .map_err(BaseModelFileRejection::Size)?;
+    sha256_safetensors_stream(file, size, MAX_BASE_MODEL_FILE_BYTES)
+}
+
+/// 形式の拒否（名前と内容の不一致等。`open_base_model_file` の `format_not_allowed` と同じ値）。
+fn not_allowed() -> BaseModelFileRejection {
+    BaseModelFileRejection::Format {
+        exit_code: ExitCode::InvalidInput,
+        reason_code: "format_not_allowed",
+    }
+}
+
+/// 読み取りの失敗を従来経路（`FormatRejection::Io`）と同じ分類にする。短すぎ（`UnexpectedEof`）は
+/// 形式の拒否、存在しない（`NotFound`）は 64、他の I/O エラーは 70。reason_code は `file_unreadable`。
+fn read_failed(e: &std::io::Error) -> BaseModelFileRejection {
+    match e.kind() {
+        std::io::ErrorKind::UnexpectedEof => not_allowed(),
+        kind => BaseModelFileRejection::Format {
+            exit_code: if kind == std::io::ErrorKind::NotFound {
+                ExitCode::InvalidInput
+            } else {
+                ExitCode::RuntimeError
+            },
+            reason_code: "file_unreadable",
+        },
+    }
+}
+
+/// 開いた fd（`reader`）から、ヘッダー（先頭 8 バイト＋ヘッダー長ぶん。上限 16 MiB）を検査しつつ最大
+/// [`STREAM_BUFFER_BYTES`] ずつ読んで sha256 を計算する。`size` は fstat の長さで、読めた総量が
+/// これと食い違えば（検査後の伸縮）拒否する。`limit` を超えて読まない（超過は従来の
+/// `Io(TooLarge)` と同じ 20・`file_unreadable`）。
+fn sha256_safetensors_stream<R: std::io::Read>(
+    reader: R,
+    size: u64,
+    limit: u64,
+) -> Result<Sha256Digest, BaseModelFileRejection> {
+    let mut reader = reader.take(limit.saturating_add(1));
+    let mut hasher = Sha256Stream::new();
+    let mut first8 = [0u8; 8];
+    reader
+        .read_exact(&mut first8)
+        .map_err(|e| read_failed(&e))?;
+    let end = safetensors_header_end(first8).map_err(|_| not_allowed())?;
+    // ヘッダー長がファイル全体を超える指定は、ヘッダーを確保・読み込みする前に拒否する
+    if end as u64 > size {
+        return Err(not_allowed());
+    }
+    let mut prefix = first8.to_vec();
+    prefix.resize(end, 0);
+    let rest = prefix.get_mut(first8.len()..).ok_or_else(not_allowed)?;
+    reader.read_exact(rest).map_err(|e| read_failed(&e))?;
+    check_safetensors_prefix(&prefix, size).map_err(|_| not_allowed())?;
+    hasher.update(&prefix);
+    let mut total = end as u64;
+    drop(prefix);
+    let mut buf = vec![0u8; STREAM_BUFFER_BYTES];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| read_failed(&e))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        hasher.update(buf.get(..n).ok_or_else(not_allowed)?);
+    }
+    if total > limit {
+        return Err(BaseModelFileRejection::Format {
+            exit_code: ExitCode::LimitExceeded,
+            reason_code: "file_unreadable",
+        });
+    }
+    if total != size {
+        return Err(not_allowed());
+    }
+    Ok(hasher.finish())
 }
 
 /// `config.json` を閉じ込め付きで開き、64 KiB を上限にストリームで sha256 を計算する（内容は解釈しない）。
@@ -279,5 +383,114 @@ mod tests {
         assert_eq!(e.exit_code(), ExitCode::InvalidInput);
         assert_eq!(e.reason_code(), "base_model_sha256_mismatch");
         assert_eq!(e.to_string(), "base model file sha256 mismatch");
+    }
+
+    /// 先頭ヘッダー付きの合成 safetensors（U8 テンソル 1 個。データ部は `n` バイトの疑似データ）。
+    fn st(n: usize) -> Vec<u8> {
+        let h = format!(r#"{{"t":{{"dtype":"U8","shape":[{n}],"data_offsets":[0,{n}]}}}}"#);
+        let mut v = (h.len() as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(h.as_bytes());
+        v.extend((0..n).map(|i| (i % 251) as u8));
+        v
+    }
+
+    fn stream(bytes: &[u8], size: u64, limit: u64) -> Result<Sha256Digest, BaseModelFileRejection> {
+        sha256_safetensors_stream(bytes, size, limit)
+    }
+
+    /// 読み出し 1 回あたりの要求長の最大値を数える Reader。
+    struct CountingReader<'a> {
+        inner: &'a [u8],
+        max_request: usize,
+    }
+
+    impl std::io::Read for CountingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.max_request = self.max_request.max(buf.len());
+            self.inner.read(buf)
+        }
+    }
+
+    /// 中身を読み切ったあとに `kind` のエラーを返す Reader。
+    struct FailingReader<'a> {
+        inner: &'a [u8],
+        kind: std::io::ErrorKind,
+    }
+
+    impl std::io::Read for FailingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.inner.read(buf)? {
+                0 => Err(std::io::Error::from(self.kind)),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// REQ-39・REQ-41・#672: バッファ長を超える（3 MiB 超）重みでも全体読みと同じ sha256。
+    #[test]
+    fn req41_issue672_stream_matches_whole_read() {
+        let b = st(3 * STREAM_BUFFER_BYTES + 5);
+        let got = stream(&b, b.len() as u64, MAX_BASE_MODEL_FILE_BYTES).unwrap();
+        assert_eq!(got, Sha256Digest::of_bytes(&b));
+    }
+
+    /// REQ-39・#672: 読み出し 1 回の要求長が固定バッファ長以下（全体読みに戻ると大きな要求になり失敗する）。
+    #[test]
+    fn req41_issue672_stream_request_size_is_bounded() {
+        let b = st(3 * STREAM_BUFFER_BYTES + 5);
+        let mut r = CountingReader {
+            inner: &b,
+            max_request: 0,
+        };
+        sha256_safetensors_stream(&mut r, b.len() as u64, MAX_BASE_MODEL_FILE_BYTES).unwrap();
+        assert!(r.max_request > 0 && r.max_request <= STREAM_BUFFER_BYTES);
+    }
+
+    /// REQ-39・#672: ヘッダー不正・伸縮・短すぎは従来と同じ 64・`format_not_allowed`。
+    /// 読み込み中に上限を超えて伸びたファイルは 20・`file_unreadable`（従来の `Io(TooLarge)` と同じ）。
+    #[test]
+    fn req41_issue672_stream_rejections() {
+        let b = st(100);
+        let n = b.len() as u64;
+        let mut bad = b.clone();
+        bad[8] = b'[';
+        // ヘッダー長が size を超える指定（先頭 8 バイトだけの偽ファイル）は読み取り前に拒否される
+        let huge = (1u64 << 20).to_le_bytes().to_vec();
+        for (bytes, size) in [
+            (bad, n),
+            (b.clone(), n - 1),
+            (b.clone(), n + 1),
+            (vec![1; 4], 4),
+            (huge, 8),
+        ] {
+            let e = stream(&bytes, size, MAX_BASE_MODEL_FILE_BYTES).unwrap_err();
+            assert_eq!(e.reason_code(), "format_not_allowed");
+            assert_eq!(e.exit_code(), ExitCode::InvalidInput);
+        }
+        let e = stream(&b, n, n - 1).unwrap_err();
+        assert_eq!(e.exit_code(), ExitCode::LimitExceeded);
+        assert_eq!(e.reason_code(), "file_unreadable");
+    }
+
+    /// REQ-39・#672: 本体・ヘッダーの I/O エラーは 70・`file_unreadable`（`UnexpectedEof` だけ形式拒否）。
+    #[test]
+    fn req41_issue672_stream_io_error_classification() {
+        let b = st(100);
+        let n = b.len() as u64;
+        for cut in [4, 20, b.len() - 10] {
+            let r = FailingReader {
+                inner: &b[..cut],
+                kind: std::io::ErrorKind::Other,
+            };
+            let e = sha256_safetensors_stream(r, n, MAX_BASE_MODEL_FILE_BYTES).unwrap_err();
+            assert_eq!(e.exit_code(), ExitCode::RuntimeError, "{cut}");
+            assert_eq!(e.reason_code(), "file_unreadable", "{cut}");
+        }
+        let r = FailingReader {
+            inner: &b[..20],
+            kind: std::io::ErrorKind::UnexpectedEof,
+        };
+        let e = sha256_safetensors_stream(r, n, MAX_BASE_MODEL_FILE_BYTES).unwrap_err();
+        assert_eq!(e.reason_code(), "format_not_allowed");
     }
 }

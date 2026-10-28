@@ -69,18 +69,34 @@ pub enum BaseModelFormatError {
 
 /// `bytes`（ファイル全体）が safetensors の形かを検査する。拒否理由を返す。REQ-39・REQ-41・TASK-41.2-1。
 pub fn check_safetensors(bytes: &[u8]) -> Result<(), BaseModelFormatError> {
+    check_safetensors_prefix(bytes, bytes.len() as u64)
+}
+
+/// safetensors のヘッダー長フィールド（先頭 8 バイト）の上限付き読み取り。ストリーム検査の入口
+/// （ガード層が本体を保持せずにヘッダーだけ読むため。REQ-39・REQ-41・#672）。
+pub fn safetensors_header_end(first8: [u8; 8]) -> Result<usize, BaseModelFormatError> {
+    Some(u64::from_le_bytes(first8))
+        .filter(|n| (2..=MAX_SAFETENSORS_HEADER_BYTES).contains(n))
+        .and_then(|n| n.checked_add(8))
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or(BaseModelFormatError::SafetensorsHeaderLength)
+}
+
+/// [`check_safetensors`] の本体。`prefix` はファイル先頭から少なくとも `8 + ヘッダー長` バイト、
+/// `total_len` はファイル全体の長さ（データ部の長さ検査に使う）。`prefix` がファイル全体なら
+/// `check_safetensors` と同一の結果になる。
+pub fn check_safetensors_prefix(prefix: &[u8], total_len: u64) -> Result<(), BaseModelFormatError> {
     use BaseModelFormatError as E;
-    let n = bytes
+    let bytes = prefix;
+    let data_start = bytes
         .get(..8)
         .and_then(|h| <[u8; 8]>::try_from(h).ok())
-        .map(u64::from_le_bytes)
-        .filter(|n| (2..=MAX_SAFETENSORS_HEADER_BYTES).contains(n))
-        .ok_or(E::SafetensorsHeaderLength)?;
-    let data_start = n
-        .checked_add(8)
-        .and_then(|v| usize::try_from(v).ok())
-        .ok_or(E::SafetensorsHeaderLength)?;
-    let (Some(header), Some(data)) = (bytes.get(8..data_start), bytes.get(data_start..)) else {
+        .ok_or(E::SafetensorsHeaderLength)
+        .and_then(safetensors_header_end)?;
+    let Some(header) = bytes.get(8..data_start) else {
+        return Err(E::SafetensorsHeaderLength);
+    };
+    let Some(data_len) = total_len.checked_sub(data_start as u64) else {
         return Err(E::SafetensorsHeaderLength);
     };
     if header.first() != Some(&b'{') {
@@ -117,7 +133,7 @@ pub fn check_safetensors(bytes: &[u8]) -> Result<(), BaseModelFormatError> {
         }
         next = e;
     }
-    if u64::try_from(data.len()).is_ok_and(|l| l == next) {
+    if data_len == next {
         Ok(())
     } else {
         Err(E::SafetensorsOffsets)
@@ -144,6 +160,20 @@ pub fn check_tokenizer_json(bytes: &[u8]) -> Result<(), BaseModelFormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-39・REQ-41・#672: ヘッダー長の範囲判定の境界（2..=16 MiB のみ許可。`end` は +8）。
+    #[test]
+    fn issue672_safetensors_header_end_boundaries() {
+        let end = |n: u64| safetensors_header_end(n.to_le_bytes());
+        for n in [0, 1, MAX_SAFETENSORS_HEADER_BYTES + 1, u64::MAX] {
+            assert!(end(n).is_err(), "{n}");
+        }
+        assert_eq!(end(2).unwrap(), 10);
+        assert_eq!(
+            end(MAX_SAFETENSORS_HEADER_BYTES).unwrap(),
+            MAX_SAFETENSORS_HEADER_BYTES as usize + 8
+        );
+    }
 
     fn is_safetensors(b: &[u8]) -> bool {
         check_safetensors(b).is_ok()
