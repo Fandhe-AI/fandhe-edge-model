@@ -98,13 +98,16 @@ pub fn supervisor_config(
 
 /// `evaluate` の監督設定（REQ-39・REQ-41・#662。RSS は `limits.memory()`）。
 ///
-/// 親の時間上限は `2 × limits.time() + 2 × MAX_INFER_BATCH_DURATION + SUPERVISOR_GRACE`。内訳:
+/// 親の時間上限は
+/// `2 × limits.time() + 2 × MAX_INFER_BATCH_DURATION + MAX_INFER_BATCH_OUTPUT_DURATION + SUPERVISOR_GRACE`。内訳:
 /// - `2 × limits.time()`: パイプライン構築が 2 回ある（適用権を取る前の試し組み立てと、取得後の再構築。
 ///   どちらも `infer` の 1 件上限と同じく「読み込み込み」の上限を 1 回ぶんずつ見込む）
 /// - `2 × MAX_INFER_BATCH_DURATION`: 1 件ずつの推論の期限が 2 回ある（validation の校正と、凍結 test への適用）
+/// - `MAX_INFER_BATCH_OUTPUT_DURATION`: 推論の後の結果の書き出し(指標・予測 JSONL・評価記録の `finish`・stdout)。
+///   `infer --input-file` の出力段と同じ定数を使う
 ///
 /// `--previous-project-dir`・`--seed-run-project` は保存済みの記録を読むだけで推論しないので数えない。
-/// 値は種類が 10 秒の既存 3 種で 1222 秒、追加学習（60 秒）で 1322 秒（どちらも `MAX_TIME_LIMIT` 3600 秒以内）。
+/// 値は種類が 10 秒の既存 3 種で 1282 秒、追加学習（60 秒）で 1382 秒（どちらも `MAX_TIME_LIMIT` 3600 秒以内）。
 ///
 /// # Errors
 /// 上限が範囲外（定数から作るため通常は起きない）。
@@ -113,7 +116,8 @@ pub fn evaluate_config(limits: SafetyLimits) -> Result<RunConfig, ResourceConfig
         .time()
         .get()
         .saturating_mul(2)
-        .saturating_add(MAX_INFER_BATCH_DURATION.saturating_mul(2));
+        .saturating_add(MAX_INFER_BATCH_DURATION.saturating_mul(2))
+        .saturating_add(MAX_INFER_BATCH_OUTPUT_DURATION);
     config_with(inner, limits)
 }
 
@@ -375,21 +379,21 @@ mod tests {
         assert_eq!(f.memory_limit(), Some(25_769_803_776));
     }
 
-    /// REQ-39・REQ-41・#662: `evaluate` の親の時間は `2 × limits.time() + 2 × 600 秒 + 2 秒`。
-    /// 既存 3 種と未知の種類は 1222 秒・2 GiB、追加学習は 1322 秒・24 GiB。
+    /// REQ-39・REQ-41・#662: `evaluate` の親の時間は `2 × limits.time() + 2 × 600 秒 + 60 秒 + 2 秒`。
+    /// 既存 3 種と未知の種類は 1282 秒・2 GiB、追加学習は 1382 秒・24 GiB。
     #[test]
-    fn req39_evaluate_config_is_1222_seconds_for_byte_kinds_and_1322_for_qwen2_lora() {
+    fn req39_evaluate_config_is_1282_seconds_for_byte_kinds_and_1382_for_qwen2_lora() {
         for kind in ["c1", "c3", "autoregressive", "unknown"] {
             let c = evaluate_config(safety_limits_for_kind(kind)).unwrap();
-            assert_eq!(c.time_limit(), Duration::from_secs(1222));
+            assert_eq!(c.time_limit(), Duration::from_secs(1282));
             assert_eq!(c.memory_limit(), Some(2_147_483_648));
         }
         let c = evaluate_config(safety_limits_for_kind("qwen2_lora")).unwrap();
-        assert_eq!(c.time_limit(), Duration::from_secs(1322));
+        assert_eq!(c.time_limit(), Duration::from_secs(1382));
         assert_eq!(c.memory_limit(), Some(25_769_803_776));
         // kind を読めなかったときの厳しい側は byte kind と同じ値になる。
         let s = evaluate_config(SafetyLimits::STRICT).unwrap();
-        assert_eq!(s.time_limit(), Duration::from_secs(1222));
+        assert_eq!(s.time_limit(), Duration::from_secs(1282));
         assert_eq!(s.memory_limit(), Some(2_147_483_648));
     }
 

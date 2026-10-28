@@ -124,7 +124,7 @@
 
 use std::cell::RefCell;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::evaluation_record::{
@@ -134,7 +134,6 @@ use fandhe_edge_core::evaluation_record::{
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded;
 use fandhe_edge_core::hash::Sha256Digest;
-use fandhe_edge_core::limits::INFER_TIME_LIMIT;
 use fandhe_edge_core::stage_report::{
     EvaluateAbstention, EvaluateCalibration, EvaluateCompletedReport, EvaluateDetails,
     EvaluateLabelMetrics, EvaluateReport, PredictionLine, PredictionLineOutcome,
@@ -154,6 +153,7 @@ use fandhe_edge_eval::final_test_once::{
 use fandhe_edge_eval::invariance::ModelPackagePaths;
 use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome};
 use fandhe_edge_guard::format::check_bytes;
+use fandhe_edge_guard::resource::safety_limits_for_kind;
 use fandhe_edge_runtime::onnx::MAX_MODEL_FILE_BYTES;
 use fandhe_edge_runtime::pipeline::{
     BackendError, InferError, MAX_INFER_BATCH_DURATION, MAX_INFER_BATCH_LEN,
@@ -329,7 +329,13 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     // 引数は train 側の入力だけで、評価データを渡せない（REQ-27・#339）。
     let baseline = prepare_baseline(&definition, &records, &split)?;
     // 校正は validation だけから、適用権を取る前に確定する（REQ-22・REQ-27・#477）。
-    let calibration = calibrate_on_validation(&pipeline, &definition, &records, &split)?;
+    let calibration = calibrate_on_validation(
+        &pipeline,
+        item_time_limit_for_kind(&target.kind_name),
+        &definition,
+        &records,
+        &split,
+    )?;
     // 適用では評価器が読み直した重みから組み直すため、校正用の分は解放する。
     drop(pipeline);
     let definition_sha256 = definition
@@ -568,6 +574,7 @@ fn check_candidate_artifact(
 /// 上限（件数・時間）超過は `limit_exceeded`。
 fn calibrate_on_validation(
     pipeline: &Pipeline,
+    item_time_limit: Duration,
     definition: &Definition,
     records: &[ValidRecord],
     split: &fandhe_edge_data::split::SplitResult,
@@ -604,7 +611,7 @@ fn calibrate_on_validation(
             ));
         }
         let prediction = pipeline
-            .infer_one_within(&record.input, INFER_TIME_LIMIT)
+            .infer_one_within(&record.input, item_time_limit)
             .map_err(|e| e.to_error_report())?;
         logits.push(prediction.scores().iter().map(|p| p.ln()).collect());
     }
@@ -618,6 +625,12 @@ fn calibrate_on_validation(
         })
         .collect();
     calibrate_checked(&labels, &inputs).map(Some)
+}
+
+/// 1 件ごとの推論の時間上限を候補の `kind` の安全上限から引く（`infer` の単件上限と同じ表。
+/// 既存 3 種と未知の kind は従来の 10 秒、追加学習は 60 秒。REQ-39・REQ-41・#662）。
+fn item_time_limit_for_kind(kind: &str) -> Duration {
+    safety_limits_for_kind(kind).time().get()
 }
 
 /// 校正・保留の計算用に保持するロジットの総数（件数 × 選択肢数）が上限内か。桁あふれは上限超過として扱う。
@@ -1108,6 +1121,7 @@ fn apply_to_frozen_data<R>(
             // ので fail-closed で契約違反ではないが、その候補は再評価できない（モジュール doc の適用権の規則）。
             let pipeline = build_candidate_pipeline(&weights, &target.artifact, options.len())
                 .map_err(|_| EvalPredictFailure::Failed)?;
+            let item_time_limit = item_time_limit_for_kind(&target.kind_name);
             let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
             let mut outcomes = Vec::with_capacity(inputs.len());
             for input in inputs {
@@ -1117,7 +1131,7 @@ fn apply_to_frozen_data<R>(
                 // 推論・判定への変換の失敗は 1 件ごとの `Outcome::Error` にせず、評価全体の失敗として
                 // 伝える。`Ok` で返すと、全件が失敗しても完了記録と配布許可が作られてしまう（REQ-27）。
                 // 失敗時は評価器が成功を記録しないため、`package` は配布を許さない。
-                let prediction = match pipeline.infer_one_within(input, INFER_TIME_LIMIT) {
+                let prediction = match pipeline.infer_one_within(input, item_time_limit) {
                     Ok(prediction) => prediction,
                     Err(InferError::Backend(BackendError::TimeLimitExceeded)) => {
                         return Err(EvalPredictFailure::TimeLimit);
@@ -1206,6 +1220,22 @@ mod tests {
 
     /// REQ-39・#445: 予測ファイルの上界（2 件 × (128 + 6×2 + 6×1 + 2×(6+40)) = 476）が上限を超えると、
     /// 適用権を取る前の確認が `limit_exceeded` になる。ちょうど上限なら通る。
+    /// REQ-39・REQ-41・#662: 1 件ごとの推論上限は kind で決まる。byte 系は従来の `INFER_TIME_LIMIT`（10 秒）、
+    /// `qwen2_lora` は 60 秒、未知の kind は厳しい側（10 秒）。
+    #[test]
+    fn req39_issue662_item_time_limit_follows_kind() {
+        for kind in ["c1", "c3", "autoregressive", "unknown"] {
+            assert_eq!(
+                item_time_limit_for_kind(kind),
+                fandhe_edge_core::limits::INFER_TIME_LIMIT
+            );
+        }
+        assert_eq!(
+            item_time_limit_for_kind("qwen2_lora"),
+            Duration::from_secs(60)
+        );
+    }
+
     #[test]
     fn req39_issue445_predictions_upper_bound_is_checked_against_limit() {
         let ids = vec!["e1".to_string(), "e2".to_string()];
