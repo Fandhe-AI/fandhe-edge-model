@@ -4168,6 +4168,10 @@ def emit(code: str, message: str, exit_code: int, with_record: bool) -> int:
     if with_record:
         obj["record"] = "record.json"
     try:
+        if os.environ.get("FANDHE_RMC_STDOUT_CLOSED") == "1":
+            # 入口スクリプトが fd 1 の閉塞を検出済み
+            # （python が /dev/null に開き直すため自力では分からない。#676）
+            raise OSError("stdout is closed")
         sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
         sys.stdout.flush()
     except (OSError, ValueError, AttributeError):
