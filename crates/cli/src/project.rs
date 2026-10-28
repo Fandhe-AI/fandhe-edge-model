@@ -107,6 +107,10 @@ pub const REQUEST_FILE: &str = "request.json";
 /// `train --train-seed` で学習 seed を上書きした候補だけに置く、実際に使った seed の記録
 /// （10 進数の u32。省略時は作らず、下流は `split.json` の seed を使う。REQ-17・REQ-41）。
 pub const TRAIN_SEED_FILE: &str = "train_seed.txt";
+/// `train --device gpu` で学習した候補だけに置く、実行デバイスの記録（内容は `gpu`。cpu は作らず、
+/// 記録が無い候補・#665 以前の候補は cpu として扱う）。下流は `request.json` の device がこの記録と
+/// 一致することを要求する（学習後に request 側だけを書き換えても通さない。REQ-27・REQ-41・#665）。
+pub const TRAIN_DEVICE_FILE: &str = "train_device.txt";
 /// 候補ディレクトリ内の学習結果。
 pub const RESULT_FILE: &str = "result.json";
 /// 候補ディレクトリ内の trainer 形式の学習データ。

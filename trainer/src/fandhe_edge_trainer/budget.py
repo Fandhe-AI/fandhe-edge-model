@@ -125,10 +125,26 @@ class ResourceBudget:
     wall_seconds: float
     rss_bytes: int
     device: str
+    #: True なら RSS 判定に MLX の確保量ピーク（`mx.get_peak_memory()`）を加え、大きい方を見る。
+    #: `ru_maxrss` は Metal（unified memory）の GPU バッファを反映しきれないことがあるため
+    #: （qwen2_lora が使う。PoC の `common.max_rss_bytes` と同じ。#665・REQ-39）。
+    include_mlx_peak: bool = False
     _deadline: float = field(init=False)
 
     def __post_init__(self) -> None:
         self._deadline = time.monotonic() + self.wall_seconds
+
+    def usage_bytes(self) -> int:
+        """RSS のピーク（`include_mlx_peak` なら MLX の確保量ピークとの大きい方）を返す。"""
+        rss = _current_rss_bytes()
+        if self.include_mlx_peak:
+            try:
+                import mlx.core as mx
+
+                rss = max(rss, int(mx.get_peak_memory()))
+            except (ImportError, AttributeError):  # pragma: no cover - mlx 未導入・API 変更
+                pass
+        return rss
 
     def check(self) -> None:
         """壁時計・RSS・（device="gpu" なら）MLX active memory を検査する。
@@ -149,7 +165,7 @@ class ResourceBudget:
                 f"training exceeded wall-clock budget of {self.wall_seconds} seconds",
                 ExitCode.LIMIT_EXCEEDED,
             )
-        rss = _current_rss_bytes()
+        rss = self.usage_bytes()
         if rss > self.rss_bytes:
             raise WorkerError(
                 "limit_exceeded",

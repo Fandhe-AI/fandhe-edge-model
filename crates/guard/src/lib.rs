@@ -7,7 +7,7 @@
 //! # 現状
 //!
 //! - [`format`][]: 許可リストによるファイル形式判定（TASK-39.2-1・#153）。実装済み。ベースモデル形式（safetensors・tokenizer JSON。`FormatAllowlist::base_model`）も実装済み（REQ-41・TASK-41.2-1・#397。ディレクトリ受付・閉じ込めは `base_model`）
-//! - [`base_model`]: ベースモデルのディレクトリ受付・経路の閉じ込め・読み込み前のサイズ確認・名前と内容の照合（REQ-41・TASK-41.2-2・#398）。重みは 2 GiB・他は 1 GiB（#655）。実装済み。CLI・trainer への配線は TASK-41.5（#425）
+//! - [`base_model`]: ベースモデルのディレクトリ受付・経路の閉じ込め・読み込み前のサイズ確認・名前と内容の照合（REQ-41・TASK-41.2-2・#398）。重みは 5 GiB・他は 1 GiB（#655・#665）。実装済み。CLI・trainer への配線は TASK-41.5（#425）
 //! - [`model_file`]: モデルファイルの拡張子（`.onnx`）と内容（ONNX）の照合による pickle 偽装・非 ONNX の拒否
 //!   （TASK-39.2-2・#154）。実装済み
 //! - [`path`]: 経路の閉じ込め（`safe_join` 相当・検証と open を一体化した `open_confined`。TASK-39.4-1・#158）。実装済み。

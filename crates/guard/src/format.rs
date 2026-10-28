@@ -753,7 +753,7 @@ pub fn check_open_file(
 }
 
 /// 天井（1 GiB）で丸めずに `max_bytes` で読み切って検査する。重みファイル専用の上限
-/// （`split_files::MAX_SHARD_FILE_BYTES`）を定数で渡す呼び出し元だけが使う（REQ-39・#655）。
+/// （`base_model::MAX_BASE_MODEL_FILE_BYTES`）を定数で渡す呼び出し元だけが使う（REQ-39・#655）。
 pub(crate) fn check_open_file_unclamped(
     file: std::fs::File,
     path: &Path,

@@ -158,7 +158,7 @@ use super::infer::build_pipeline;
 use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
-    allotted_time_limit, candidate_rel, effective_train_seed, load_trained,
+    allotted_time_limit, candidate_rel, effective_train_seed, load_trained, recorded_device,
     request_is_smoke_trained, request_matches_candidate, resolve_candidates, train_rows,
     verified_split,
 };
@@ -219,6 +219,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
         selection.candidate_index,
         seed,
         &selection.explicit_kinds,
+        recorded_device(&project, selection.candidate_index)?,
     )?;
     let candidate = candidates
         .get(selection.candidate_index)

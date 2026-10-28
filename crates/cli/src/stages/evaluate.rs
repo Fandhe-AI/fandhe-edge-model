@@ -160,7 +160,7 @@ use fandhe_edge_runtime::pipeline::{
     MAX_INFER_BATCH_TOTAL_SCORES,
 };
 use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
-use fandhe_edge_train::request::TrainRequest;
+use fandhe_edge_train::request::{Device, TrainRequest};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::stage_files::SelectionRecord;
 
@@ -187,7 +187,7 @@ use super::previous_comparison::{PreparedPrevious, current_correctness, prepare_
 use super::reproducibility::{OwnRun, SeedRuns, check_run_count, load_seed_runs};
 use super::select::compute_selection;
 use super::train::{
-    allotted_time_limit, candidate_rel, effective_train_seed, load_trained,
+    allotted_time_limit, candidate_rel, effective_train_seed, load_trained, recorded_device,
     request_is_smoke_trained, request_matches_candidate, resolve_candidates, train_rows,
     verified_split,
 };
@@ -237,8 +237,15 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
 
     let mut prepared_target: Option<PreparedCandidate> = None;
     let mut entries: Vec<RegisteredConfig> = Vec::new();
-    let n_candidates =
-        resolve_candidates(&project, &definition, args.candidate, seed, &explicit_kinds)?.len();
+    let n_candidates = resolve_candidates(
+        &project,
+        &definition,
+        args.candidate,
+        seed,
+        &explicit_kinds,
+        Device::Cpu,
+    )?
+    .len();
     if args.candidate >= n_candidates {
         return Err(invalid("candidate index is out of range"));
     }
@@ -477,7 +484,14 @@ fn prepare_candidate(
     explicit_kinds: &[String],
 ) -> Result<Option<PreparedCandidate>, ErrorReport> {
     let seed = effective_train_seed(project, index, seed)?;
-    let candidates = resolve_candidates(project, definition, index, seed, explicit_kinds)?;
+    let candidates = resolve_candidates(
+        project,
+        definition,
+        index,
+        seed,
+        explicit_kinds,
+        recorded_device(project, index)?,
+    )?;
     let candidate = candidates
         .get(index)
         .ok_or_else(|| invalid("candidate index is out of range"))?;

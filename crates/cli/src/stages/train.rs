@@ -155,8 +155,8 @@ use crate::args::TrainArgs;
 use crate::error_report::{ToErrorReport, train_outcome_error_report};
 use crate::project::{
     CANCEL_REQUEST_FILE, CANDIDATES_DIR, CreatedDir, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR,
-    Project, REQUEST_FILE, RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_INPUT_FILE,
-    TRAIN_SEED_FILE, fail, invalid, runtime,
+    Project, REQUEST_FILE, RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_DEVICE_FILE,
+    TRAIN_INPUT_FILE, TRAIN_SEED_FILE, fail, invalid, runtime,
 };
 
 /// 学習ワーカーのディレクトリ（`launch.py` と `.venv`）を指す環境変数。絶対パスのみ受理する。
@@ -213,6 +213,7 @@ pub fn resolve_candidates(
     index: usize,
     seed: u32,
     explicit_kinds: &[String],
+    device: Device,
 ) -> Result<Vec<SearchCandidate>, ErrorReport> {
     let label_order = label_order_from_definition(definition)
         .map_err(|e| e.to_error_report())?
@@ -228,7 +229,7 @@ pub fn resolve_candidates(
             label_order,
             max_bytes: DEFAULT_MAX_BYTES,
             seed,
-            device: Device::Cpu,
+            device,
             root,
             train_path: TRAIN_INPUT_FILE.to_string(),
             out_dir: MODEL_DIR.to_string(),
@@ -418,7 +419,8 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Tr
     // [`effective_train_seed`] でそれを正とする（`request.json` の seed 改ざんは従来どおり照合で弾く）。
     let seed = args.train_seed.unwrap_or(split_seed);
 
-    let mut candidates = resolve_candidates(&project, &definition, index, seed, &args.kinds)?;
+    let mut candidates =
+        resolve_candidates(&project, &definition, index, seed, &args.kinds, args.device)?;
     if index >= candidates.len() {
         return Err(invalid("candidate index is out of range").into());
     }
@@ -985,6 +987,10 @@ fn prepare_candidate_dir(
     if let Some(seed) = train_seed_override {
         project.write_new(rel.join(TRAIN_SEED_FILE), seed.to_string().as_bytes())?;
     }
+    // 実行デバイスは request.json とは別に記録し、下流が両者の一致を要求する（#665）。cpu は作らない。
+    if request.device() == Device::Gpu {
+        project.write_new(rel.join(TRAIN_DEVICE_FILE), b"gpu")?;
+    }
     Ok(job_dir)
 }
 
@@ -1097,15 +1103,17 @@ where
     let seed = args.train_seed.unwrap_or(split_seed);
 
     // 候補 N の `root` は `candidates/<N>`。単発の `train --candidate N` と同じ解決を候補ごとに行う。
-    let n_candidates = resolve_candidates(&project, &definition, 0, seed, &args.kinds)?.len();
+    let n_candidates =
+        resolve_candidates(&project, &definition, 0, seed, &args.kinds, args.device)?.len();
     // ベースモデルの照合は探索の開始前に 1 回（#628）。`--kind qwen2_lora` があれば候補に含まれる。
     let base_model_dir = checked_base_model_dir(args, &definition, cwd, true)?;
     let mut candidates = Vec::with_capacity(n_candidates);
     for index in 0..n_candidates {
-        let mut candidate = resolve_candidates(&project, &definition, index, seed, &args.kinds)?
-            .into_iter()
-            .nth(index)
-            .ok_or_else(|| runtime("candidate resolution is inconsistent"))?;
+        let mut candidate =
+            resolve_candidates(&project, &definition, index, seed, &args.kinds, args.device)?
+                .into_iter()
+                .nth(index)
+                .ok_or_else(|| runtime("candidate resolution is inconsistent"))?;
         if args.smoke {
             apply_smoke_checked(&mut candidate)?;
         }
@@ -1472,6 +1480,23 @@ pub fn effective_train_seed(
         .ok_or_else(|| invalid("train seed record is invalid"))
 }
 
+/// 候補 `index` の学習時の実行デバイスを `train_device.txt` から返す。記録が無い候補（cpu で学習した候補・
+/// #665 以前の候補）は cpu。`evaluate`・`select`・`package` が期待する学習リクエストの device に使い、
+/// `request.json` の device 単独の書き換えを [`request_matches_candidate`] で弾く（REQ-27・REQ-41・#665）。
+///
+/// # Errors
+/// 記録が `gpu` 以外の場合は `invalid_input`（64。fail-closed）。
+pub fn recorded_device(project: &Project, index: usize) -> Result<Device, ErrorReport> {
+    match project
+        .read_optional(candidate_rel(index).join(TRAIN_DEVICE_FILE), 8)?
+        .as_deref()
+    {
+        None => Ok(Device::Cpu),
+        Some(b"gpu") => Ok(Device::Gpu),
+        Some(_) => Err(invalid("train device record is invalid")),
+    }
+}
+
 /// `split.json` を読んで解析する（検証はしない。`package` が記録済みの seed を取り出すのにも使う）。
 ///
 /// # Errors
@@ -1569,6 +1594,10 @@ pub fn build_train_request(
 /// 増えても自動で照合対象になる（`train_path`・`device`・時間と RSS の制限・validation 入力・
 /// `root`・`out_dir` を含む）。`root` は絶対パスで記録されるので、プロジェクトのディレクトリを
 /// 移動すると一致せず拒否される（fail-closed として許容する）。
+///
+/// `device` は例外にせず厳密に比べる: 呼び出し元が `params` の device に [`recorded_device`]（`train` が
+/// request とは別に書く `train_device.txt`）を渡す。request.json か記録のどちらか片方だけの書き換えは
+/// 不一致で拒否される（両方を書き換えれば通る。他の記録の束縛と同水準。#665）。
 ///
 /// **例外は `epochs` と `base_model_dir` の 2 か所だけ**: `epochs` は `train --smoke` が 1 へ上書きする項目のため、
 /// 期待値の `epochs` を保存済みリクエストの値に揃えてから比べる（smoke かどうかは別に
@@ -1838,6 +1867,7 @@ mod all_tests {
         TrainArgs {
             kinds: vec!["qwen2_lora".to_string()],
             base_model_dir: Some(BASE_MODEL_DIR.into()),
+            device: Device::Cpu,
             ..all_args()
         }
     }
@@ -1846,6 +1876,7 @@ mod all_tests {
         TrainArgs {
             kinds: Vec::new(),
             base_model_dir: None,
+            device: Device::Cpu,
             project_dir: "proj".into(),
             op: TrainOp::Run(TrainTarget::All {
                 budget: SearchBudget::default(),
@@ -2041,6 +2072,7 @@ mod all_tests {
             };
             let args = TrainArgs {
                 base_model_dir: (!kinds.is_empty()).then(|| BASE_MODEL_DIR.into()),
+                device: Device::Cpu,
                 kinds,
                 ..all_args()
             };
@@ -2169,6 +2201,7 @@ mod all_tests {
         let smoke = TrainArgs {
             kinds: vec!["qwen2_lora".to_string()],
             base_model_dir: None,
+            device: Device::Cpu,
             smoke: true,
             ..single
         };
@@ -2541,6 +2574,7 @@ mod all_tests {
             (
                 TrainArgs {
                     base_model_dir: Some(BASE_MODEL_DIR.into()),
+                    device: Device::Cpu,
                     ..all_args()
                 },
                 "option --base-model-dir requires --kind qwen2_lora",
@@ -2548,6 +2582,7 @@ mod all_tests {
             (
                 TrainArgs {
                     base_model_dir: Some("../bm".into()),
+                    device: Device::Cpu,
                     ..qwen2_all_args()
                 },
                 "path rejected: path_escapes_root",
@@ -2555,6 +2590,7 @@ mod all_tests {
             (
                 TrainArgs {
                     base_model_dir: Some(outside.clone()),
+                    device: Device::Cpu,
                     ..qwen2_all_args()
                 },
                 "path rejected: path_escapes_root",
@@ -2562,6 +2598,7 @@ mod all_tests {
             (
                 TrainArgs {
                     base_model_dir: Some("bm-link".into()),
+                    device: Device::Cpu,
                     ..qwen2_all_args()
                 },
                 "path rejected: path_escapes_root",
@@ -2681,10 +2718,17 @@ mod all_tests {
         let definition = project.load_definition().expect("definition");
         let records = project.load_records(&definition).expect("records");
         let (split, seed) = verified_split(&project, &records).expect("split");
-        let params = resolve_candidates(&project, &definition, 2, seed, &qwen2_all_args().kinds)
-            .expect("candidates")
-            .swap_remove(2)
-            .params;
+        let params = resolve_candidates(
+            &project,
+            &definition,
+            2,
+            seed,
+            &qwen2_all_args().kinds,
+            Device::Cpu,
+        )
+        .expect("candidates")
+        .swap_remove(2)
+        .params;
         let mut moved = params.clone();
         moved
             .config
@@ -2702,7 +2746,7 @@ mod all_tests {
             &tampered, &params, None, &records, &split
         ));
         // 場所の例外は qwen2_lora に限る（c1 の request に base_model_dir が混ざれば不一致）。
-        let c1 = resolve_candidates(&project, &definition, 0, seed, &[])
+        let c1 = resolve_candidates(&project, &definition, 0, seed, &[], Device::Cpu)
             .expect("candidates")
             .swap_remove(0)
             .params;
@@ -2762,6 +2806,7 @@ mod status_tests {
         let args = TrainArgs {
             kinds: Vec::new(),
             base_model_dir: None,
+            device: Device::Cpu,
             project_dir: "proj".into(),
             op: TrainOp::Status(candidate),
             smoke: false,
@@ -3342,6 +3387,7 @@ mod status_tests {
         let args = TrainArgs {
             kinds: Vec::new(),
             base_model_dir: None,
+            device: Device::Cpu,
             project_dir: "proj".into(),
             op: TrainOp::Cancel(candidate),
             smoke: false,

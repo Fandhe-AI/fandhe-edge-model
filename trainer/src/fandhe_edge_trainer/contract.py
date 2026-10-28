@@ -52,7 +52,7 @@ PR #238）。リクエスト全体が `MAX_REQUEST_BYTES` で縛られるため�
 そちらで決まる。
 
 `time_limit_seconds`・`rss_limit_bytes` は任意項目（省略時は `limits.py` の
-`MAX_TRAIN_WALL_SECONDS`・`MAX_TRAIN_RSS_BYTES` を既定値として使う）。
+`MAX_TRAIN_WALL_SECONDS`・`max_train_rss_bytes_for_kind(kind)` を既定値として使う）。
 指定する場合は、その上限を**下げる**ことしかできない（上限より大きい値は
 `invalid_request` で拒否する）。学習ループ中の実際の検査は `budget.py`
 （`ResourceBudget`）が担う。
@@ -145,7 +145,6 @@ from .limits import (
     MAX_TRAIN_DATA_BYTES,
     MAX_TRAIN_EXAMPLES,
     MAX_TRAIN_LINE_BYTES,
-    MAX_TRAIN_RSS_BYTES,
     MAX_TRAIN_WALL_SECONDS,
     MAX_VALIDATION_ID_BYTES,
     MAX_VALIDATION_INPUT_BYTES,
@@ -153,6 +152,7 @@ from .limits import (
     MIN_LABELS,
     MIN_MAX_BYTES,
     MIN_SEED,
+    max_train_rss_bytes_for_kind,
 )
 
 SCHEMA_VERSION = 1
@@ -440,13 +440,15 @@ def validate_request(raw: Any) -> TrainRequest:
     ):
         raise _invalid(f"time_limit_seconds must be an integer in [1, {MAX_TRAIN_WALL_SECONDS}]")
 
-    rss_limit_bytes = raw.get("rss_limit_bytes", MAX_TRAIN_RSS_BYTES)
+    # kind ごとの既定・上限（qwen2_lora のみ 12 GiB。#665・REQ-39）。
+    max_rss = max_train_rss_bytes_for_kind(kind)
+    rss_limit_bytes = raw.get("rss_limit_bytes", max_rss)
     if (
         not isinstance(rss_limit_bytes, int)
         or isinstance(rss_limit_bytes, bool)
-        or not (1 <= rss_limit_bytes <= MAX_TRAIN_RSS_BYTES)
+        or not (1 <= rss_limit_bytes <= max_rss)
     ):
-        raise _invalid(f"rss_limit_bytes must be an integer in [1, {MAX_TRAIN_RSS_BYTES}]")
+        raise _invalid(f"rss_limit_bytes must be an integer in [1, {max_rss}]")
 
     validation_inputs = _validate_validation_inputs(
         raw.get("validation_inputs"), "validation_inputs" in raw

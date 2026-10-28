@@ -499,6 +499,52 @@ fn drain_capped<R: Read>(mut reader: R, cap: usize) -> DrainedOutput {
     }
 }
 
+/// 進捗行として親の stderr へ転送する行の接頭辞（`kinds/qwen2_lora.py` の進捗行。#665）。
+pub const PROGRESS_LINE_PREFIX: &[u8] = b"qwen2_lora: step ";
+/// 転送する 1 行の長さ上限（超過分は切る）。
+#[cfg(unix)]
+const PROGRESS_LINE_MAX_BYTES: usize = 256;
+
+/// ワーカーの stderr を読みつつ、`qwen2_lora: step ` で始まる行だけを `sink` へ 1 行ずつ
+/// 転送する `Read` 包み。読んだバイトはそのまま呼び出し元（[`drain_capped`]）へ返すため、
+/// 保持・上限の挙動は変わらない。他の行（データ由来の文字列を含みうる）は転送しない。
+/// 転送する行は印字可能 ASCII 以外（制御文字・ANSI・非 UTF-8）を `?` に置換し、行末の `\r` は落とす。
+/// 転送失敗は無視する（進捗は診断用で、学習の成否に影響させない）。REQ-39・#665。
+#[cfg(unix)]
+struct ProgressTee<R, W> {
+    inner: R,
+    sink: W,
+    line: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl<R: Read, W: Write> Read for ProgressTee<R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        for &b in buf.get(..n).unwrap_or(&[]) {
+            if b == b'\n' {
+                if self.line.starts_with(PROGRESS_LINE_PREFIX) {
+                    if self.line.last() == Some(&b'\r') {
+                        self.line.pop();
+                    }
+                    let clean: Vec<u8> = self
+                        .line
+                        .iter()
+                        .map(|&c| if (b' '..=b'~').contains(&c) { c } else { b'?' })
+                        .collect();
+                    let _ = self.sink.write_all(&clean);
+                    let _ = self.sink.write_all(b"\n");
+                    let _ = self.sink.flush();
+                }
+                self.line.clear();
+            } else if self.line.len() < PROGRESS_LINE_MAX_BYTES {
+                self.line.push(b);
+            }
+        }
+        Ok(n)
+    }
+}
+
 /// パイプ読み取りを専用スレッドへ切り出し、`mpsc::Receiver` を返す
 /// （呼び出し元は `recv_timeout` で上限付きに待つ）。
 #[cfg(unix)]
@@ -1540,7 +1586,16 @@ pub fn run_train_cancellable(
     let stderr_pipe = child.stderr.take();
     let stdout_rx =
         stdout_pipe.map(|pipe| spawn_reader(pipe, request.max_result_bytes().saturating_add(1)));
-    let stderr_rx = stderr_pipe.map(|pipe| spawn_reader(pipe, MAX_WORKER_STDERR_BYTES));
+    let stderr_rx = stderr_pipe.map(|pipe| {
+        spawn_reader(
+            ProgressTee {
+                inner: pipe,
+                sink: std::io::stderr(),
+                line: Vec::new(),
+            },
+            MAX_WORKER_STDERR_BYTES,
+        )
+    });
 
     let deadline = started + limits.wall_timeout();
 
@@ -1999,6 +2054,71 @@ pub fn run_train(
 
 #[cfg(test)]
 mod tests {
+    /// REQ-39・#665: 進捗行（接頭辞つき）だけが転送され、他の行は転送されず、読み取り結果は不変。
+    #[cfg(unix)]
+    #[test]
+    fn progress_tee_forwards_only_prefixed_lines() {
+        let input: &[u8] =
+            b"secret data line\nqwen2_lora: step 10/300 loss=1.0000 rss_bytes=5\nnoise\n";
+        let mut sink = Vec::new();
+        let mut tee = super::ProgressTee {
+            inner: input,
+            sink: &mut sink,
+            line: Vec::new(),
+        };
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut tee, &mut out).unwrap();
+        assert_eq!(out, input);
+        assert_eq!(
+            sink,
+            b"qwen2_lora: step 10/300 loss=1.0000 rss_bytes=5\n".to_vec()
+        );
+    }
+
+    /// 1 byte ずつ read させて ProgressTee の転送結果を返す（複数 read にまたがる行の検証用）。
+    #[cfg(unix)]
+    fn tee_bytewise(input: &[u8]) -> Vec<u8> {
+        struct OneByte<'a>(&'a [u8]);
+        impl std::io::Read for OneByte<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match (self.0.split_first(), buf.first_mut()) {
+                    (Some((b, rest)), Some(slot)) => {
+                        *slot = *b;
+                        self.0 = rest;
+                        Ok(1)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let mut sink = Vec::new();
+        let mut tee = super::ProgressTee {
+            inner: OneByte(input),
+            sink: &mut sink,
+            line: Vec::new(),
+        };
+        std::io::Read::read_to_end(&mut tee, &mut Vec::new()).unwrap();
+        sink
+    }
+
+    /// REQ-39・#665: 制御文字・ANSI・非 UTF-8 は `?` に置換、`\r\n` の `\r` は落ちる、改行無しの末尾は転送しない、
+    /// 256 B 超の行は切り詰め、複数 read にまたがる行も転送される。
+    #[cfg(unix)]
+    #[test]
+    fn progress_tee_sanitizes_truncates_and_handles_split_reads() {
+        let out = tee_bytewise(b"qwen2_lora: step 1/2 \x1b[31m\xff\x00x\r\n");
+        assert_eq!(out, b"qwen2_lora: step 1/2 ?[31m??x\n".to_vec());
+        // 改行無しの末尾は転送しない。
+        assert!(tee_bytewise(b"qwen2_lora: step 3/4").is_empty());
+        // 256 B 超は先頭 256 B で切る。
+        let mut long = b"qwen2_lora: step ".to_vec();
+        long.extend(std::iter::repeat_n(b'9', 400));
+        long.push(b'\n');
+        let out = tee_bytewise(&long);
+        assert_eq!(out.len(), 256 + 1);
+        assert_eq!(out.last(), Some(&b'\n'));
+    }
+
     use super::*;
     use crate::limits::MAX_TRAIN_WALL_SECONDS;
     use crate::request::{Device, TrainRequestParams};

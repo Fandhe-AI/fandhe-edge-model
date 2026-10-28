@@ -105,6 +105,14 @@ fn req39_limits_fixture_matches_rust_constants() {
         Some(limits::MAX_TRAIN_RSS_BYTES)
     );
     assert_eq!(
+        fixture["progress_line_prefix"].as_str().map(str::as_bytes),
+        Some(fandhe_edge_train::process::PROGRESS_LINE_PREFIX)
+    );
+    assert_eq!(
+        fixture["max_qwen2_lora_train_rss_bytes"].as_u64(),
+        Some(limits::MAX_QWEN2_LORA_TRAIN_RSS_BYTES)
+    );
+    assert_eq!(
         fixture["max_result_bytes"].as_u64(),
         Some(limits::MAX_RESULT_BYTES as u64)
     );

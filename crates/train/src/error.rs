@@ -181,8 +181,9 @@ impl std::fmt::Display for TrainRequestError {
             ),
             TrainRequestError::InvalidRssLimitBytes => write!(
                 f,
-                "rss_limit_bytes must be an integer in [1, {}]",
-                crate::limits::MAX_TRAIN_RSS_BYTES
+                "rss_limit_bytes must be an integer in [1, {}] ({} for qwen2_lora)",
+                crate::limits::MAX_TRAIN_RSS_BYTES,
+                crate::limits::MAX_QWEN2_LORA_TRAIN_RSS_BYTES
             ),
             TrainRequestError::InvalidPath { field } => {
                 write!(f, "{field} has an invalid path")

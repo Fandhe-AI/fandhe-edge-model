@@ -29,11 +29,13 @@ mlx は関数内で遅延 import する（選択口の import を軽く保つ）
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import random
+import sys
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import IO, Any
 
@@ -329,6 +331,35 @@ def _build_sequences(
     return seqs, tokenizer.special_ids["endoftext"]
 
 
+#: 学習中の MLX buffer cache の上限（512 MiB）。無制限だと CPU・GPU とも 1 ステップごとに
+#: cache が数 GiB ずつ増え RSS 上限（REQ-39）を超える。上限つきにすると RSS が実使用量を表す。
+#: 計算内容は変わらない。PoC（`tools/poc26/cli.py::CACHE_LIMIT_BYTES`）と同値。#665。
+MLX_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
+
+
+@contextlib.contextmanager
+def mlx_cache_limited() -> Iterator[None]:
+    """qwen2_lora のワーカー処理全体（学習・予測・書き出し）で MLX の cache 上限を掛ける。
+
+    `cli.py` の train ワーカーが qwen2_lora のときだけ使う。抜けるときに元の上限へ戻す（#665）。
+    """
+    import mlx.core as mx
+
+    prev = mx.set_cache_limit(MLX_CACHE_LIMIT_BYTES)
+    try:
+        yield
+    finally:
+        mx.set_cache_limit(prev)
+
+
+#: 進捗を stderr へ出すステップ間隔（最終ステップも出す）。
+PROGRESS_EVERY_STEPS = 10
+
+#: 進捗行の接頭辞。Rust `crates/train/src/process.rs::PROGRESS_LINE_PREFIX` と同値
+#: （fixtures/train_contract/limits.json の `progress_line_prefix` で照合）。#665。
+PROGRESS_LINE_PREFIX = "qwen2_lora: step "
+
+
 def _train_loop(
     model: Any,
     seqs: list[list[int]],
@@ -350,7 +381,7 @@ def _train_loop(
     model.train()
     order: list[int] = []
     loss_value = float("nan")
-    for _ in range(cfg["iters"]):
+    for step in range(1, cfg["iters"] + 1):
         resource_budget.check()
         if not order:
             order = [int(i) for i in rng.permutation(len(batches))]
@@ -361,6 +392,14 @@ def _train_loop(
         loss_value = float(loss.item())
         if not math.isfinite(loss_value):
             raise WorkerError("runtime_error", "loss is not finite", ExitCode.RUNTIME_ERROR)
+        if step % PROGRESS_EVERY_STEPS == 0 or step == cfg["iters"]:
+            # 数値のみ（学習データの本文は出さない）。Rust 側は stderr を上限つきで読み捨てる
+            print(
+                f"{PROGRESS_LINE_PREFIX}{step}/{cfg['iters']} loss={loss_value:.4f}"
+                f" rss_bytes={resource_budget.usage_bytes()}",
+                file=sys.stderr,
+                flush=True,
+            )
     resource_budget.check()
     model.eval()
     return loss_value, cfg["iters"]
@@ -506,11 +545,14 @@ class Qwen2LoraKind:
 
         from ..qwen2_model import apply_lora, load_base_model, load_base_model_at
 
+        resource_budget.include_mlx_peak = True
         mx.set_default_device(mx.gpu if request.device == "gpu" else mx.cpu)
         _seed_all(request.seed)
         if len(examples) < cfg["batch_size"]:
             raise WorkerError(
-                "invalid_data", "fewer training examples than batch_size", ExitCode.INVALID_INPUT
+                "invalid_data",
+                "fewer training examples than batch_size",
+                ExitCode.INVALID_INPUT,
             )
         dtype = mx.bfloat16 if cfg["dtype"] == "bfloat16" else mx.float32
         load_args = {

@@ -81,6 +81,22 @@ pub fn max_model_bytes_for_kind(kind: &str) -> u64 {
 /// 1 学習ジョブあたりの RSS 上限（バイト）。`limits.py::MAX_TRAIN_RSS_BYTES`。
 pub const MAX_TRAIN_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// qwen2_lora の学習 RSS の既定・上限（12 GiB）。`limits.py::MAX_QWEN2_LORA_TRAIN_RSS_BYTES`。
+/// 根拠: 1.5B の GPU 学習の実測ピーク 7.37 GB・見積式は実測の約 1.4 倍で max_seq_length 512 に約 10 GB、
+/// PoC は 12 GiB で完走（PoC-26・#628 の実機）。7B の学習は収まらず範囲外。
+/// 上限緩和はオーナー判断 2026-10-27（上限の見直しを一任）・#665。REQ-39・REQ-41。
+pub const MAX_QWEN2_LORA_TRAIN_RSS_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+
+/// `kind` ごとの学習 RSS の既定・上限。qwen2_lora のみ 12 GiB、他は [`MAX_TRAIN_RSS_BYTES`]。
+/// `limits.py::max_train_rss_bytes_for_kind`。
+pub fn max_train_rss_bytes_for_kind(kind: &str) -> u64 {
+    if kind == "qwen2_lora" {
+        MAX_QWEN2_LORA_TRAIN_RSS_BYTES
+    } else {
+        MAX_TRAIN_RSS_BYTES
+    }
+}
+
 /// 学習結果（ワーカーの標準出力）の読み込み上限（バイト）。
 /// `supervisor.py::_MAX_WORKER_STDOUT_BYTES`。
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
