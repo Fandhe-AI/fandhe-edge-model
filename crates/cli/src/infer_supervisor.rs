@@ -1,5 +1,5 @@
-//! `infer`・`evaluate` の時間・RSS の安全上限を子プロセス境界で強制する監督層（REQ-39・TASK-39.5-3・#577。
-//! 親 issue #576 の二層化のうち「安全上限」側。`evaluate` は追加学習の GiB 級 shard を読むため、#662 で対象に加えた）。
+//! `infer`・`evaluate`・`package` の時間・RSS の安全上限を子プロセス境界で強制する監督層（REQ-39・TASK-39.5-3・#577。
+//! 親 issue #576 の二層化のうち「安全上限」側。`evaluate`・`package` は追加学習の GiB 級 shard を読むため、#662 で対象に加えた）。
 //!
 //! # 役割と呼び出し文脈
 //!
@@ -41,14 +41,14 @@
 //!   worker のガード検査と協調的な期限は実際の `kind` で効く
 //! - `kind` を読めない・許可外のときは厳しい上限（10 秒・2 GiB）に落とす（本来のエラーは worker が出す）
 
-use crate::args::{EvaluateArgs, InferArgs, InferSource};
+use crate::args::{EvaluateArgs, InferArgs, InferSource, PackageArgs};
 use crate::error_report::default_message;
 use crate::infer_batch::{
     MAX_INFER_BATCH_OUTPUT_DURATION, OutputWatchdog, SINGLE_HARD_LIMIT_GRACE,
 };
 use crate::infer_guard::peek_checked_kind;
 use crate::output::write_error_report;
-use crate::project::Project;
+use crate::project::{Project, SELECTION_FILE};
 use crate::stages::train::load_trained;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_guard::resource::{
@@ -56,7 +56,9 @@ use fandhe_edge_guard::resource::{
     ResourceConfigError, ResourceKind, ResourceLimitExceeded, RunConfig, SafetyLimits, TimeLimit,
     run_with_limits, safety_limits_for_kind,
 };
+use fandhe_edge_runtime::latency::DEFAULT_LATENCY_TOTAL_TIMEOUT_NS;
 use fandhe_edge_runtime::pipeline::MAX_INFER_BATCH_DURATION;
+use fandhe_edge_train::stage_files::SelectionRecord;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
@@ -70,7 +72,7 @@ pub const WORKER_ENV: &str = "FANDHE_EDGE_INFER_WORKER";
 // ponytail: 暫定 2 秒。種類ごとの時間上限（#578・#435）に上乗せする固定値で、大きいパッケージの起動が長引くなら見直す。
 pub const SUPERVISOR_GRACE: Duration = Duration::from_secs(2);
 
-/// 現在のプロセスが worker か（`infer`・`evaluate` 共通）。
+/// 現在のプロセスが worker か（`infer`・`evaluate`・`package` 共通）。
 #[must_use]
 pub fn is_worker() -> bool {
     std::env::var_os(WORKER_ENV).is_some_and(|v| v == "1")
@@ -121,6 +123,33 @@ pub fn evaluate_config(limits: SafetyLimits) -> Result<RunConfig, ResourceConfig
     config_with(inner, limits)
 }
 
+/// `package` の監督設定（REQ-39・REQ-41・#662。RSS は `limits.memory()`）。
+///
+/// 親の時間上限は
+/// `2 × limits.time() + DEFAULT_LATENCY_TOTAL_TIMEOUT + MAX_INFER_BATCH_OUTPUT_DURATION + SUPERVISOR_GRACE`。内訳:
+/// - `1 × limits.time()`: パイプライン構築（shard の全読込と sha256 照合を含む。`infer` の 1 件上限と同じく
+///   「読み込み込み」の上限を 1 回ぶん見込む）
+/// - `DEFAULT_LATENCY_TOTAL_TIMEOUT`（600 秒）: p95 計測（`limits.max_infer_p95_us` があるときだけ。warmup と計測の合計の
+///   協調的な期限。`MAX_INFER_BATCH_DURATION` と同じ値）
+/// - `1 × limits.time()`: 成果物のステージングへの複写（GiB 級 shard）・複写後の sha256 再照合・容量計測
+/// - `MAX_INFER_BATCH_OUTPUT_DURATION`（60 秒）: 版管理台帳・`package/` の公開（fsync・rename）と stdout の書き出し
+///
+/// 値は種類が 10 秒の既存 3 種で 682 秒、追加学習（60 秒）で 782 秒（どちらも `MAX_TIME_LIMIT` 3600 秒以内）。
+///
+/// # Errors
+/// 上限が範囲外（定数から作るため通常は起きない）。
+// ponytail: 複写と再照合の時間を表す既存定数が無いため、暫定で構築の上限 `limits.time()` をもう 1 回足している。
+// 実機で GiB 級 shard の複写＋再照合がこれを超えるなら、複写専用の定数を設計して置き換える。
+pub fn package_config(limits: SafetyLimits) -> Result<RunConfig, ResourceConfigError> {
+    let inner = limits
+        .time()
+        .get()
+        .saturating_mul(2)
+        .saturating_add(Duration::from_nanos(DEFAULT_LATENCY_TOTAL_TIMEOUT_NS))
+        .saturating_add(MAX_INFER_BATCH_OUTPUT_DURATION);
+    config_with(inner, limits)
+}
+
 fn config_with(inner: Duration, limits: SafetyLimits) -> Result<RunConfig, ResourceConfigError> {
     RunConfig::new(
         TimeLimit::new(inner.saturating_add(SUPERVISOR_GRACE))?,
@@ -137,6 +166,8 @@ pub enum Workload {
     Inference,
     /// `evaluate`（REQ-39・#662）。
     Evaluation,
+    /// `package`（REQ-39・#662）。
+    Packaging,
 }
 
 impl Workload {
@@ -144,6 +175,7 @@ impl Workload {
         match self {
             Self::Inference => "inference",
             Self::Evaluation => "evaluation",
+            Self::Packaging => "packaging",
         }
     }
 }
@@ -221,6 +253,46 @@ pub fn run_evaluate<W: Write>(
         raw_args,
         cwd,
     )
+}
+
+/// `package` を worker として起動し、時間・RSS を監視して結果を `out` へ中継する（REQ-39・REQ-41・#662）。
+///
+/// RSS・時間の上限は選定候補の `kind`（`selection_record.json` の添字の `result.json` から読む。`evaluate` と同じ
+/// 読み方）で選ぶ。読めない・許可外なら厳しい上限に落とし、本来のエラーは worker が出す。
+///
+/// worker が kill されたときの残り方（新しい後始末は持たない）:
+/// - `package/` は原子的な公開（rename）まで作られないので、kill では半端な `package/` は残らない
+/// - 組み立て中なら `package.staging/` が残る。再実行は `directory already exists`（64）で拒否されるため、
+///   利用者が `package.staging/` を消してからやり直す
+/// - 台帳の公開と `package/` の公開の間（ごく短い窓）で kill されると `version_ledger.json` も残り、再実行は
+///   `version ledger already exists`（64）で拒否される。同様に利用者が両方を消す
+///
+/// # Errors
+/// `out` への書き込み失敗（呼び出し側は exit 70 に写す）。
+pub fn run_package<W: Write>(
+    out: &mut W,
+    args: &PackageArgs,
+    raw_args: impl IntoIterator<Item = OsString>,
+    cwd: &Path,
+) -> io::Result<ExitCode> {
+    let limits =
+        peek_package_kind(cwd, args).map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(&k));
+    launch(
+        out,
+        Workload::Packaging,
+        package_config(limits),
+        raw_args,
+        cwd,
+    )
+}
+
+/// 親が種類別の上限を選ぶために、選定候補の `kind` だけを読む（失敗は `None`）。
+fn peek_package_kind(cwd: &Path, args: &PackageArgs) -> Option<String> {
+    let project = Project::open(cwd, &args.project_dir).ok()?;
+    let bytes = project.read(SELECTION_FILE, 64 * 1024).ok()?;
+    let selection = SelectionRecord::from_json_slice(&bytes).ok()?;
+    let (request, _) = load_trained(&project, selection.candidate_index).ok()??;
+    Some(request.kind().to_string())
 }
 
 /// 親が種類別の上限を選ぶために、対象候補の `kind` だけを読む（失敗は `None`）。
@@ -423,6 +495,54 @@ mod tests {
             f.message,
             format!(
                 "evaluation supervisor failed: {}",
+                GuardRunError::Spawn.code()
+            )
+        );
+    }
+
+    /// REQ-39・REQ-41・#662: `package` の親の時間は `2 × limits.time() + 600 秒 + 60 秒 + 2 秒`。
+    /// 既存 3 種と未知の種類・読めないときの厳しい側は 682 秒・2 GiB、追加学習は 782 秒・24 GiB。
+    #[test]
+    fn req39_package_config_is_682_seconds_for_byte_kinds_and_782_for_qwen2_lora() {
+        for kind in ["c1", "c3", "autoregressive", "unknown"] {
+            let c = package_config(safety_limits_for_kind(kind)).unwrap();
+            assert_eq!(c.time_limit(), Duration::from_secs(682));
+            assert_eq!(c.memory_limit(), Some(2_147_483_648));
+        }
+        let c = package_config(safety_limits_for_kind("qwen2_lora")).unwrap();
+        assert_eq!(c.time_limit(), Duration::from_secs(782));
+        assert_eq!(c.memory_limit(), Some(25_769_803_776));
+        let s = package_config(SafetyLimits::STRICT).unwrap();
+        assert_eq!(s.time_limit(), Duration::from_secs(682));
+        assert_eq!(s.memory_limit(), Some(2_147_483_648));
+    }
+
+    /// REQ-39・#662: `package` の上限超過・監督失敗の message は `packaging` の固定語彙。
+    #[test]
+    fn req39_package_messages_use_packaging_vocabulary() {
+        let t = limit_report(
+            Workload::Packaging,
+            &ResourceLimitExceeded::time(Duration::from_secs(1), Duration::from_secs(2), true),
+        );
+        assert_eq!(t.code, ExitCode::LimitExceeded);
+        assert_eq!(t.message, "packaging time limit exceeded");
+        let m = limit_report(
+            Workload::Packaging,
+            &ResourceLimitExceeded::memory(
+                Duration::from_secs(1),
+                1,
+                2,
+                Duration::from_secs(1),
+                true,
+            ),
+        );
+        assert_eq!(m.message, "packaging memory limit exceeded");
+        let f = supervisor_failed(Workload::Packaging, GuardRunError::Spawn);
+        assert_eq!(f.code, ExitCode::RuntimeError);
+        assert_eq!(
+            f.message,
+            format!(
+                "packaging supervisor failed: {}",
                 GuardRunError::Spawn.code()
             )
         );
