@@ -253,6 +253,27 @@ fn req39_issue662_crashed_package_removes_staging_created_by_worker() {
     assert!(!proj.join("package.staging").exists());
 }
 
+/// REQ-39・#662: 後始末はプロジェクトの外を消さない。kill 後にステージング・台帳が外を指す symlink へ
+/// 差し替えられていても、外のディレクトリとファイルは残る（消えるのはプロジェクト内のリンクだけ）。
+#[test]
+fn req39_issue662_cleanup_does_not_follow_symlinks_out_of_project() {
+    use fandhe_edge_cli::infer_supervisor::PackageRemnants;
+    let (cwd, proj) = package_project("symlink");
+    let outside = cwd.join("outside");
+    std::fs::create_dir(&outside).expect("outside");
+    std::fs::write(outside.join("keep"), b"x").expect("keep");
+    let remnants = PackageRemnants::snapshot(&cwd, std::path::Path::new("proj"))
+        .expect("lock")
+        .expect("project");
+    std::os::unix::fs::symlink(&outside, proj.join("package.staging")).expect("staging link");
+    std::os::unix::fs::symlink(outside.join("keep"), proj.join("version_ledger.json"))
+        .expect("ledger link");
+    remnants.discard_created();
+    assert_eq!(std::fs::read(outside.join("keep")).expect("keep"), b"x");
+    assert!(outside.is_dir());
+    assert!(!proj.join("version_ledger.json").exists());
+}
+
 /// REQ-39・#662: 同じプロジェクトの `package` の親は 1 つだけ。ロックを持つ間の 2 つ目は 64 で拒否し、
 /// 解放後は取れる（後始末が他の `package` の作ったものを消さないための排他）。
 #[test]
