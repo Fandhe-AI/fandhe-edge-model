@@ -6462,6 +6462,33 @@ mod suite {
         stopped(&env, "path rejected: path_unresolvable");
     }
 
+    /// REQ-27・REQ-39・REQ-41・#662: `evaluate` の後に、新しい shard の内容と、その sha256 に書き換えた
+    /// `artifact.json` を両方置く（内部で整合した差し替え）と、`package` は評価記録との照合で 64 で止め、
+    /// `package/`・ステージング・版管理台帳を作らない（証拠種別: テストハーネス）。
+    pub fn qwen2_lora_package_rejects_consistent_swap_after_evaluate() {
+        let (env, dir) = qwen2_evaluated("qwen2-pkg-swap");
+        let old = std::fs::read(dir.join("weights-00000.bin")).expect("shard");
+        let old_sha = Sha256Digest::of_bytes(&old).to_hex();
+        let mut swapped = old;
+        swapped[0] ^= 1;
+        let new_sha = Sha256Digest::of_bytes(&swapped).to_hex();
+        let meta = std::fs::read_to_string(dir.join("artifact.json")).expect("meta");
+        assert!(meta.contains(&old_sha), "shard sha256 is recorded");
+        overwrite(&dir.join("weights-00000.bin"), &swapped);
+        overwrite(
+            &dir.join("artifact.json"),
+            meta.replace(&old_sha, &new_sha).as_bytes(),
+        );
+        let out = env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input");
+        assert_eq!(
+            out,
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation record does not match the package\"}\n"
+        );
+        for f in ["package", "package.staging", "version_ledger.json"] {
+            assert!(!env.project_file(f).exists(), "{f}");
+        }
+    }
+
     /// REQ-39・REQ-41・#662: `select` が検出するのは shard の欠落と symlink 化（経路の閉じ込め）まで。
     /// 同じサイズの改変は `select` では検出せず、`evaluate` 以降のランタイムの照合で止まる。
     pub fn qwen2_lora_select_rejects_tampered_members() {
@@ -6675,6 +6702,10 @@ fn main() -> std::process::ExitCode {
         (
             "qwen2_lora_package_rejects_tampered_members",
             suite::qwen2_lora_package_rejects_tampered_members,
+        ),
+        (
+            "qwen2_lora_package_rejects_consistent_swap_after_evaluate",
+            suite::qwen2_lora_package_rejects_consistent_swap_after_evaluate,
         ),
         (
             "qwen2_lora_evaluate_rejects_tampered_members",
