@@ -48,6 +48,9 @@ fn child_entry() {
             let proj = std::path::PathBuf::from(std::env::var(DIR_ENV).expect("dir"));
             std::fs::create_dir(proj.join("package.staging")).expect("staging");
             std::fs::write(proj.join("version_ledger.json"), b"{}").expect("ledger");
+            // 台帳の書きかけ（`publish_new_file` の一時名）。
+            let tmp = format!(".tmp-version_ledger.json-{}", std::process::id());
+            std::fs::write(proj.join(tmp), b"{").expect("ledger tmp");
             if mode == "publish" {
                 std::fs::create_dir(proj.join("package")).expect("package");
             }
@@ -206,6 +209,11 @@ fn req39_issue662_killed_package_removes_staging_and_ledger_created_by_worker() 
     assert!(!proj.join("package.staging").exists());
     assert!(!proj.join("version_ledger.json").exists());
     assert!(!proj.join("package").exists());
+    assert_eq!(
+        std::fs::read_dir(&proj).expect("list").count(),
+        1,
+        "only .package.lock remains"
+    );
 }
 
 /// REQ-39・#662: launch 前からあったステージング・台帳は利用者の物として消さない。
