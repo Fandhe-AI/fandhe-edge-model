@@ -666,7 +666,7 @@ impl PackageCapacity {
 /// 性能の 3 層（spec 20 回目のオーナー判断。REQ-31・TASK-41.9・#579）を欄で区別する。
 /// - `limit_us`・`exceeded`: 利用者設定の上限（`limits.max_infer_p95_us`）。超過は終了コード 20
 /// - `guideline_us`・`over_guideline`: 目標（250ms）。超過は警告のみで終了コードは 0 のまま
-/// - 安全上限（暴走止め）は `infer` の監督層が別に強制する。この型には現れない
+/// - 安全上限（暴走止め）は監督層（`infer`・`evaluate`・`package`）が別に強制する。この型には現れない
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct InferP95 {
     p95_us: u64,

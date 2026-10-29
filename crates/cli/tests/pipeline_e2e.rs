@@ -23,6 +23,11 @@
 //! を置き、結果 JSON を 1 行出す。validation 予測は c1 が常に `alpha`、c3 が入力の先頭の語
 //! （合成データの正解ラベルと一致）とする（正解率に差を付けて選定を確認するため）。
 
+/// `fixtures/qwen2_parity/cases.json` の読み取り（`infer_qwen2_parity.rs` と共有。REQ-41・REQ-28・#662）。
+#[cfg(unix)]
+#[path = "support/qwen2_cases.rs"]
+mod qwen2_cases;
+
 #[cfg(unix)]
 mod suite {
     use std::collections::BTreeMap;
@@ -6027,11 +6032,10 @@ mod suite {
     /// REQ-41・REQ-33・REQ-39・#628: `train --kind qwen2_lora --base-model-dir` が CLI から完走し、学習リクエストに
     /// 定義の同一性・来歴と照合済みの場所が入る（偽ワーカー＋parity fixture。証拠種別: テストハーネス）。
     ///
-    /// `select`・`evaluate` は tokenizer 入力表現（`qwen2_lora`）に接続済み（#662-a）で、`select` の選定と
-    /// `evaluate` の評価記録までを確かめる。`package` の tokenizer 経路は #662-b で接続するまで fail-closed
-    /// （64 `unsupported input representation`）で、接続したら `infer`（`fixtures/qwen2_parity/cases.json` の
-    /// 予測と照合）まで延ばす。
-    pub fn qwen2_lora_runs_through_evaluate() {
+    /// 7 工程すべてが tokenizer 入力表現（`qwen2_lora`）に接続済み（#662）。`select` の選定・`evaluate` の評価記録に
+    /// 続き、`package` が shard と tokenizer.json を含む自己完結パッケージを作り、`infer` の予測が
+    /// `fixtures/qwen2_parity/cases.json` の学習側の予測と全件一致する（REQ-28・REQ-41）。
+    pub fn qwen2_lora_runs_all_seven_stages() {
         let env = qwen2_inspected("qwen2-full", true);
         assert_eq!(
             env.ok(&TRAIN_QWEN2),
@@ -6096,11 +6100,96 @@ mod suite {
             env.fails(&EVALUATE_QWEN2, 64, "invalid_input"),
             "{\"code\":\"invalid_input\",\"message\":\"candidate has already been evaluated on the frozen data\"}\n"
         );
-        // `package` の tokenizer 経路は #662-b まで未接続（不完全なパッケージを作らない）。
-        assert_eq!(
-            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
-            "{\"code\":\"invalid_input\",\"message\":\"unsupported input representation\"}\n"
+        // 配布: shard（重み）と tokenizer.json（語彙・特徴量変換）を持つ自己完結パッケージを公開する
+        // （容量の 5 区分は据え置きで、shard は weights、tokenizer.json は vocab_or_feature_transform。REQ-30・REQ-41）。
+        let packaged = env.ok(&["package", "--project-dir", "proj"]);
+        assert!(
+            packaged.starts_with("{\"step\":\"package\",\"status\":\"ok\""),
+            "{packaged}"
         );
+        // weights は ONNX 本体＋ shard 1 件、語彙・特徴量変換は tokenizer.json 1 件。
+        let component = |key: &str| {
+            let rest = packaged.split(key).nth(1).expect("component");
+            rest.split('}').next().expect("component end").to_string()
+        };
+        assert!(
+            component("\"weights\":{").ends_with("\"file_count\":2"),
+            "{packaged}"
+        );
+        assert!(
+            component("\"vocab_or_feature_transform\":{").ends_with("\"file_count\":1"),
+            "{packaged}"
+        );
+        for f in [
+            "weights-00000.bin",
+            "tokenizer.json",
+            "model.onnx",
+            "artifact.json",
+            "definition.json",
+        ] {
+            assert!(env.project_file(&format!("package/{f}")).is_file(), "{f}");
+        }
+        // 配布した shard・tokenizer.json は候補の成果物と同じバイト列（複写後の再照合を通っている）。
+        let artifact_dir = qwen2_artifact_dir(&env);
+        for f in ["weights-00000.bin", "tokenizer.json", "model.onnx"] {
+            assert_eq!(
+                std::fs::read(artifact_dir.join(f)).expect("source"),
+                std::fs::read(env.project_file(&format!("package/{f}"))).expect("package"),
+                "{f}"
+            );
+        }
+        // 推論: 学習側（MLX 内推論）の予測ラベルと全件一致する（`--input-file` と単体。REQ-28・REQ-41）。
+        let cases = crate::qwen2_cases::load_cases();
+        assert_eq!(cases.len(), 120);
+        let predicted = |line: &str| {
+            let key = "\"predicted_label\":\"";
+            let start = line.find(key).expect("label key") + key.len();
+            line[start..].split('"').next().expect("label").to_string()
+        };
+        let jsonl: String = cases
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{{\"id\":\"{i}\",\"input\":\"{}\"}}\n", c.raw_input))
+            .collect();
+        std::fs::write(env.work.join("cases.jsonl"), jsonl).expect("cases");
+        let (code, lines) = env.run(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--input-file",
+            "cases.jsonl",
+        ]);
+        assert_eq!(code, 0, "{lines}");
+        assert_eq!(lines.lines().count(), cases.len());
+        let mismatched: Vec<&str> = cases
+            .iter()
+            .zip(lines.lines())
+            .filter(|(c, l)| QWEN2_LABELS.get(c.label).copied() != Some(predicted(l).as_str()))
+            .map(|(c, _)| c.name.as_str())
+            .collect();
+        assert!(mismatched.is_empty(), "batch labels differ: {mismatched:?}");
+        for (c, batch_line) in cases.iter().zip(lines.lines()).take(8) {
+            let text = c.raw_input.replace("\\t", "\t");
+            let (code, one) = env.run(&["infer", "--package", "proj/package", "--text", &text]);
+            // 評価で校正が同梱されるため、棄権（abstain）の行は exit 12（保留）でも予測ラベルは出る。
+            assert!(matches!(code, 0 | 12), "{}: {one}", c.name);
+            assert_eq!(
+                QWEN2_LABELS.get(c.label).copied(),
+                Some(predicted(&one).as_str()),
+                "{}",
+                c.name
+            );
+            assert_eq!(predicted(&one), predicted(batch_line), "{}", c.name);
+        }
+    }
+
+    /// `select` 後の `qwen2_lora` の成果物ディレクトリ（`artifact.json` があるもの）。
+    fn qwen2_artifact_dir(env: &Env) -> std::path::PathBuf {
+        std::fs::read_dir(env.project_file("candidates/2"))
+            .expect("candidate dir")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.join("artifact.json").is_file())
+            .expect("artifact dir")
     }
 
     /// REQ-41・REQ-18・#628: `train --all --kind qwen2_lora --base-model-dir` は既定候補の後ろに `qwen2_lora` を
@@ -6251,11 +6340,7 @@ mod suite {
         let env = qwen2_inspected(case, true);
         env.ok(&TRAIN_QWEN2);
         env.ok(&SELECT_QWEN2);
-        let artifact = std::fs::read_dir(env.project_file("candidates/2"))
-            .expect("candidate dir")
-            .map(|e| e.expect("entry").path())
-            .find(|p| p.join("artifact.json").is_file())
-            .expect("artifact dir");
+        let artifact = qwen2_artifact_dir(&env);
         (env, artifact)
     }
 
@@ -6325,6 +6410,83 @@ mod suite {
         let (env, dir) = qwen2_selected("qwen2-missing-shard");
         std::fs::remove_file(dir.join("weights-00000.bin")).expect("remove shard");
         stopped(&env, Some("path rejected: path_unresolvable"));
+    }
+
+    /// `qwen2_lora` を `train`・`select`・`evaluate` まで進める（偽ワーカー）。成果物のディレクトリを返す。
+    fn qwen2_evaluated(case: &str) -> (Env, std::path::PathBuf) {
+        let (env, dir) = qwen2_selected(case);
+        env.ok(&EVALUATE_QWEN2);
+        (env, dir)
+    }
+
+    /// REQ-27・REQ-39・REQ-41・#662: `evaluate` の後に成果物を改変した `qwen2_lora` は `package` が 64 で止め、
+    /// `package/`・ステージング・版管理台帳を作らない。shard の 1 バイト改変・`artifact.json` の shard sha256 の改変・
+    /// tokenizer.json の改変・shard の欠落が対象（証拠種別: テストハーネス）。
+    pub fn qwen2_lora_package_rejects_tampered_members() {
+        let stopped = |env: &Env, message: &str| {
+            let out = env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input");
+            assert_eq!(
+                out,
+                format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n")
+            );
+            for f in ["package", "package.staging", "version_ledger.json"] {
+                assert!(!env.project_file(f).exists(), "{f}");
+            }
+        };
+        // (a) shard の 1 バイト改変（ランタイムの読み込み時照合）。
+        let (env, dir) = qwen2_evaluated("qwen2-pkg-shard");
+        let mut shard = std::fs::read(dir.join("weights-00000.bin")).expect("shard");
+        shard[0] ^= 1;
+        overwrite(&dir.join("weights-00000.bin"), &shard);
+        stopped(&env, "model file cannot be loaded");
+        // (b) `artifact.json` の shard sha256 の改変。
+        let (env, dir) = qwen2_evaluated("qwen2-pkg-meta");
+        let meta = std::fs::read_to_string(dir.join("artifact.json")).expect("meta");
+        let shard_sha =
+            Sha256Digest::of_bytes(&std::fs::read(dir.join("weights-00000.bin")).expect("shard"))
+                .to_hex();
+        overwrite(
+            &dir.join("artifact.json"),
+            meta.replace(&shard_sha, &"0".repeat(64)).as_bytes(),
+        );
+        stopped(&env, "model file cannot be loaded");
+        // (c) tokenizer.json の改変（記録 sha256 と不一致）。
+        let (env, dir) = qwen2_evaluated("qwen2-pkg-tokenizer");
+        let mut tokenizer = std::fs::read(dir.join("tokenizer.json")).expect("tokenizer");
+        tokenizer.push(b' ');
+        overwrite(&dir.join("tokenizer.json"), &tokenizer);
+        stopped(&env, "package tokenizer does not match its recorded hash");
+        // (d) shard の欠落。
+        let (env, dir) = qwen2_evaluated("qwen2-pkg-missing");
+        std::fs::remove_file(dir.join("weights-00000.bin")).expect("remove shard");
+        stopped(&env, "path rejected: path_unresolvable");
+    }
+
+    /// REQ-27・REQ-39・REQ-41・#662: `evaluate` の後に、新しい shard の内容と、その sha256 に書き換えた
+    /// `artifact.json` を両方置く（内部で整合した差し替え）と、`package` は評価記録との照合で 64 で止め、
+    /// `package/`・ステージング・版管理台帳を作らない（証拠種別: テストハーネス）。
+    pub fn qwen2_lora_package_rejects_consistent_swap_after_evaluate() {
+        let (env, dir) = qwen2_evaluated("qwen2-pkg-swap");
+        let old = std::fs::read(dir.join("weights-00000.bin")).expect("shard");
+        let old_sha = Sha256Digest::of_bytes(&old).to_hex();
+        let mut swapped = old;
+        swapped[0] ^= 1;
+        let new_sha = Sha256Digest::of_bytes(&swapped).to_hex();
+        let meta = std::fs::read_to_string(dir.join("artifact.json")).expect("meta");
+        assert!(meta.contains(&old_sha), "shard sha256 is recorded");
+        overwrite(&dir.join("weights-00000.bin"), &swapped);
+        overwrite(
+            &dir.join("artifact.json"),
+            meta.replace(&old_sha, &new_sha).as_bytes(),
+        );
+        let out = env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input");
+        assert_eq!(
+            out,
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation record does not match the package\"}\n"
+        );
+        for f in ["package", "package.staging", "version_ledger.json"] {
+            assert!(!env.project_file(f).exists(), "{f}");
+        }
     }
 
     /// REQ-39・REQ-41・#662: `select` が検出するのは shard の欠落と symlink 化（経路の閉じ込め）まで。
@@ -6534,8 +6696,16 @@ fn main() -> std::process::ExitCode {
     }
     let tests: &[(&str, fn())] = &[
         (
-            "qwen2_lora_runs_through_evaluate",
-            suite::qwen2_lora_runs_through_evaluate,
+            "qwen2_lora_runs_all_seven_stages",
+            suite::qwen2_lora_runs_all_seven_stages,
+        ),
+        (
+            "qwen2_lora_package_rejects_tampered_members",
+            suite::qwen2_lora_package_rejects_tampered_members,
+        ),
+        (
+            "qwen2_lora_package_rejects_consistent_swap_after_evaluate",
+            suite::qwen2_lora_package_rejects_consistent_swap_after_evaluate,
         ),
         (
             "qwen2_lora_evaluate_rejects_tampered_members",

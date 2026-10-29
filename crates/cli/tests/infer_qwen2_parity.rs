@@ -13,54 +13,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "support/qwen2_cases.rs"]
+mod qwen2_cases;
+use qwen2_cases::load_cases;
+
 /// 単体推論（1 件 1 プロセス）で照合する件数。残りは `--input-file`（全件）で照合する。
 const SINGLE_CASES: usize = 8;
 
-struct Case {
-    name: String,
-    /// JSON 文字列リテラルの中身（エスケープ済み。`--input-file` の行へそのまま埋める）。
-    raw_input: String,
-    label: usize,
-}
-
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/qwen2_parity")
-}
-
-/// `cases.json`（整形済み・1 欄 1 行）から必要な欄だけを読む。serde_json を cli の依存へ足さないため、
-/// 行単位で読み、`\t` 以外のエスケープが現れたら失敗させる。
-fn load_cases() -> Vec<Case> {
-    let text = fs::read_to_string(fixture_dir().join("cases.json"))
-        .expect("fixture の整形形式が想定と違う（cases.json の読み込み失敗。生成側の責務）");
-    let (mut cases, mut name, mut raw) = (Vec::new(), None, None);
-    for line in text.lines().map(str::trim) {
-        if let Some(v) = line.strip_prefix("\"name\": \"") {
-            name = Some(v.trim_end_matches(',').trim_end_matches('"').to_string());
-        } else if let Some(v) = line.strip_prefix("\"input\": \"") {
-            raw = Some(v.trim_end_matches(',').trim_end_matches('"').to_string());
-        } else if let Some(v) = line.strip_prefix("\"mlx_label_index\": ") {
-            cases.push(Case {
-                name: name.take().expect(
-                    "fixture の整形形式が想定と違う（name の後に label が来る前提。生成側の責務）",
-                ),
-                raw_input: raw.take().expect(
-                    "fixture の整形形式が想定と違う（input の後に label が来る前提。生成側の責務）",
-                ),
-                label: v
-                    .trim_end_matches(',')
-                    .parse()
-                    .expect("fixture の整形形式が想定と違う（label が整数でない。生成側の責務）"),
-            });
-        }
-    }
-    for c in &cases {
-        assert!(
-            !c.raw_input.replace("\\t", "").contains(['\\', '"']),
-            "{}",
-            c.name
-        );
-    }
-    cases
 }
 
 /// 固定の定義（`label_order` と同じ選択肢の宣言順）とパッケージを一時 workspace へ複製する。

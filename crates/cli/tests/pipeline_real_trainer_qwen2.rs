@@ -1,7 +1,8 @@
 #![cfg(unix)]
 //! 実バイナリ `fandhe-edge` と実 trainer（MLX CPU）で、`qwen2_lora` を CLI の `train --base-model-dir` から
-//! 学習する結合テスト（REQ-41 正常系・REQ-33・REQ-39・#628）。`select`・`evaluate`（tokenizer 入力表現の経路）は
-//! #662-a で接続済み。`package` は #662-b まで未接続のため、現状の境界（`package` の 64）までを確かめる。
+//! 学習し、`select`・`evaluate`・`package`・`infer` まで通す結合テスト（REQ-41 正常系・REQ-33・REQ-39・REQ-28・
+//! #628・#662）。`infer` の予測が学習直後の validation 予測と一致することで、学習側（MLX）と推論ランタイムの
+//! 連鎖を確かめる。
 //!
 //! # 証拠の種別
 //!
@@ -95,8 +96,8 @@ fn string_after<'a>(json: &'a str, from: &str, key: &str) -> &'a str {
 }
 
 /// REQ-41・REQ-33・REQ-39・#628: 実 trainer で `train --kind qwen2_lora --base-model-dir` が完走し（cwd 配下の
-/// ベースモデルを候補ディレクトリの外の絶対パスとして読む）、`select`・`evaluate` が通り、`package` は
-/// tokenizer 経路の未接続（#662-b）で 64 になる。
+/// ベースモデルを候補ディレクトリの外の絶対パスとして読む）、`select`・`evaluate`・`package` が通り、
+/// `infer --text` の予測ラベルが学習直後の validation 予測と一致する（REQ-28）。
 #[test]
 #[ignore = "requires trainer/.venv (make py-sync) and MLX CPU; run via make test-trainer-integration"]
 fn req41_issue628_real_trainer_qwen2_lora_trains_via_cli() {
@@ -205,17 +206,26 @@ fn req41_issue628_real_trainer_qwen2_lora_trains_via_cli() {
         evaluated.starts_with("{\"step\":\"evaluate\",\"status\":\"ok\""),
         "{evaluated}"
     );
-    // `package` の tokenizer 経路は #662-b で接続する。それまでは fail-closed（接続したら `infer` と、
-    // validation 予測との一致まで延ばす）。
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fandhe-edge"));
-    cmd.args(["package", "--project-dir", "proj"])
-        .current_dir(&work_dir);
-    assert_eq!(
-        run(cmd),
-        (
-            Some(64),
-            "{\"code\":\"invalid_input\",\"message\":\"unsupported input representation\"}\n"
-                .to_string()
-        )
+    let packaged = cli_ok(&work_dir, &["package", "--project-dir", "proj"]);
+    assert!(
+        packaged.starts_with("{\"step\":\"package\",\"status\":\"ok\""),
+        "{packaged}"
     );
+    for f in ["tokenizer.json", "model.onnx", "artifact.json"] {
+        assert!(work_dir.join("proj/package").join(f).is_file(), "{f}");
+    }
+    // validation 予測の先頭 1 件（id から合成データの入力を復元できる）を配布パッケージへ `infer` し、
+    // 学習直後の予測ラベルと一致することを確かめる（学習側 MLX ＝ 推論ランタイム。REQ-28・REQ-41）。
+    // 評価で校正が同梱されると棄権の行は exit 12 になるため、終了コードではなく出力行のラベルを見る。
+    let anchor = "\"validation_predictions\":[";
+    let id = string_after(&result, anchor, "id");
+    let (label_name, index) = id.split_once('-').expect("synthetic id");
+    let i: usize = index.parse().expect("row index");
+    let text = format!("{label_name}{} {label_name}{} x{i}", i % 4, (i + 1) % 4);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fandhe-edge"));
+    cmd.args(["infer", "--package", "proj/package", "--text", &text])
+        .current_dir(&work_dir);
+    let (code, inferred) = run(cmd);
+    assert!(matches!(code, Some(0 | 12)), "{code:?} {inferred}");
+    assert_eq!(string_after(&inferred, "", "predicted_label"), label);
 }

@@ -17,7 +17,7 @@
 - **推論は学習に依存しない**: 推論ランタイムと配布パッケージに学習側の依存を持ち込みません
 - **モデルの種類の選択口**: 判別型・生成型などの種類を同じ選択口から選べるようにし、種類は PoC の結果で増やします
 - **評価契約**: 評価データの凍結・ハッシュの不変・下限基準に対する有意性の判定を、評価器の正しさとあわせて保証します
-- **入力表現**: 既定は byte。モデルの種類（kind）ごとに byte か事前学習モデルのトークナイザーを選べる方針です（REQ-41・M12。sw2k などの自作語彙は除外のまま）。`artifact.json` の `input_representation`（`byte`｜`tokenizer`）で宣言します（tokenizer は REQ-41・TASK-41.4 で対応中。現状 CLI は `invalid_input` で拒否）
+- **入力表現**: 既定は byte。モデルの種類（kind）ごとに byte か事前学習モデルのトークナイザーを選べる方針です（REQ-41・M12。sw2k などの自作語彙は除外のまま）。`artifact.json` の `input_representation`（`byte`｜`tokenizer`）で宣言します（tokenizer は `qwen2_lora` だけ CLI が受け付け、`infer`・`select`・`evaluate`・`package` で使えます。他の kind の tokenizer は `invalid_input` で拒否します。REQ-41・TASK-41.4・#626・#662）
 - **呼び出し口**: CLI＋JSON を基本とします。ローカル MCP・Codex からの呼び出しも要件に含みますが、実クライアントとの接続は初期スコープ外です
 - **ローカル完結**: 推論・学習・評価はローカルで完結させます
 - **実装言語の境界**: 共通コアを Rust 中心とする案を暫定で推奨しています。学習側をどこまで Rust に寄せるかは未決です

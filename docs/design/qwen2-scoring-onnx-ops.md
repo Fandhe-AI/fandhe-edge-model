@@ -183,7 +183,7 @@
 - 完全性: `verify_output` が確定直前に `model.onnx`・`tokenizer.json`・全 shard の sha256 とサイズを照合する。記録された名前は字句規則（英数字と `._-`・先頭 `.` 不可・128 文字以下）と予約名で検査してから `dir_fd` 相対・`O_NOFOLLOW` で開く。Rust の `crates/train` は結果 JSON の追加欄を同じ規則で検証する
 - 受け入れテスト: `trainer/tests/test_qwen2_lora_package.py`（CLI で学習し、複写先で `tokenizer.json`・`scoring` から ONNX 推論して学習側の予測と一致）。証拠種別: テストハーネス（ReferenceEvaluator・CPU）
 - #634（system の KV 同梱）: グラフ内部の変更のみ。入出力契約（`ids: INT64 [N,T]` → `probs: FLOAT [N,K]`）・`artifact.json` の欄・`kind_version` は変えない（2026-10-20 オーナー承認）。同梱後は `scoring.system_prompt` を書き換えても予測は変わらない（グラフは `ids` の先頭 P 列を参照しない。文の内容・長さを実行時に照合する処理は無い）。トークン化の誤りは全件一致テストと tokenizer の golden テストで守る
-- 範囲外: Rust の `package`・`infer` での受け入れは #434 の実行器（§10）の後続（現状は `input_representation: tokenizer` を `invalid_input` で拒否）。`base_model_*` を CLI から渡す配線も後続
+- CLI への接続: `infer` は #626、`select`・`evaluate`・`package` は #662 で `input_representation: tokenizer` を受け付ける（`qwen2_lora` だけ。他の kind は `invalid_input`）。`base_model_*` の CLI 配線は #628（`train --base-model-dir`）で接続済み
 
 ## 10. 推論側の実行器と全件一致（TASK-41.6-5・#434）
 
@@ -193,4 +193,4 @@
 - bf16: `Cast(to=FLOAT)` の出力は f32 に展開せず遅延 f32 として持ち、`Gemm` の B と `Gather` の data だけがカーネル内で展開する。それ以外の消費者（RMSNorm の重み・bias）は小さいテンソルとして f32 に展開する。中間値は最後の消費で解放する
 - 前処理: `TokenizerPreprocessor`（`crates/runtime/src/preprocess.rs`）が `scoring.system_prompt` と `tokenizer.json` から `build_chat_ids(add_generation_prompt=True)` の id 列を作る
 - 受け入れ: `crates/runtime/tests/qwen2_parity.rs`。`fixtures/qwen2_parity/`（学習ワーカーが書いた自己完結パッケージと `cases.json`）の全ケースで、予測ラベルが学習側（MLX）と全件一致し、確率が ReferenceEvaluator と 1e-5 以内で一致し、単体・バッチが同一であることを確かめる。`env_isolation.rs` は環境変数を空にした子プロセスでも同じ推論が成功することを確かめる。証拠種別: テストハーネス（合成の極小モデル・CPU）。実重みでの照合・p95・RSS は TASK-41.11（#442）
-- 未実装: `export_exclusion::screen_scoring_candidate` の `ParityUnverified` を推論照合へ差し替えること、CLI（`infer`・`package`）での受け入れ、ガード層の `kind`・`kind_version` 許可リストへの `qwen2_lora` 追加
+- 未実装: `export_exclusion::screen_scoring_candidate` の `ParityUnverified` を推論照合へ差し替えること（他の除外理由を通過した候補は、現状この理由で必ず除外される）

@@ -13,7 +13,7 @@
 //!   [`fandhe_edge_cli::stages::run`] へ渡す。7 工程の下位層への接続と、未接続の区間
 //!   は `stages` の doc（「完走の範囲」「未検証の項目」）を参照。
 //!   `infer` の経路・形式のガード（REQ-39・#159）も `stages::infer` の中で通る。
-//! - `infer`・`evaluate`（Linux・macOS）: worker でなければ [`fandhe_edge_cli::infer_supervisor`] が自分自身を
+//! - `infer`・`evaluate`・`package`（Linux・macOS）: worker でなければ [`fandhe_edge_cli::infer_supervisor`] が自分自身を
 //!   worker として子プロセスで起動し、時間・RSS の安全上限を強制する（REQ-39・TASK-39.5-3・#577・#662）。
 
 use fandhe_edge_cli::args::{self, Invocation};
@@ -54,6 +54,20 @@ fn main() -> std::process::ExitCode {
                 return match infer_supervisor::run_evaluate(
                     &mut std::io::stdout().lock(),
                     evaluate,
+                    std::env::args_os().skip(1),
+                    &cwd,
+                ) {
+                    Ok(code) => code.into(),
+                    Err(_) => ExitCode::RuntimeError.into(),
+                };
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if let args::Command::Package(package) = &command
+                && !infer_supervisor::is_worker()
+            {
+                return match infer_supervisor::run_package(
+                    &mut std::io::stdout().lock(),
+                    package,
                     std::env::args_os().skip(1),
                     &cwd,
                 ) {

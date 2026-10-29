@@ -328,7 +328,7 @@ pub(crate) fn check_meta_consistency(
     trained_max_bytes: u32,
 ) -> Result<(), ErrorReport> {
     // 推論できない入力表現の候補は受け付けない（REQ-41・TASK-41.3-1・#402）。tokenizer は `qwen2_lora` のみ
-    // （`infer` は #626、`select`・`evaluate` は #662-a で接続。`package` は #662-b）。
+    // （`infer` は #626、`select`・`evaluate`・`package` は #662 で接続）。
     super::infer::check_input_representation(meta)?;
     KindAllowlist::supported()
         .check(meta.kind())

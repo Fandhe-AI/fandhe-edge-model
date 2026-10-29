@@ -166,8 +166,8 @@ const MAX_META_KIND_BYTES: usize = 64;
 ///
 /// `artifact.json` の任意の欄 `input_representation` で kind ごとに宣言する。欄が無い既存パッケージは
 /// [`Self::Byte`] として従来どおり読める。定義ファイルの `io.input`（`bytes`）とは別物で、定義側の
-/// スキーマ・正準化ハッシュは変えない。`Tokenizer` は `qwen2_lora` の `infer`（#626）・`select`・`evaluate`
-/// （#662-a）だけが扱え、`package` は未接続（#662-b）のため `invalid_input`（64）で拒否する。
+/// スキーマ・正準化ハッシュは変えない。`Tokenizer` は `qwen2_lora` の `infer`（#626）・`select`・`evaluate`・
+/// `package`（#662）だけが扱い、それ以外の kind の宣言は `invalid_input`（64）で拒否する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageInputRepresentation {
