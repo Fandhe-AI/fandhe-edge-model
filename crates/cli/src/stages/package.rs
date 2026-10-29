@@ -530,7 +530,7 @@ fn capacity_report(
 /// runtime の p95 照合結果を stdout 用の値型へ写す（REQ-31・#340）。
 ///
 /// 性能の 3 層（REQ-31・TASK-41.9・#579）のうち、ここで扱うのは利用者設定の上限（`exceeded`。exit 20）と
-/// 目標（`over_guideline`。警告のみ）。安全上限は `infer` の監督層（`infer_supervisor`）が強制する。
+/// 目標（`over_guideline`。警告のみ）。安全上限は監督層（`infer_supervisor`。`infer`・`evaluate`・`package`）が強制する。
 ///
 /// `p95_us` は ns を切り上げた値（`limit_ns = limit_us * 1000` なので、`p95_ns > limit_ns` と
 /// `p95_us > limit_us` は同値で、切り上げが偽陽性を生まない）。`exceeded` は照合結果から決める。
