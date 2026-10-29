@@ -53,6 +53,12 @@ fn child_entry() {
             }
             std::thread::sleep(Duration::from_secs(30));
         }
+        // 組み立て中の worker が後始末なしに落ちる（panic と同じ 101 で終わる）。
+        "crash" => {
+            let proj = std::path::PathBuf::from(std::env::var(DIR_ENV).expect("dir"));
+            std::fs::create_dir(proj.join("package.staging")).expect("staging");
+            std::process::exit(101);
+        }
         "ok" => println!("{{\"id\":\"input\",\"status\":\"ok\"}}"),
         _ => {}
     }
@@ -226,5 +232,15 @@ fn req39_issue662_killed_package_keeps_ledger_when_package_exists() {
     assert_eq!(code, ExitCode::LimitExceeded);
     assert!(proj.join("package").is_dir());
     assert!(proj.join("version_ledger.json").is_file());
+    assert!(!proj.join("package.staging").exists());
+}
+
+/// REQ-39・#662: 7 種に写らない終了（panic・シグナル死）で残ったステージングも親が片付ける。出力は
+/// `runtime_error`。
+#[test]
+fn req39_issue662_crashed_package_removes_staging_created_by_worker() {
+    let (cwd, proj) = package_project("crash");
+    let (code, _) = supervise_package("crash", &cwd, &proj);
+    assert_eq!(code, ExitCode::RuntimeError);
     assert!(!proj.join("package.staging").exists());
 }

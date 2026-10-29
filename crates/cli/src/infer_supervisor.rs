@@ -270,7 +270,8 @@ pub fn run_evaluate<W: Write>(
 ///   （64）で拒否されて利用者が復旧できないため、親が launch の前に両者の有無を記録し（[`PackageRemnants`]）、
 ///   kill で戻ったときに **launch 前に無かったものだけ** を閉じ込めつきで片付ける。`package/` 本体には触れず、
 ///   `package/` が出来ていれば台帳も消さない。片付けに失敗しても出力は `limit_exceeded` のまま（best effort）
-/// - worker が自分で終えた場合（exit 0・10・12・20 等）は親は何も消さない（worker が自分で片付ける）
+/// - worker が自分で終えた場合（exit 0・10・12・20 等）は親は何も消さない（worker が自分で片付ける）。7 種に写らない
+///   終了（panic・シグナル死）は worker が片付けられていないので、kill と同じく親が片付ける
 ///
 /// # Errors
 /// `out` への書き込み失敗（呼び出し側は exit 70 に写す）。
@@ -412,8 +413,8 @@ pub fn run_supervised_as<W: Write, E: Write>(
 }
 
 /// [`run_supervised_as`] に、worker が監督側に kill された（時間・RSS 超過、または監督失敗）ときだけ呼ぶ
-/// 後始末 `on_killed` を足したもの（`package` のステージング掃除用。REQ-39・#662）。worker が自分で終えた
-/// 場合は呼ばない。出力の写像は [`run_supervised_as`] と同じ。
+/// 後始末 `on_killed` を足したもの（`package` のステージング掃除用。REQ-39・#662）。7 種に写らない終了（panic・
+/// シグナル死）でも呼ぶ。worker が 7 種のどれかで自分で終えた場合は呼ばない。出力の写像は [`run_supervised_as`] と同じ。
 ///
 /// # Errors
 /// `out` への書き込み失敗。
@@ -432,6 +433,14 @@ pub fn run_supervised_cleaning<W: Write, E: Write>(
         Ok(GuardedRunOutcome::Exited { status, output, .. }) => {
             // stderr は契約外のため中継の失敗は無視する。
             let _ = err.write_all(output.stderr());
+            // 7 種に写らない終了（panic・シグナル死）は worker が後始末できていないので親が片付ける。
+            if status
+                .code()
+                .and_then(|c| ExitCode::try_from(c).ok())
+                .is_none()
+            {
+                on_killed();
+            }
             relay_exited(
                 out,
                 status.code(),
