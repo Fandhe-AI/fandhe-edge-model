@@ -105,7 +105,7 @@ pub(crate) fn resolve(
         .collect::<Result<Vec<_>, WeightsIdentityError>>()?;
     // location の昇順に正準化する（記載順に依存させない）。重複 location は対応が一意でないので拒否する。
     shards.sort_by(|a, b| a.0.cmp(b.0));
-    if shards.windows(2).any(|w| w[0].0 == w[1].0) {
+    if shards.windows(2).any(|w| matches!(w, [a, b] if a.0 == b.0)) {
         return Err(bad());
     }
     let mut buf = Vec::with_capacity(WEIGHTS_IDENTITY_DOMAIN.len() + 72 + 80 * shards.len());
