@@ -113,6 +113,7 @@ use fandhe_edge_data::split::SplitResult;
 use fandhe_edge_eval::acceptance::{AcceptanceVerdict, judge_min_accuracy};
 use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
+use fandhe_edge_eval::weights_identity::weights_identity_from_bytes;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_guard::version_ledger::{ArtifactKind, CreatedAt, VersionId, VersionLedger};
 use fandhe_edge_runtime::capacity::{
@@ -250,7 +251,13 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
         onnx_bytes,
         onnx_file,
         handles,
+        ..
     } = load_candidate_artifact(&project, selection.candidate_index, success)?;
+    // tokenizer 表現（`qwen2_lora`）の複写・容量・再検証は #662-b で接続する。それまでは従来どおり拒否する
+    // （shard・tokenizer.json を欠いた不完全なパッケージを作らない。REQ-41・REQ-39）。
+    if super::infer::is_tokenizer_qwen2(&meta) {
+        return Err(invalid("unsupported input representation"));
+    }
     let onnx_file = onnx_file.as_str();
     let vocab_file = handles.vocab;
     check_meta_consistency(
@@ -791,13 +798,16 @@ fn verify_evaluation_record(
     // この評価データ × 代表構成 × 重みの適用完了を記録していることを必ず照合する（REQ-27）。
     let config_id =
         RepresentativeConfigId::parse(config_id).map_err(|e| acquire_error_report(&e))?;
-    let onnx_digest = Sha256Digest::of_bytes(onnx_bytes);
+    // 台帳が見分ける重みの識別は `evaluate` の登録と同じ関数で求める（byte は ONNX の sha256、tokenizer 表現は
+    // ONNX・tokenizer.json・各 shard の sha256 から。REQ-27・#662）。
+    let weights_digest = weights_identity_from_bytes(onnx_bytes, Some(meta_bytes))
+        .map_err(|_| invalid("artifact tokenizer references are invalid"))?;
     let Some(held) = HeldLedger::open(project, false)? else {
         return Err(invalid("evaluation has not been completed"));
     };
     let applied = held
         .ledger()
-        .is_applied(&freeze.sha256(), &config_id, &onnx_digest)
+        .is_applied(&freeze.sha256(), &config_id, &weights_digest)
         .map_err(|e| acquire_error_report(&e))?;
     if !applied {
         return Err(invalid("evaluation has not been completed"));

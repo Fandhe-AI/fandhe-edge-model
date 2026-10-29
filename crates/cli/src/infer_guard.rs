@@ -173,11 +173,7 @@ pub fn check_infer_path_and_format(
     }
     // 外部データ（重みの shard）を持つ種類だけ、外部参照付き ONNX を許す（REQ-41・REQ-39・#626）。
     // 参照先の閉じ込め・sha256 は `stages::infer` が開く shard とランタイムの照合で担保する。
-    let allowlist = if kind.as_str() == "qwen2_lora" {
-        FormatAllowlist::onnx_with_external_data()
-    } else {
-        FormatAllowlist::onnx_only()
-    };
+    let allowlist = format_allowlist_for(kind.as_str());
     let onnx = check_open_file(onnx, onnx_path.as_path(), &allowlist, MAX_MODEL_FILE_BYTES)
         .map_err(|e| e.to_error_report())?;
     Ok(PathFormatCheckedInputs {
@@ -188,6 +184,16 @@ pub fn check_infer_path_and_format(
         onnx_path,
         meta_bytes: bytes,
     })
+}
+
+/// ONNX 本体に許す形式の許可リスト。外部データ（重みの shard）を持つ `qwen2_lora` だけ、外部参照付き ONNX を
+/// 許す（REQ-41・REQ-39・#626）。`infer`・`select`・`evaluate` が同じ規則で形式を検査する。
+pub(crate) fn format_allowlist_for(kind: &str) -> FormatAllowlist {
+    if kind == "qwen2_lora" {
+        FormatAllowlist::onnx_with_external_data()
+    } else {
+        FormatAllowlist::onnx_only()
+    }
 }
 
 /// `artifact.json` のバイト列（`meta_bytes`）の sha256 が、版管理台帳の `(model, V)` の記録と一致するか確認する

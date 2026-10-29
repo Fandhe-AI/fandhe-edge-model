@@ -174,6 +174,7 @@ impl Fixture {
             vocab: None,
             calibration: None,
             thresholds: None,
+            manifest: None,
         };
         apply_once(ledger, &frozen, Self::id(), &model, dec, |_t, _i, _p| {
             calls.set(calls.get() + 1);

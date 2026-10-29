@@ -14,6 +14,7 @@ use fandhe_edge_eval::final_test_once::{
     LabeledInput, RegisteredConfig, RepresentativeConfigId, apply_once, apply_once_then,
 };
 use fandhe_edge_eval::invariance::{EvaluationInvarianceError, ModelPackagePaths};
+use fandhe_edge_eval::weights_identity::weights_identity_from_bytes;
 use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,6 +90,8 @@ struct Model {
     _dir: TempDir,
     weights: PathBuf,
     thresholds: Option<PathBuf>,
+    vocab: Option<PathBuf>,
+    manifest: Option<PathBuf>,
 }
 
 impl Model {
@@ -105,15 +108,30 @@ impl Model {
             _dir: dir,
             weights: w,
             thresholds: t,
+            vocab: None,
+            manifest: None,
         }
+    }
+
+    /// tokenizer 表現の成果物（ONNX・`tokenizer.json`・`artifact.json`）を置いたモデル。
+    fn tokenizer(onnx: &[u8], tokenizer: &[u8], manifest: &str) -> Self {
+        let mut m = Model::new(onnx, None);
+        let v = m._dir.path().join("tokenizer.json");
+        fs::write(&v, tokenizer).unwrap();
+        let a = m._dir.path().join("artifact.json");
+        fs::write(&a, manifest).unwrap();
+        m.vocab = Some(v);
+        m.manifest = Some(a);
+        m
     }
 
     fn paths(&self) -> ModelPackagePaths<'_> {
         ModelPackagePaths {
             weights: &self.weights,
-            vocab: None,
+            vocab: self.vocab.as_deref(),
             calibration: None,
             thresholds: self.thresholds.as_deref(),
+            manifest: self.manifest.as_deref(),
         }
     }
 }
@@ -1429,4 +1447,233 @@ fn req27_is_applied_rejects_tampered_completion_record() {
         matches!(r, Err(AcquireError::RegistryTampered { .. })),
         "{r:?}"
     );
+}
+
+const SHARD_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const SHARD_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const TOKENIZER: &[u8] = b"{\"tokenizer\":true}";
+
+/// tokenizer 表現の `artifact.json`（`qwen2_lora`）。shard の記録 sha256・プロンプト・`created_utc` を変えられる。
+fn tokenizer_manifest(shard: &str, tokenizer: &[u8], prompt: &str, created_utc: &str) -> String {
+    let z = "0".repeat(64);
+    let tok = Sha256Digest::of_bytes(tokenizer).to_hex();
+    format!(
+        r#"{{"kind":"qwen2_lora","kind_version":1,"max_bytes":64,"label_order":["a","b"],"onnx_file":"model.onnx","onnx_sha256":"{z}","input_representation":"tokenizer","created_utc":"{created_utc}","tokenizer_file":"tokenizer.json","tokenizer_sha256":"{tok}","external_data":[{{"location":"w0.bin","sha256":"{shard}"}}],"scoring":{{"system_prompt":"{prompt}","choices":[{{"token_ids":[1]}},{{"token_ids":[2]}}]}},"config":{{"max_seq_length":64}}}}"#
+    )
+}
+
+/// ファイルから自ら識別を算出して登録する（`from_package`。登録後に適用する構成のモデルを渡す）。
+fn register_from_package(ledger: &FinalTestLedger, config: &str, model: &Model) {
+    let entry = RegisteredConfig::from_package(id(config), &model.paths()).unwrap();
+    ledger
+        .register_configs(&freeze_eval_data(DATA).unwrap().sha256(), &[entry])
+        .unwrap();
+}
+
+fn run_with_calls(ledger: &FinalTestLedger, config: &str, model: &Model) -> Outcome {
+    run(ledger, DATA, config, model, &Cell::new(0))
+}
+
+/// REQ-27・#662: 評価器は識別をファイルから自ら算出する。ONNX 本体が同じでも shard の記録 sha256 が違う
+/// 2 候補（`qwen2_lora` の想定）は別の識別になり、同じ凍結 test に 1 回ずつ適用できる。同じ候補の
+/// 再適用は拒否し、他の候補のモデルでの適用は未登録の重みとして拒否する。
+#[test]
+fn req27_issue662_evaluator_derives_identity_from_files() {
+    let ledger_dir = TempDir::new("ledger-identity");
+    let ledger = FinalTestLedger::open(ledger_dir.path()).unwrap();
+    let manifest = |shard: &str| tokenizer_manifest(shard, TOKENIZER, "p", "t");
+    let model_q = Model::tokenizer(b"same-onnx", TOKENIZER, &manifest(SHARD_A));
+    let model_r = Model::tokenizer(b"same-onnx", TOKENIZER, &manifest(SHARD_B));
+    let entries = [
+        RegisteredConfig::from_package(id("q:seed0"), &model_q.paths()).unwrap(),
+        RegisteredConfig::from_package(id("r:seed0"), &model_r.paths()).unwrap(),
+    ];
+    ledger
+        .register_configs(&freeze_eval_data(DATA).unwrap().sha256(), &entries)
+        .unwrap();
+    assert!(run_with_calls(&ledger, "q:seed0", &model_q).is_ok());
+    assert!(run_with_calls(&ledger, "r:seed0", &model_r).is_ok());
+    let again = run_with_calls(&ledger, "q:seed0", &model_q);
+    assert!(
+        is_already(&again, AppliedBy::RepresentativeConfig),
+        "{again:?}"
+    );
+    let mismatched = run_with_calls(&ledger, "r:seed0", &model_q);
+    assert!(
+        matches!(
+            acquire_err(&mismatched),
+            Some(AcquireError::WeightsNotRegistered)
+        ),
+        "{mismatched:?}"
+    );
+}
+
+/// REQ-27・#662 (a): 同じ ONNX・`artifact.json` を別の ID の 2 構成で登録しても、評価器が同じ識別を算出する
+/// ため、2 回目の適用は重みロックで拒否される（呼び出し側が識別を名乗って迂回できない）。
+#[test]
+fn req27_issue662_same_files_under_two_ids_hit_the_weights_lock() {
+    let ledger_dir = TempDir::new("ledger-two-ids");
+    let ledger = FinalTestLedger::open(ledger_dir.path()).unwrap();
+    let model = Model::tokenizer(
+        b"onnx",
+        TOKENIZER,
+        &tokenizer_manifest(SHARD_A, TOKENIZER, "p", "t"),
+    );
+    let entries = [
+        RegisteredConfig::from_package(id("q:seed0"), &model.paths()).unwrap(),
+        RegisteredConfig::from_package(id("r:seed0"), &model.paths()).unwrap(),
+    ];
+    ledger
+        .register_configs(&freeze_eval_data(DATA).unwrap().sha256(), &entries)
+        .unwrap();
+    assert!(run_with_calls(&ledger, "q:seed0", &model).is_ok());
+    let second = run_with_calls(&ledger, "r:seed0", &model);
+    assert!(is_already(&second, AppliedBy::ModelWeights), "{second:?}");
+}
+
+/// REQ-27・#662 (b): 登録後に `artifact.json` のプロンプトだけを差し替えると（識別は重みの中身だけなので同じ）、
+/// `artifact.json` の完全一致の照合で `ComponentNotRegistered { manifest }` になり、ロックは作られない。
+#[test]
+fn req27_issue662_manifest_change_after_registration_is_rejected() {
+    let ledger_dir = TempDir::new("ledger-manifest-change");
+    let ledger = FinalTestLedger::open(ledger_dir.path()).unwrap();
+    let model = Model::tokenizer(
+        b"onnx",
+        TOKENIZER,
+        &tokenizer_manifest(SHARD_A, TOKENIZER, "p", "t"),
+    );
+    register_from_package(&ledger, "q:seed0", &model);
+    fs::write(
+        model.manifest.as_ref().unwrap(),
+        tokenizer_manifest(SHARD_A, TOKENIZER, "other prompt", "t"),
+    )
+    .unwrap();
+    let r = run_with_calls(&ledger, "q:seed0", &model);
+    assert!(
+        matches!(
+            acquire_err(&r),
+            Some(AcquireError::ComponentNotRegistered {
+                component: "manifest"
+            })
+        ),
+        "{r:?}"
+    );
+    assert_eq!(
+        ledger_dir.count(),
+        2,
+        "registry and seal only; no lock is created"
+    );
+}
+
+/// REQ-27・#662 (c): 登録後に ONNX を変えると、評価器が算出した識別が登録と違い `WeightsNotRegistered`。
+#[test]
+fn req27_issue662_onnx_change_after_registration_is_rejected() {
+    let ledger_dir = TempDir::new("ledger-onnx-change");
+    let ledger = FinalTestLedger::open(ledger_dir.path()).unwrap();
+    let model = Model::tokenizer(
+        b"onnx",
+        TOKENIZER,
+        &tokenizer_manifest(SHARD_A, TOKENIZER, "p", "t"),
+    );
+    register_from_package(&ledger, "q:seed0", &model);
+    fs::write(&model.weights, b"onnx-changed").unwrap();
+    let r = run_with_calls(&ledger, "q:seed0", &model);
+    assert!(
+        matches!(acquire_err(&r), Some(AcquireError::WeightsNotRegistered)),
+        "{r:?}"
+    );
+}
+
+/// REQ-27・#662 (d): `vocab`（`tokenizer.json`）の sha256 が `artifact.json` の記録値と一致しない構成は、
+/// 登録（`from_package`）も、申告で登録した構成の適用も `ComponentNotRegistered { vocab }` で拒否する。
+#[test]
+fn req27_issue662_vocab_must_match_the_manifest_tokenizer_sha256() {
+    let ledger_dir = TempDir::new("ledger-vocab-binding");
+    let ledger = FinalTestLedger::open(ledger_dir.path()).unwrap();
+    // `artifact.json` は TOKENIZER の sha256 を記録するが、`vocab` には別のバイト列を置く。
+    let model = Model::tokenizer(
+        b"onnx",
+        b"another tokenizer",
+        &tokenizer_manifest(SHARD_A, TOKENIZER, "p", "t"),
+    );
+    let registered = RegisteredConfig::from_package(id("q:seed0"), &model.paths());
+    assert!(
+        matches!(
+            registered,
+            Err(AcquireError::ComponentNotRegistered { component: "vocab" })
+        ),
+        "{registered:?}"
+    );
+    // 低水準の入口で、識別・vocab・manifest を実ファイルと同じ値で登録しても、適用で拒否する。
+    let manifest_bytes = fs::read(model.manifest.as_ref().unwrap()).unwrap();
+    let entry = RegisteredConfig::new(
+        id("q:seed0"),
+        weights_identity_from_bytes(b"onnx", Some(&manifest_bytes)).unwrap(),
+    )
+    .with_vocab(Sha256Digest::of_bytes(b"another tokenizer"))
+    .with_manifest(Sha256Digest::of_bytes(&manifest_bytes));
+    ledger
+        .register_configs(&freeze_eval_data(DATA).unwrap().sha256(), &[entry])
+        .unwrap();
+    let r = run_with_calls(&ledger, "q:seed0", &model);
+    assert!(
+        matches!(
+            acquire_err(&r),
+            Some(AcquireError::ComponentNotRegistered { component: "vocab" })
+        ),
+        "{r:?}"
+    );
+}
+
+/// REQ-27・#662: `artifact.json` が壊れている構成は、識別を作れないため登録も適用も拒否する（fail-closed）。
+#[test]
+fn req27_issue662_malformed_manifest_cannot_be_registered_or_applied() {
+    let ledger_dir = TempDir::new("ledger-bad-manifest");
+    let ledger = FinalTestLedger::open(ledger_dir.path()).unwrap();
+    let model = Model::tokenizer(b"onnx", TOKENIZER, "not json");
+    let registered = RegisteredConfig::from_package(id("q:seed0"), &model.paths());
+    assert!(
+        matches!(registered, Err(AcquireError::RegistryInvalid { .. })),
+        "{registered:?}"
+    );
+    // 申告で登録しても、適用時に評価器が識別を算出できず拒否する。
+    ledger
+        .register_configs(
+            &freeze_eval_data(DATA).unwrap().sha256(),
+            &[reg("q:seed0", b"onnx")],
+        )
+        .unwrap();
+    let r = run_with_calls(&ledger, "q:seed0", &model);
+    assert!(
+        matches!(acquire_err(&r), Some(AcquireError::RegistryInvalid { .. })),
+        "{r:?}"
+    );
+    assert_eq!(
+        ledger_dir.count(),
+        2,
+        "registry and seal only; no lock is created"
+    );
+}
+
+/// REQ-27・#662: byte 表現の事前登録本文は従来どおり 5 列のまま（メタデータの列を足さない）。
+#[test]
+fn req27_issue662_byte_registry_lines_keep_five_columns() {
+    let ledger_dir = TempDir::new("ledger-byte-columns");
+    let ledger = FinalTestLedger::open(ledger_dir.path()).unwrap();
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
+    let scope = ledger_dir.scope_dirs().remove(0);
+    let registry = fs::read_dir(&scope)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("registry-")
+        })
+        .unwrap();
+    let body = fs::read_to_string(registry).unwrap();
+    let line = body.lines().nth(1).unwrap();
+    assert_eq!(line.split(' ').count(), 5, "{line}");
 }

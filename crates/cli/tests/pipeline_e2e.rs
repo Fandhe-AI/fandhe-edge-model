@@ -5890,6 +5890,7 @@ mod suite {
     /// cwd（`work/`）配下のベースモデルのディレクトリ。
     const BASE_MODEL_DIR: &str = "bm";
     const SELECT_QWEN2: [&str; 5] = ["select", "--project-dir", "proj", "--kind", "qwen2_lora"];
+    const EVALUATE_QWEN2: [&str; 5] = ["evaluate", "--project-dir", "proj", "--candidate", "2"];
     const TRAIN_QWEN2: [&str; 9] = [
         "train",
         "--project-dir",
@@ -6026,11 +6027,11 @@ mod suite {
     /// REQ-41・REQ-33・REQ-39・#628: `train --kind qwen2_lora --base-model-dir` が CLI から完走し、学習リクエストに
     /// 定義の同一性・来歴と照合済みの場所が入る（偽ワーカー＋parity fixture。証拠種別: テストハーネス）。
     ///
-    /// `select`・`evaluate`・`package` の tokenizer 入力表現（`qwen2_lora`）の経路は未接続で、
-    /// `check_input_representation` が fail-closed で止める（byte 前処理で黙って評価・公開しない）。本テストは
-    /// 現状のその境界（`select` が保存済みリクエストの照合を通った後に 64）までを確かめる。接続したら
-    /// `evaluate`・`package`・`infer`（`fixtures/qwen2_parity/cases.json` の予測と照合）まで延ばす。
-    pub fn qwen2_lora_trains_via_cli_until_select_boundary() {
+    /// `select`・`evaluate` は tokenizer 入力表現（`qwen2_lora`）に接続済み（#662-a）で、`select` の選定と
+    /// `evaluate` の評価記録までを確かめる。`package` の tokenizer 経路は #662-b で接続するまで fail-closed
+    /// （64 `unsupported input representation`）で、接続したら `infer`（`fixtures/qwen2_parity/cases.json` の
+    /// 予測と照合）まで延ばす。
+    pub fn qwen2_lora_runs_through_evaluate() {
         let env = qwen2_inspected("qwen2-full", true);
         assert_eq!(
             env.ok(&TRAIN_QWEN2),
@@ -6049,12 +6050,57 @@ mod suite {
         ] {
             assert!(request.contains(&part), "{part}: {request}");
         }
-        // 保存済みリクエストの照合（`base_model_dir` の例外を含む）を通り、tokenizer 経路の未接続で止まる。
+        // 保存済みリクエストの照合（`base_model_dir` の例外を含む）を通り、構造検査と容量計測を経て選定される。
         assert_eq!(
-            env.fails(&SELECT_QWEN2, 64, "invalid_input"),
+            env.ok(&SELECT_QWEN2),
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":2,\"kind\":\"qwen2_lora\",\"significance\":null}\n"
+        );
+        assert!(env.project_file("selection_record.json").is_file());
+        // 評価: shard・tokenizer.json を含む自己完結パッケージで校正と凍結 test への適用が通る（REQ-27・REQ-41）。
+        let evaluated = env.ok(&EVALUATE_QWEN2);
+        assert!(
+            evaluated.starts_with("{\"step\":\"evaluate\",\"status\":\"ok\""),
+            "{evaluated}"
+        );
+        assert!(
+            env.project_file("candidates/2/evaluation_record.json")
+                .is_file()
+        );
+        // 1 件ごとの予測: 評価データの件数（8 ラベル × 2）ぶん、評価データの順に、行の形（id・status・
+        // predicted_label・scores〔選択肢 ID をキーとする〕）で書かれる（REQ-27・REQ-41・#445）。
+        let predictions =
+            std::fs::read_to_string(env.project_file("candidates/2/evaluation_predictions.jsonl"))
+                .expect("predictions");
+        let lines: Vec<&str> = predictions.lines().collect();
+        let expected_ids: Vec<String> = (0..2)
+            .flat_map(|i| QWEN2_LABELS.iter().map(move |l| format!("e-{l}-{i}")))
+            .collect();
+        assert_eq!(lines.len(), expected_ids.len(), "{predictions}");
+        let scores_keys = QWEN2_LABELS
+            .iter()
+            .map(|l| format!("\"{l}\":"))
+            .collect::<Vec<_>>();
+        for (line, id) in lines.iter().zip(&expected_ids) {
+            let head = format!("{{\"id\":\"{id}\",\"status\":\"ok\",\"predicted_label\":\"");
+            assert!(line.starts_with(&head), "{line}");
+            let scores = line.split_once("\"scores\":{").expect("scores").1;
+            let mut at = 0;
+            for key in &scores_keys {
+                let found = scores[at..].find(key.as_str()).expect(key);
+                at += found + key.len();
+            }
+            assert!(line.ends_with("}}"), "{line}");
+        }
+        // 適用権は 1 回限り（REQ-27）。
+        assert_eq!(
+            env.fails(&EVALUATE_QWEN2, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate has already been evaluated on the frozen data\"}\n"
+        );
+        // `package` の tokenizer 経路は #662-b まで未接続（不完全なパッケージを作らない）。
+        assert_eq!(
+            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
             "{\"code\":\"invalid_input\",\"message\":\"unsupported input representation\"}\n"
         );
-        assert!(!env.project_file("selection_record.json").exists());
     }
 
     /// REQ-41・REQ-18・#628: `train --all --kind qwen2_lora --base-model-dir` は既定候補の後ろに `qwen2_lora` を
@@ -6155,7 +6201,7 @@ mod suite {
         assert!(!env.project_file("candidates/2").exists());
     }
 
-    /// REQ-41・REQ-27・#628: 後工程は学習リクエストの同一性（`base_model_sha256` 等）を定義から組んで厳密に
+    /// REQ-41・REQ-27・#628・#662: 後工程は学習リクエストの同一性（`base_model_sha256` 等）を定義から組んで厳密に
     /// 照合し、場所（`base_model_dir`）だけは保存値を写して比べる（証拠種別: テストハーネス）。
     pub fn qwen2_lora_select_matches_identity_but_not_location() {
         let env = qwen2_inspected("qwen2-select", true);
@@ -6192,12 +6238,147 @@ mod suite {
             &format!("\"base_model_dir\":\"{}\"", dir.display()),
             "\"base_model_dir\":\"/elsewhere/bm\"",
         );
-        // 照合を通った後、tokenizer 経路の未接続（`check_input_representation`）で止まる（同一性の改変とは
-        // 別の拒否理由であることが、場所の違いが照合を通った証拠になる）。
+        // 照合を通って選定される（同一性の改変とは別の結果になることが、場所の違いが照合を通った証拠になる。
+        // `select` は tokenizer 表現に接続済み。#662-a）。
         assert_eq!(
-            env.fails(&select, 64, "invalid_input"),
-            "{\"code\":\"invalid_input\",\"message\":\"unsupported input representation\"}\n"
+            env.ok(&select),
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":2,\"kind\":\"qwen2_lora\",\"significance\":null}\n"
         );
+    }
+
+    /// `qwen2_lora` を `train`・`select` まで進める（偽ワーカー）。成果物のディレクトリ名を返す。
+    fn qwen2_selected(case: &str) -> (Env, std::path::PathBuf) {
+        let env = qwen2_inspected(case, true);
+        env.ok(&TRAIN_QWEN2);
+        env.ok(&SELECT_QWEN2);
+        let artifact = std::fs::read_dir(env.project_file("candidates/2"))
+            .expect("candidate dir")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.join("artifact.json").is_file())
+            .expect("artifact dir");
+        (env, artifact)
+    }
+
+    /// 読み取り専用の成果物ファイルを `bytes` で置き換える（テストによる改変の模擬）。
+    fn overwrite(path: &Path, bytes: &[u8]) {
+        let _ = std::fs::remove_file(path);
+        std::fs::write(path, bytes).expect("overwrite");
+    }
+
+    /// REQ-27・REQ-39・REQ-41・#662: `select` 後に成果物を改変・差し替えた `qwen2_lora` は `evaluate` が適用権を
+    /// 使う前に 64 で止める（評価記録も予測も作らない）。shard の 1 バイト改変・`artifact.json` の shard sha256 の
+    /// 改変はランタイムの読み込み時照合、tokenizer.json の改変は記録 sha256 との照合、shard の symlink 化は
+    /// 経路の閉じ込めで拒否される（証拠種別: テストハーネス）。
+    pub fn qwen2_lora_evaluate_rejects_tampered_members() {
+        let stopped = |env: &Env, message: Option<&str>| {
+            let out = env.fails(&EVALUATE_QWEN2, 64, "invalid_input");
+            if let Some(message) = message {
+                assert_eq!(
+                    out,
+                    format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n")
+                );
+            }
+            assert!(
+                !env.project_file("candidates/2/evaluation_record.json")
+                    .exists()
+            );
+            assert!(
+                !env.project_file("candidates/2/evaluation_predictions.jsonl")
+                    .exists()
+            );
+        };
+        // (a) shard の 1 バイト改変。
+        let (env, dir) = qwen2_selected("qwen2-tamper-shard");
+        let mut shard = std::fs::read(dir.join("weights-00000.bin")).expect("shard");
+        shard[0] ^= 1;
+        overwrite(&dir.join("weights-00000.bin"), &shard);
+        stopped(&env, Some("model file cannot be loaded"));
+        // (b) tokenizer.json の改変（`artifact.json` の記録 sha256 と不一致）。
+        let (env, dir) = qwen2_selected("qwen2-tamper-tokenizer");
+        let mut tokenizer = std::fs::read(dir.join("tokenizer.json")).expect("tokenizer");
+        tokenizer.push(b' ');
+        overwrite(&dir.join("tokenizer.json"), &tokenizer);
+        stopped(
+            &env,
+            Some("package tokenizer does not match its recorded hash"),
+        );
+        // (c) `artifact.json` の shard sha256 の改変（メタデータの改変は選定後に検出される）。
+        let (env, dir) = qwen2_selected("qwen2-tamper-meta");
+        let meta = std::fs::read_to_string(dir.join("artifact.json")).expect("meta");
+        let shard_sha =
+            Sha256Digest::of_bytes(&std::fs::read(dir.join("weights-00000.bin")).expect("shard"))
+                .to_hex();
+        assert!(meta.contains(&shard_sha), "shard sha256 is recorded");
+        overwrite(
+            &dir.join("artifact.json"),
+            meta.replace(&shard_sha, &"0".repeat(64)).as_bytes(),
+        );
+        stopped(&env, Some("model file cannot be loaded"));
+        // (d) shard の symlink 化（プロジェクトの外を指す）は経路の閉じ込めで拒否する。
+        let (env, dir) = qwen2_selected("qwen2-symlink-shard");
+        let outside = env.base.join("outside.bin");
+        std::fs::write(&outside, b"outside").expect("outside");
+        std::fs::remove_file(dir.join("weights-00000.bin")).expect("remove shard");
+        std::os::unix::fs::symlink(&outside, dir.join("weights-00000.bin")).expect("symlink");
+        stopped(&env, Some("path rejected: path_escapes_root"));
+        // (e) shard の欠落。
+        let (env, dir) = qwen2_selected("qwen2-missing-shard");
+        std::fs::remove_file(dir.join("weights-00000.bin")).expect("remove shard");
+        stopped(&env, Some("path rejected: path_unresolvable"));
+    }
+
+    /// REQ-39・REQ-41・#662: `select` が検出するのは shard の欠落と symlink 化（経路の閉じ込め）まで。
+    /// 同じサイズの改変は `select` では検出せず、`evaluate` 以降のランタイムの照合で止まる。
+    pub fn qwen2_lora_select_rejects_tampered_members() {
+        let env = qwen2_inspected("qwen2-select-tamper", true);
+        env.ok(&TRAIN_QWEN2);
+        let dir = std::fs::read_dir(env.project_file("candidates/2"))
+            .expect("candidate dir")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.join("artifact.json").is_file())
+            .expect("artifact dir");
+        let shard = dir.join("weights-00000.bin");
+        let outside = env.base.join("outside.bin");
+        std::fs::write(&outside, b"outside").expect("outside");
+        let original = std::fs::read(&shard).expect("shard");
+        std::fs::remove_file(&shard).expect("remove shard");
+        std::os::unix::fs::symlink(&outside, &shard).expect("symlink");
+        env.fails(&SELECT_QWEN2, 64, "invalid_input");
+        std::fs::remove_file(&shard).expect("remove symlink");
+        env.fails(&SELECT_QWEN2, 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+        // 復元すれば通る（上の拒否が改変によるものであることの対照）。
+        std::fs::write(&shard, original).expect("restore");
+        env.ok(&SELECT_QWEN2);
+    }
+
+    /// REQ-39・REQ-41・#662: `select` は shard を 1 ファイルごとの上限（`MAX_SHARD_FILE_BYTES`）で fstat 検査する。
+    /// 上限を 1 バイト超えると 20 `limit_exceeded`、ちょうどなら中身を読まずに（疎ファイルなので読めば
+    /// 2 GiB の読み込みになる）通る。shard の中身の sha256 は `select` では見ない（`evaluate` 以降）。
+    /// 疎ファイルを作れないファイルシステムでは領域を食うため、本テストは疎ファイル対応の環境
+    /// （macOS の APFS・Linux の ext4/tmpfs）を前提にする。
+    pub fn qwen2_lora_select_checks_shard_size_limit() {
+        use fandhe_edge_guard::split_files::MAX_SHARD_FILE_BYTES;
+        let env = qwen2_inspected("qwen2-shard-limit", true);
+        env.ok(&TRAIN_QWEN2);
+        let dir = std::fs::read_dir(env.project_file("candidates/2"))
+            .expect("candidate dir")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.join("artifact.json").is_file())
+            .expect("artifact dir");
+        let shard = dir.join("weights-00000.bin");
+        let sparse = |len: u64| {
+            std::fs::remove_file(&shard).expect("remove shard");
+            std::fs::File::create(&shard)
+                .and_then(|f| f.set_len(len))
+                .expect("sparse shard");
+        };
+        sparse(MAX_SHARD_FILE_BYTES + 1);
+        env.fails(&SELECT_QWEN2, 20, "limit_exceeded");
+        assert!(!env.project_file("selection_record.json").exists());
+        sparse(MAX_SHARD_FILE_BYTES);
+        env.ok(&SELECT_QWEN2);
+        assert!(env.project_file("selection_record.json").is_file());
     }
 
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
@@ -6353,8 +6534,20 @@ fn main() -> std::process::ExitCode {
     }
     let tests: &[(&str, fn())] = &[
         (
-            "qwen2_lora_trains_via_cli_until_select_boundary",
-            suite::qwen2_lora_trains_via_cli_until_select_boundary,
+            "qwen2_lora_runs_through_evaluate",
+            suite::qwen2_lora_runs_through_evaluate,
+        ),
+        (
+            "qwen2_lora_evaluate_rejects_tampered_members",
+            suite::qwen2_lora_evaluate_rejects_tampered_members,
+        ),
+        (
+            "qwen2_lora_select_rejects_tampered_members",
+            suite::qwen2_lora_select_rejects_tampered_members,
+        ),
+        (
+            "qwen2_lora_select_checks_shard_size_limit",
+            suite::qwen2_lora_select_checks_shard_size_limit,
         ),
         (
             "qwen2_lora_train_all_with_base_model_dir",

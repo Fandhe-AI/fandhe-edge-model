@@ -38,7 +38,7 @@
 //! - [`wilson`][]: Wilson 95% 信頼区間の算出（REQ-24・REQ-26・TASK-24.1-2・
 //!   issue #60。sklearn 照合 8/8 は `tests/sklearn_check.rs` を参照。
 //!   Wilson 自体は sklearn に実装が無いため sklearn 照合の対象外）
-//! - [`invariance`][]: モデルパッケージ（重み・語彙・校正・しきい値）の
+//! - [`invariance`][]: モデルパッケージ（重み・語彙・校正・しきい値・`artifact.json`）の
 //!   評価前後ハッシュ比較（REQ-27 正常系・TASK-27.1-1・issue #69）。
 //!   `invariance::evaluate_with_invariance` は評価経路そのものを前後の
 //!   ディスク再読み込み＋ハッシュ比較で包む公開 API で、CLI の `evaluate`
@@ -50,6 +50,9 @@
 //!   パッケージ側と対になる評価データ側の実装
 //! - [`final_test_once`][]: 凍結した最終 test への 1 回限り適用の強制
 //!   （REQ-27 境界値・TASK-27.3・issue #72。PoC-10・PoC-25 のロックファイル方式）
+//! - [`weights_identity`]: 最終 test の台帳が候補を見分ける重みの識別の算出（byte は ONNX の sha256、
+//!   tokenizer 表現は ONNX・tokenizer.json・各 shard の sha256 から。評価器自身がファイルから求め、
+//!   呼び出し側の申告は受け付けない。REQ-27・#662）
 //! - [`ledger_dir`]: 最終 test 台帳のディレクトリ操作の抽象（fd 起点の実装を CLI が差し込む。REQ-39）
 //! - [`sample_size`][]: McNemar 検定で下限基準との差を検出するための
 //!   必要評価件数の事前計算（Connor 式を起点に、実際に使う両側正確検定の
@@ -204,4 +207,5 @@ pub mod regression;
 pub mod reproducibility;
 pub mod sample_size;
 pub mod significance;
+pub mod weights_identity;
 pub mod wilson;

@@ -124,8 +124,9 @@
 
 use std::cell::RefCell;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::evaluation_record::{
     AbstentionRecord, CalibrationRecord, EvaluationRecord, MAX_EVALUATION_RECORD_BYTES,
@@ -134,7 +135,6 @@ use fandhe_edge_core::evaluation_record::{
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded;
 use fandhe_edge_core::hash::Sha256Digest;
-use fandhe_edge_core::limits::INFER_TIME_LIMIT;
 use fandhe_edge_core::stage_report::{
     EvaluateAbstention, EvaluateCalibration, EvaluateCompletedReport, EvaluateDetails,
     EvaluateLabelMetrics, EvaluateReport, PredictionLine, PredictionLineOutcome,
@@ -151,15 +151,15 @@ use fandhe_edge_eval::final_test_once::{
     AcquireError, AppliedOnce, DecodeFailed, FinalTestLedger, LabeledInput, RegisteredConfig,
     RepresentativeConfigId, apply_once_then,
 };
-use fandhe_edge_eval::invariance::ModelPackagePaths;
+use fandhe_edge_eval::invariance::{ModelPackageBytes, ModelPackagePaths};
 use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome};
-use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
-use fandhe_edge_runtime::onnx::{MAX_MODEL_FILE_BYTES, ModelKind};
+use fandhe_edge_guard::format::check_bytes;
+use fandhe_edge_guard::resource::safety_limits_for_kind;
+use fandhe_edge_runtime::onnx::MAX_MODEL_FILE_BYTES;
 use fandhe_edge_runtime::pipeline::{
-    BackendError, InferError, InferencePipeline, MAX_INFER_BATCH_DURATION, MAX_INFER_BATCH_LEN,
+    BackendError, InferError, MAX_INFER_BATCH_DURATION, MAX_INFER_BATCH_LEN,
     MAX_INFER_BATCH_TOTAL_SCORES,
 };
-use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
 use fandhe_edge_train::request::{Device, TrainRequest};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::stage_files::SelectionRecord;
@@ -169,6 +169,7 @@ use crate::error_report::{
     EvalPredictFailure, ToErrorReport, acquire_error_report, apply_once_error_report,
 };
 use crate::infer_batch::judgment_from_prediction;
+use crate::infer_guard::format_allowlist_for;
 use crate::project::{
     EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, EVALUATION_REPORT_FILE,
     MAX_PROJECT_FILE_BYTES, Project, SELECTION_FILE, fail, inspect_bytes, invalid, runtime,
@@ -177,10 +178,11 @@ use crate::stage_output::{EvaluateStart, evaluate_start};
 
 use super::baseline::{PreparedBaseline, compare, prepare_baseline};
 use super::candidate_artifact::{
-    CandidateArtifact, check_meta_consistency, load_candidate_artifact,
+    CandidateArtifact, build_candidate_pipeline, build_candidate_pipeline_with_meta,
+    check_meta_consistency, load_candidate_artifact,
 };
 use super::diagnostics::{PreparedStats, prepare_stats};
-use super::infer::load_backend;
+use super::infer::Pipeline;
 use super::inspect::load_frozen_evaluation;
 use super::ledger::HeldLedger;
 use super::previous_comparison::{PreparedPrevious, current_correctness, prepare_previous};
@@ -204,8 +206,6 @@ pub enum EvaluateOutcome {
 /// 推論に使う、事前検証済みの候補（評価する 1 候補分）。
 struct PreparedCandidate {
     artifact: CandidateArtifact,
-    kind: ModelKind,
-    max_bytes: usize,
     config_id: RepresentativeConfigId,
     candidate_id: String,
     kind_name: String,
@@ -267,10 +267,23 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         else {
             continue;
         };
-        entries.push(RegisteredConfig::new(
+        // 重みの識別は評価器が同じ関数（`weights_identity`）で求める（byte が ONNX の sha256、tokenizer 表現が
+        // ONNX・tokenizer.json・各 shard の sha256 から。REQ-27・#662）。登録の構成要素は実際に当てるものと同じ
+        // バイト列から評価器に作らせる。tokenizer 表現は tokenizer.json と `artifact.json`（プロンプト等を含む）の
+        // sha256 も結び付け、登録後の差し替えを適用時の照合で止める。byte 表現は従来どおり ONNX だけ。
+        let tokenizer = prepared.artifact.tokenizer_bytes.as_deref();
+        let entry = RegisteredConfig::from_package_bytes(
             prepared.config_id.clone(),
-            Sha256Digest::of_bytes(&prepared.artifact.onnx_bytes),
-        ));
+            &ModelPackageBytes {
+                weights: Some(&prepared.artifact.onnx_bytes),
+                vocab: tokenizer,
+                calibration: None,
+                thresholds: None,
+                manifest: tokenizer.map(|_| prepared.artifact.meta_bytes.as_slice()),
+            },
+        )
+        .map_err(|e| acquire_error_report(&e))?;
+        entries.push(entry);
         if is_target {
             prepared_target = Some(prepared);
         }
@@ -284,16 +297,16 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
             "candidate has already been evaluated on the frozen data",
         ));
     }
-    // バックエンドを試しに組み立てて、読めない ONNX で適用権を使わない。
+    // パイプラインを試しに組み立てて、読めない ONNX で適用権を使わない。組んだものは校正にそのまま使う
+    // （`qwen2_lora` は shard が GiB 級のため、読み込みを増やさない。REQ-41・#662）。
     check_bytes(
         target.artifact.onnx_bytes.clone(),
-        &FormatAllowlist::onnx_only(),
+        &format_allowlist_for(&target.kind_name),
     )
     .map_err(|e| e.to_error_report())?;
-    load_backend(
+    let pipeline = build_candidate_pipeline(
         &target.artifact.onnx_bytes,
-        target.kind,
-        target.artifact.meta.kind_version(),
+        &target.artifact,
         definition.options().len(),
     )?;
     // 評価データも事前に検査する（ロック取得後の分解失敗で適用権を失わない）。
@@ -315,7 +328,15 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     // 引数は train 側の入力だけで、評価データを渡せない（REQ-27・#339）。
     let baseline = prepare_baseline(&definition, &records, &split)?;
     // 校正は validation だけから、適用権を取る前に確定する（REQ-22・REQ-27・#477）。
-    let calibration = calibrate_on_validation(&target, &definition, &records, &split)?;
+    let calibration = calibrate_on_validation(
+        &pipeline,
+        item_time_limit_for_kind(&target.kind_name),
+        &definition,
+        &records,
+        &split,
+    )?;
+    // 適用では評価器が読み直した重みから組み直すため、校正用の分は解放する。
+    drop(pipeline);
     let definition_sha256 = definition
         .canonical_hash()
         .map_err(|_| runtime("cannot hash definition"))?
@@ -516,18 +537,12 @@ fn prepare_candidate(
     }
     let artifact = load_candidate_artifact(project, index, &success)?;
     check_candidate_artifact(&artifact, definition, &request)?;
-    let kind =
-        ModelKind::parse(artifact.meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
-    let max_bytes = usize::try_from(artifact.meta.max_bytes())
-        .map_err(|_| invalid("package max_bytes is out of range"))?;
     let config_id =
         RepresentativeConfigId::parse(&format!("{}:seed{}", candidate.candidate_id, seed))
             .map_err(|e| acquire_error_report(&e))?;
     Ok(Some(PreparedCandidate {
         kind_name: artifact.meta.kind().to_string(),
         artifact,
-        kind,
-        max_bytes,
         config_id,
         candidate_id: candidate.candidate_id.clone(),
     }))
@@ -557,7 +572,8 @@ fn check_candidate_artifact(
 /// REQ-22 に基準なし。オーナー判断 2026-10-09）。校正の計算の失敗は `runtime_error`、
 /// 上限（件数・時間）超過は `limit_exceeded`。
 fn calibrate_on_validation(
-    target: &PreparedCandidate,
+    pipeline: &Pipeline,
+    item_time_limit: Duration,
     definition: &Definition,
     records: &[ValidRecord],
     split: &fandhe_edge_data::split::SplitResult,
@@ -584,13 +600,6 @@ fn calibrate_on_validation(
             "validation data has too many scores",
         ));
     }
-    let backend = load_backend(
-        &target.artifact.onnx_bytes,
-        target.kind,
-        target.artifact.meta.kind_version(),
-        options.len(),
-    )?;
-    let pipeline = InferencePipeline::new(ByteEncodingPreprocessor::new(target.max_bytes), backend);
     let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
     let mut logits: Vec<Vec<f64>> = Vec::with_capacity(validation.len());
     for record in &validation {
@@ -601,7 +610,7 @@ fn calibrate_on_validation(
             ));
         }
         let prediction = pipeline
-            .infer_one_within(&record.input, INFER_TIME_LIMIT)
+            .infer_one_within(&record.input, item_time_limit)
             .map_err(|e| e.to_error_report())?;
         logits.push(prediction.scores().iter().map(|p| p.ln()).collect());
     }
@@ -615,6 +624,12 @@ fn calibrate_on_validation(
         })
         .collect();
     calibrate_checked(&labels, &inputs).map(Some)
+}
+
+/// 1 件ごとの推論の時間上限を候補の `kind` の安全上限から引く（`infer` の単件上限と同じ表。
+/// 既存 3 種と未知の kind は従来の 10 秒、追加学習は 60 秒。REQ-39・REQ-41・#662）。
+fn item_time_limit_for_kind(kind: &str) -> Duration {
+    safety_limits_for_kind(kind).time().get()
 }
 
 /// 校正・保留の計算用に保持するロジットの総数（件数 × 選択肢数）が上限内か。桁あふれは上限超過として扱う。
@@ -1057,6 +1072,22 @@ fn apply_to_frozen_data<R>(
     let staged = StagedFiles::create()?;
     let eval_path = staged.write("evaluation.jsonl", eval_bytes)?;
     let weights_path = staged.write("model.onnx", &target.artifact.onnx_bytes)?;
+    // tokenizer 表現は tokenizer.json も私用ディレクトリへ複製し、語彙として評価器の前後ハッシュ照合へ渡す
+    // （登録の完全性のため。REQ-27・#662）。複製のハッシュは常に一致するので、これは改変を検出しない。
+    // 実際に止めるのは `build_qwen2_pipeline` の tokenizer.json の sha256 照合とランタイムの shard の照合。
+    // shard は GiB 級のため複製しない。
+    let vocab_path = target
+        .artifact
+        .tokenizer_bytes
+        .as_deref()
+        .map(|bytes| staged.write("tokenizer.json", bytes))
+        .transpose()?;
+    // tokenizer 表現は `artifact.json` もステージングし、評価器の識別の算出・登録照合・前後ハッシュ検証の対象にする。
+    // 適用での推論も、ここから読み直したバイト列でパイプラインを組む（REQ-27・#662）。
+    let manifest_path = vocab_path
+        .as_ref()
+        .map(|_| staged.write("artifact.json", &target.artifact.meta_bytes))
+        .transpose()?;
     let frozen = FrozenEvalData {
         path: &eval_path,
         sha256: freeze.sha256(),
@@ -1064,9 +1095,10 @@ fn apply_to_frozen_data<R>(
     };
     let model = ModelPackagePaths {
         weights: &weights_path,
-        vocab: None,
+        vocab: vocab_path.as_deref(),
         calibration: None,
         thresholds: None,
+        manifest: manifest_path.as_deref(),
     };
     let options = definition.options();
     apply_once_then(
@@ -1083,15 +1115,30 @@ fn apply_to_frozen_data<R>(
             if Sha256Digest::of_bytes(&weights) != onnx_digest {
                 return Err(EvalPredictFailure::ModelChanged);
             }
-            let backend = load_backend(
-                &weights,
-                target.kind,
-                target.artifact.meta.kind_version(),
-                options.len(),
-            )
+            // 注意（tokenizer 表現）: ここで shard を読み直して sha256 を照合する（適用権の取得後）。適用権の前の
+            // 試し組み立てからここまでの間に shard が差し替えられる、またはメモリが足りなくなると、適用権だけが
+            // 消費されて `Failed`（`runtime_error`・70）になる。評価は成功を記録せず `package` は配布を許さない
+            // ので fail-closed で契約違反ではないが、その候補は再評価できない（モジュール doc の適用権の規則）。
+            // tokenizer 表現は、評価器が識別と照合に使ったステージング済みの `artifact.json` から読み直した
+            // バイト列でパイプラインを組む（ランタイムの shard sha256 照合が、識別と同じ記録値に対して行われる）。
+            let pipeline = match paths.manifest {
+                Some(manifest) => {
+                    let meta_bytes = read_bounded(manifest, MAX_ARTIFACT_META_BYTES)
+                        .map_err(|_| EvalPredictFailure::Failed)?;
+                    let meta =
+                        ArtifactMeta::parse(&meta_bytes).map_err(|_| EvalPredictFailure::Failed)?;
+                    build_candidate_pipeline_with_meta(
+                        &weights,
+                        &target.artifact.dir,
+                        &meta_bytes,
+                        &meta,
+                        options.len(),
+                    )
+                }
+                None => build_candidate_pipeline(&weights, &target.artifact, options.len()),
+            }
             .map_err(|_| EvalPredictFailure::Failed)?;
-            let pipeline =
-                InferencePipeline::new(ByteEncodingPreprocessor::new(target.max_bytes), backend);
+            let item_time_limit = item_time_limit_for_kind(&target.kind_name);
             let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
             let mut outcomes = Vec::with_capacity(inputs.len());
             for input in inputs {
@@ -1101,7 +1148,7 @@ fn apply_to_frozen_data<R>(
                 // 推論・判定への変換の失敗は 1 件ごとの `Outcome::Error` にせず、評価全体の失敗として
                 // 伝える。`Ok` で返すと、全件が失敗しても完了記録と配布許可が作られてしまう（REQ-27）。
                 // 失敗時は評価器が成功を記録しないため、`package` は配布を許さない。
-                let prediction = match pipeline.infer_one_within(input, INFER_TIME_LIMIT) {
+                let prediction = match pipeline.infer_one_within(input, item_time_limit) {
                     Ok(prediction) => prediction,
                     Err(InferError::Backend(BackendError::TimeLimitExceeded)) => {
                         return Err(EvalPredictFailure::TimeLimit);
@@ -1190,6 +1237,22 @@ mod tests {
 
     /// REQ-39・#445: 予測ファイルの上界（2 件 × (128 + 6×2 + 6×1 + 2×(6+40)) = 476）が上限を超えると、
     /// 適用権を取る前の確認が `limit_exceeded` になる。ちょうど上限なら通る。
+    /// REQ-39・REQ-41・#662: 1 件ごとの推論上限は kind で決まる。byte 系は従来の `INFER_TIME_LIMIT`（10 秒）、
+    /// `qwen2_lora` は 60 秒、未知の kind は厳しい側（10 秒）。
+    #[test]
+    fn req39_issue662_item_time_limit_follows_kind() {
+        for kind in ["c1", "c3", "autoregressive", "unknown"] {
+            assert_eq!(
+                item_time_limit_for_kind(kind),
+                fandhe_edge_core::limits::INFER_TIME_LIMIT
+            );
+        }
+        assert_eq!(
+            item_time_limit_for_kind("qwen2_lora"),
+            Duration::from_secs(60)
+        );
+    }
+
     #[test]
     fn req39_issue445_predictions_upper_bound_is_checked_against_limit() {
         let ids = vec!["e1".to_string(), "e2".to_string()];

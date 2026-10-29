@@ -88,6 +88,9 @@ pub enum ModelComponent {
     Calibration,
     /// しきい値（判定境界）。
     Thresholds,
+    /// 成果物のメタデータ（`artifact.json`。プロンプト・参照欄・来歴を含む）。評価器が重みの識別を
+    /// 算出する材料で、登録後の差し替えを検出するため不変性検証の対象にする（REQ-27・#662）。
+    Manifest,
 }
 
 impl ModelComponent {
@@ -122,7 +125,8 @@ impl ModelComponent {
             Some(ModelComponent::Weights) => Some(ModelComponent::Vocab),
             Some(ModelComponent::Vocab) => Some(ModelComponent::Calibration),
             Some(ModelComponent::Calibration) => Some(ModelComponent::Thresholds),
-            Some(ModelComponent::Thresholds) => None,
+            Some(ModelComponent::Thresholds) => Some(ModelComponent::Manifest),
+            Some(ModelComponent::Manifest) => None,
         }
     }
 
@@ -143,6 +147,7 @@ impl ModelComponent {
             ModelComponent::Vocab => "vocab",
             ModelComponent::Calibration => "calibration",
             ModelComponent::Thresholds => "thresholds",
+            ModelComponent::Manifest => "manifest",
         }
     }
 }
@@ -170,6 +175,8 @@ pub struct ModelPackageBytes<'a> {
     pub calibration: Option<&'a [u8]>,
     /// しきい値。無ければ `None`。
     pub thresholds: Option<&'a [u8]>,
+    /// 成果物のメタデータ（`artifact.json`）。無ければ `None`。
+    pub manifest: Option<&'a [u8]>,
 }
 
 impl fmt::Debug for ModelPackageBytes<'_> {
@@ -186,6 +193,7 @@ impl fmt::Debug for ModelPackageBytes<'_> {
             .field("vocab_len", &len_or_none(self.vocab))
             .field("calibration_len", &len_or_none(self.calibration))
             .field("thresholds_len", &len_or_none(self.thresholds))
+            .field("manifest_len", &len_or_none(self.manifest))
             .finish()
     }
 }
@@ -202,6 +210,7 @@ impl<'a> ModelPackageBytes<'a> {
             ModelComponent::Vocab => self.vocab,
             ModelComponent::Calibration => self.calibration,
             ModelComponent::Thresholds => self.thresholds,
+            ModelComponent::Manifest => self.manifest,
         }
     }
 
@@ -454,6 +463,9 @@ pub struct ModelPackagePaths<'a> {
     pub calibration: Option<&'a Path>,
     /// しきい値ファイルのパス。無ければ `None`。
     pub thresholds: Option<&'a Path>,
+    /// 成果物のメタデータ（`artifact.json`。ステージングしたもの）のパス。無ければ `None`。
+    /// 評価器が重みの識別の算出（[`crate::weights_identity`]）と登録照合に使う（REQ-27・#662）。
+    pub manifest: Option<&'a Path>,
 }
 
 impl<'a> ModelPackagePaths<'a> {
@@ -469,6 +481,7 @@ impl<'a> ModelPackagePaths<'a> {
             ModelComponent::Vocab => self.vocab,
             ModelComponent::Calibration => self.calibration,
             ModelComponent::Thresholds => self.thresholds,
+            ModelComponent::Manifest => self.manifest,
         }
     }
 }
@@ -555,6 +568,12 @@ fn capture_snapshot<E>(
         digests.insert(
             ModelComponent::Thresholds,
             hash_component(ModelComponent::Thresholds, path)?,
+        );
+    }
+    if let Some(path) = paths.manifest {
+        digests.insert(
+            ModelComponent::Manifest,
+            hash_component(ModelComponent::Manifest, path)?,
         );
     }
     ModelPackageSnapshot::from_digests(digests).map_err(EvaluationInvarianceError::Snapshot)
@@ -807,6 +826,7 @@ mod tests {
             vocab: Some(b"vocab-v1"),
             calibration: Some(b"calibration-v1"),
             thresholds: Some(b"thresholds-v1"),
+            manifest: None,
         }
     }
 
@@ -827,8 +847,31 @@ mod tests {
                 ModelComponent::Vocab,
                 ModelComponent::Calibration,
                 ModelComponent::Thresholds,
+                ModelComponent::Manifest,
             ]
         );
+    }
+
+    /// REQ-27・#662: メタデータ（`artifact.json`）も評価前後の不変性検証の対象で、差し替えは `Manifest` の
+    /// 変化として検出される。
+    #[test]
+    fn req27_issue662_manifest_change_is_detected() {
+        let with_manifest = |m: &'static [u8]| ModelPackageBytes {
+            manifest: Some(m),
+            ..sample_bytes()
+        };
+        let before = ModelPackageSnapshot::capture(&with_manifest(b"prompt-v1")).unwrap();
+        let after = ModelPackageSnapshot::capture(&with_manifest(b"prompt-v2")).unwrap();
+        let violation = before.verify_unchanged(&after).unwrap_err();
+        assert_eq!(violation.changes.len(), 1);
+        assert!(matches!(
+            &violation.changes[0],
+            ComponentChange::Modified {
+                component: ModelComponent::Manifest,
+                ..
+            }
+        ));
+        assert_eq!(ModelComponent::Manifest.as_str(), "manifest");
     }
 
     #[test]
@@ -971,6 +1014,7 @@ mod tests {
             vocab: Some(b"vocab-v2"),
             calibration: Some(b"calibration-v2"),
             thresholds: Some(b"thresholds-v2"),
+            manifest: None,
         };
         let after = ModelPackageSnapshot::capture(&after_bytes).expect("失敗しないはず");
 
@@ -1026,6 +1070,7 @@ mod tests {
             vocab: None,
             calibration: Some(b"SECRET-CALIBRATION"),
             thresholds: Some(b""),
+            manifest: None,
         };
         let debugged = format!("{bytes:?}");
         assert!(!debugged.contains("SECRET-WEIGHTS-should-not-leak"));
@@ -1193,6 +1238,7 @@ mod tests {
                 vocab: Some(&self.vocab_path),
                 calibration: Some(&self.calibration_path),
                 thresholds: Some(&self.thresholds_path),
+                manifest: None,
             }
         }
     }
@@ -1418,6 +1464,7 @@ mod tests {
             vocab: None,
             calibration: None,
             thresholds: Some(&thresholds_guard.0),
+            manifest: None,
         };
 
         let result: Result<(), EvaluationInvarianceError<StubEvalError>> =
@@ -1443,6 +1490,7 @@ mod tests {
             vocab: Some(&missing_vocab),
             calibration: None,
             thresholds: None,
+            manifest: None,
         };
 
         let result: Result<(), EvaluationInvarianceError<StubEvalError>> =
@@ -1479,6 +1527,7 @@ mod tests {
             vocab: None,
             calibration: None,
             thresholds: None,
+            manifest: None,
         };
 
         let result: Result<(), EvaluationInvarianceError<StubEvalError>> =

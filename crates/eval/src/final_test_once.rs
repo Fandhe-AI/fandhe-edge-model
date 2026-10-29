@@ -23,9 +23,12 @@
 //!   を受け取り、[`evaluate_with_invariance`] の内側で重みファイルを自らハッシュして
 //!   キーを作り、`predict` へは**同じ [`ModelPackagePaths`]** を渡す。予測に使う
 //!   モデルとロックキーが同一のパスから導出され、評価前後のモデル不変性検証
-//!   （REQ-27）と一体で動く。
+//!   （REQ-27）と一体で動く。重みの識別（ロックのキー）は [`crate::weights_identity`] が重み・
+//!   `artifact.json`（tokenizer 表現のとき）のファイルから算出する 1 か所の定義で、識別を呼び出し側が
+//!   渡す入口は公開しない（同じモデルを別の識別で再適用する迂回、登録後に重みを変えて登録済みの識別を
+//!   名乗る迂回を作れない。#662）。
 //! - **事前登録**: 候補・seed の代表構成 ID と、その構成で当てるモデルパッケージ全構成要素
-//!   （重み・語彙・校正・しきい値。無い要素は「無い」）の sha256 の組
+//!   （重み・語彙・校正・しきい値・`artifact.json`。無い要素は「無い」）の sha256 の組
 //!   ([`RegisteredConfig`]) を、評価前に [`FinalTestLedger::register_configs`] で
 //!   評価データごとに 1 回だけ台帳へ凍結する。[`apply_once`] は登録済み集合に含まれない
 //!   ID、および登録したダイジェストと異なる構成要素での適用を拒否する（未使用 ID に別重みを当てて
@@ -109,10 +112,11 @@ use crate::eval_data_invariance::{
     EvalDataInvarianceError, FrozenEvalData, evaluate_with_eval_data_invariance,
 };
 use crate::invariance::{
-    EvaluationInvarianceError, MAX_MODEL_COMPONENT_BYTES, ModelPackagePaths,
+    EvaluationInvarianceError, MAX_MODEL_COMPONENT_BYTES, ModelPackageBytes, ModelPackagePaths,
     evaluate_with_invariance,
 };
 use crate::ledger_dir::{EntryKind, LedgerDir, StdLedgerDir};
+use crate::weights_identity::{self, ResolvedIdentity, WeightsIdentityError};
 use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
@@ -170,8 +174,8 @@ fn is_lock_file_name(name: &str) -> bool {
 pub const MAX_REGISTERED_CONFIGS: usize = 1024;
 
 /// 事前登録ファイルの最大バイト数（読み込み前のサイズ上限。REQ-39）。
-/// 128 バイトの ID と sha256（hex 64 桁）4 個の行を最大件数並べても収まる値。
-const MAX_REGISTRY_BYTES: u64 = (MAX_CONFIG_ID_BYTES as u64 + 4 * (1 + 64) + 1)
+/// 128 バイトの ID と sha256（hex 64 桁）5 個の行を最大件数並べても収まる値。
+const MAX_REGISTRY_BYTES: u64 = (MAX_CONFIG_ID_BYTES as u64 + 5 * (1 + 64) + 1)
     * MAX_REGISTERED_CONFIGS as u64
     + REGISTRY_HEADER.len() as u64;
 
@@ -217,10 +221,16 @@ pub struct RegisteredConfig {
     vocab_sha256: Option<Sha256Digest>,
     calibration_sha256: Option<Sha256Digest>,
     thresholds_sha256: Option<Sha256Digest>,
+    manifest_sha256: Option<Sha256Digest>,
 }
 
 impl RegisteredConfig {
-    /// 代表構成 ID と、評価前に確定した重みファイルの sha256 から作る。
+    /// 代表構成 ID と、評価前に確定した重みの識別から作る低水準の入口。
+    ///
+    /// `weights_sha256` は適用時に評価器が [`weights_identity`] の関数でファイルから自ら算出した値と
+    /// 照合される（呼び出し側の申告は適用に影響しない）。登録に使う識別は、同じ関数
+    /// （[`weights_identity::weights_identity_from_bytes`] 等）で求めるか、[`Self::from_package`]・
+    /// [`Self::from_package_bytes`] に任せること。
     #[must_use]
     pub fn new(id: RepresentativeConfigId, weights_sha256: Sha256Digest) -> Self {
         RegisteredConfig {
@@ -229,7 +239,18 @@ impl RegisteredConfig {
             vocab_sha256: None,
             calibration_sha256: None,
             thresholds_sha256: None,
+            manifest_sha256: None,
         }
+    }
+
+    /// 成果物のメタデータ（`artifact.json`）の生バイトの sha256 も結び付ける（呼ばなければ「無し」を登録する）。
+    ///
+    /// 識別（重みの中身だけで決まる。ロックのキー）とは別に、登録時と適用時でメタデータが完全一致することを
+    /// 照合させる。登録後に system プロンプト等を差し替えて最終 test を当て直す迂回を止める（REQ-27・#662）。
+    #[must_use]
+    pub fn with_manifest(mut self, sha256: Sha256Digest) -> Self {
+        self.manifest_sha256 = Some(sha256);
+        self
     }
 
     /// 語彙ファイルの sha256 も結び付ける（呼ばなければ「語彙なし」を登録する）。
@@ -253,23 +274,83 @@ impl RegisteredConfig {
         self
     }
 
-    /// モデルパッケージの全構成要素（重み・語彙・校正・しきい値）を自らハッシュして
-    /// 登録項目を作る。存在しない構成要素（`None`）は「無い」ことを登録する。
+    /// モデルパッケージの全構成要素（重み・語彙・校正・しきい値・メタデータ）を自らハッシュして
+    /// 登録項目を作る。存在しない構成要素（`None`）は「無い」ことを登録する。重みの識別は
+    /// [`weights_identity::weights_identity_from_paths`] で算出する。
     ///
     /// # Errors
     ///
-    /// いずれかのファイルのダイジェストを計算できない場合（[`AcquireError::WeightsDigest`]）。
+    /// いずれかのファイルのダイジェストを計算できない場合（[`AcquireError::WeightsDigest`]）、
+    /// `manifest` が不正な場合（[`AcquireError::RegistryInvalid`]）、tokenizer 表現で `vocab` が記録値と
+    /// 一致しない場合（[`AcquireError::ComponentNotRegistered`]）。
     pub fn from_package(
         id: RepresentativeConfigId,
         package: &ModelPackagePaths<'_>,
     ) -> Result<Self, AcquireError> {
+        let resolved = weights_identity::resolve_from_paths(package)?;
+        let vocab_sha256 = digest_optional(package.vocab)?;
+        check_vocab_binding(&resolved, vocab_sha256.as_ref())?;
         Ok(RegisteredConfig {
             id,
-            weights_sha256: digest_component(package.weights)?,
-            vocab_sha256: digest_optional(package.vocab)?,
+            weights_sha256: resolved.digest,
+            vocab_sha256,
             calibration_sha256: digest_optional(package.calibration)?,
             thresholds_sha256: digest_optional(package.thresholds)?,
+            manifest_sha256: digest_optional(package.manifest)?,
         })
+    }
+
+    /// [`Self::from_package`] のメモリ上のバイト列版（CLI が全候補を、ステージングする前に登録するために使う）。
+    /// 重みは必須で、識別は [`weights_identity::weights_identity_from_bytes`] と同じ定義で算出する。
+    ///
+    /// # Errors
+    ///
+    /// 重みが無い・`manifest` が不正（[`AcquireError::RegistryInvalid`]）、tokenizer 表現で `vocab` が
+    /// 記録値と一致しない（[`AcquireError::ComponentNotRegistered`]）。
+    pub fn from_package_bytes(
+        id: RepresentativeConfigId,
+        package: &ModelPackageBytes<'_>,
+    ) -> Result<Self, AcquireError> {
+        let resolved = weights_identity::resolve_from_bytes(package)?.ok_or(
+            AcquireError::RegistryInvalid {
+                reason: "missing weights",
+            },
+        )?;
+        let vocab_sha256 = package.vocab.map(Sha256Digest::of_bytes);
+        check_vocab_binding(&resolved, vocab_sha256.as_ref())?;
+        Ok(RegisteredConfig {
+            id,
+            weights_sha256: resolved.digest,
+            vocab_sha256,
+            calibration_sha256: package.calibration.map(Sha256Digest::of_bytes),
+            thresholds_sha256: package.thresholds.map(Sha256Digest::of_bytes),
+            manifest_sha256: package.manifest.map(Sha256Digest::of_bytes),
+        })
+    }
+}
+
+impl From<WeightsIdentityError> for AcquireError {
+    fn from(error: WeightsIdentityError) -> Self {
+        match error {
+            WeightsIdentityError::Read(source) => AcquireError::WeightsDigest { source },
+            _ => AcquireError::RegistryInvalid {
+                reason: "artifact manifest is invalid",
+            },
+        }
+    }
+}
+
+/// tokenizer 表現のとき、`vocab`（`tokenizer.json`）の sha256 が `artifact.json` の記録値と一致することを
+/// 確かめる。tokenizer.json を識別（重み）と同じ記録値へ結び付け、別の tokenizer を当てて同じ識別を名乗る
+/// 迂回を止める（REQ-27・#662）。byte 表現（記録値なし）は何もしない。
+fn check_vocab_binding(
+    resolved: &ResolvedIdentity,
+    vocab: Option<&Sha256Digest>,
+) -> Result<(), AcquireError> {
+    match (&resolved.tokenizer_sha256, vocab) {
+        (None, _) => Ok(()),
+        (Some(recorded), Some(actual)) if recorded == actual => Ok(()),
+        _ => Err(AcquireError::ComponentNotRegistered { component: "vocab" }),
     }
 }
 
@@ -450,7 +531,7 @@ pub enum AcquireError {
     /// 予測に使う語彙・校正・しきい値のいずれかが、事前登録でその ID に結び付けた
     /// ダイジェスト（または「無い」）と一致しない。ロックは作られない。
     ComponentNotRegistered {
-        /// 不一致の構成要素名（`vocab` / `calibration` / `thresholds`）。
+        /// 不一致の構成要素名（`vocab` / `calibration` / `thresholds` / `manifest`）。
         component: &'static str,
     },
     /// この評価データの事前登録は既にある（登録の変更・上書きは拒否する）、または
@@ -1178,7 +1259,8 @@ fn selection_pin_body(
     )
 }
 
-/// 事前登録集合の正準化本文（ID 順にソート済みの `<ID> <重み> <語彙> <校正> <しきい値>`（sha256 hex。無い要素は `-`）を 1 行ずつ）。
+/// 事前登録集合の正準化本文（ID 順にソート済みの `<ID> <重み> <語彙> <校正> <しきい値>`（sha256 hex。無い要素は `-`）を
+/// 1 行ずつ。`artifact.json` を登録した構成だけ、末尾に 6 列目として sha256 を付ける）。
 fn registry_body(entries: &[RegisteredConfig]) -> String {
     let mut out = String::from(REGISTRY_HEADER);
     for e in entries {
@@ -1191,6 +1273,11 @@ fn registry_body(entries: &[RegisteredConfig]) -> String {
         ] {
             out.push(' ');
             out.push_str(&opt_hex(&d));
+        }
+        // メタデータの列は登録したときだけ付ける（byte 表現の登録本文は従来と同じ 5 列のまま）。
+        if let Some(manifest) = &e.manifest_sha256 {
+            out.push(' ');
+            out.push_str(&manifest.to_hex());
         }
         out.push('\n');
     }
@@ -1211,10 +1298,14 @@ fn parse_registry(body: &str) -> Result<Vec<RegisteredConfig>, AcquireError> {
             });
         }
         let fields: Vec<&str> = line.split(' ').collect();
-        let [id, w, v, c, t] = fields[..] else {
-            return Err(AcquireError::RegistryInvalid {
-                reason: "malformed registry line",
-            });
+        let (id, w, v, c, t, m) = match fields[..] {
+            [id, w, v, c, t] => (id, w, v, c, t, "-"),
+            [id, w, v, c, t, m] if m != "-" => (id, w, v, c, t, m),
+            _ => {
+                return Err(AcquireError::RegistryInvalid {
+                    reason: "malformed registry line",
+                });
+            }
         };
         let Some(weights_sha256) = parse_opt_digest(w)? else {
             return Err(AcquireError::RegistryInvalid {
@@ -1227,6 +1318,7 @@ fn parse_registry(body: &str) -> Result<Vec<RegisteredConfig>, AcquireError> {
             vocab_sha256: parse_opt_digest(v)?,
             calibration_sha256: parse_opt_digest(c)?,
             thresholds_sha256: parse_opt_digest(t)?,
+            manifest_sha256: parse_opt_digest(m)?,
         });
     }
     if entries.is_empty() {
@@ -1322,8 +1414,8 @@ impl FinalTestLedger {
 ///
 /// - `frozen` の sha256・バイト長と実データが一致した場合のみ、その照合済み sha256 で
 ///   ロックのキーを作る。
-/// - `model` の重みファイルは本関数が自らハッシュしてキーにし、`predict` へは同じ
-///   `model` を渡す。評価前後のモデル不変性も本関数が検証する（REQ-27）。
+/// - `model` の重みの識別は本関数が [`crate::weights_identity`] の定義でファイルから自ら算出してキーにし、
+///   `predict` へは同じ `model` を渡す。評価前後のモデル不変性も本関数が検証する（REQ-27）。
 /// - `config_id` は [`FinalTestLedger::register_configs`] で事前登録済みの ID に限る。
 /// - `decode` は照合済みの評価データ本体を [`LabeledInput`] の列へ分ける（評価器側の責務）。
 ///   ロック取得後に呼ばれ、失敗しても適用は消費済み（理由は運ばない。[`DecodeFailed`]）。
@@ -1378,18 +1470,29 @@ pub fn apply_once_then<T, E, R>(
             let Some(entry) = registered.iter().find(|e| e.id == config_id) else {
                 return Err(ApplyOnceError::Acquire(AcquireError::UnregisteredConfig));
             };
-            let weights_sha256 =
-                digest_component(paths.weights).map_err(ApplyOnceError::Acquire)?;
+            // 重みの識別は呼び出し側の申告でなく、評価器が `paths` のファイルから自ら算出する
+            // （同じモデルを別の識別で再適用する迂回、登録後に重みを変えて登録済みの識別を名乗る迂回を
+            // 公開 API では作れない。REQ-27・#662）。
+            let resolved = weights_identity::resolve_from_paths(paths)
+                .map_err(|e| ApplyOnceError::Acquire(e.into()))?;
+            let weights_sha256 = resolved.digest;
             if weights_sha256 != entry.weights_sha256 {
                 return Err(ApplyOnceError::Acquire(AcquireError::WeightsNotRegistered));
             }
-            // 語彙・校正・しきい値も登録時のダイジェスト（または「無い」）と照合する。
+            // 語彙・校正・しきい値・メタデータも登録時のダイジェスト（または「無い」）と照合する。
             // 重みだけ一致させて未使用構成の他要素を調整する迂回を拒否する（REQ-27）。
-            for (component, path, registered) in [
-                ("vocab", paths.vocab, &entry.vocab_sha256),
+            let vocab_actual = digest_optional(paths.vocab).map_err(ApplyOnceError::Acquire)?;
+            let others = [
                 ("calibration", paths.calibration, &entry.calibration_sha256),
                 ("thresholds", paths.thresholds, &entry.thresholds_sha256),
-            ] {
+                ("manifest", paths.manifest, &entry.manifest_sha256),
+            ];
+            if vocab_actual != entry.vocab_sha256 {
+                return Err(ApplyOnceError::Acquire(
+                    AcquireError::ComponentNotRegistered { component: "vocab" },
+                ));
+            }
+            for (component, path, registered) in others {
                 let actual = digest_optional(path).map_err(ApplyOnceError::Acquire)?;
                 if &actual != registered {
                     return Err(ApplyOnceError::Acquire(
@@ -1397,6 +1500,9 @@ pub fn apply_once_then<T, E, R>(
                     ));
                 }
             }
+            // tokenizer 表現は、`tokenizer.json` が識別に入れた記録値と一致することも確かめる。
+            check_vocab_binding(&resolved, vocab_actual.as_ref())
+                .map_err(ApplyOnceError::Acquire)?;
             // 適用権は評価データ本文を `decode` へ渡す前に消費する。本文を見てから
             // `Err` で抜けて何度でも呼び直す迂回を塞ぐ（REQ-27）。
             let key = FinalTestKey::from_verified(frozen.sha256, config_id, weights_sha256);

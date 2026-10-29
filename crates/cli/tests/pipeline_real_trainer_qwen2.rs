@@ -1,7 +1,7 @@
 #![cfg(unix)]
 //! 実バイナリ `fandhe-edge` と実 trainer（MLX CPU）で、`qwen2_lora` を CLI の `train --base-model-dir` から
-//! 学習する結合テスト（REQ-41 正常系・REQ-33・REQ-39・#628）。`select` 以降（tokenizer 入力表現の経路）は
-//! 未接続のため、現状の境界（`select` の 64）までを確かめる。
+//! 学習する結合テスト（REQ-41 正常系・REQ-33・REQ-39・#628）。`select`・`evaluate`（tokenizer 入力表現の経路）は
+//! #662-a で接続済み。`package` は #662-b まで未接続のため、現状の境界（`package` の 64）までを確かめる。
 //!
 //! # 証拠の種別
 //!
@@ -95,7 +95,8 @@ fn string_after<'a>(json: &'a str, from: &str, key: &str) -> &'a str {
 }
 
 /// REQ-41・REQ-33・REQ-39・#628: 実 trainer で `train --kind qwen2_lora --base-model-dir` が完走し（cwd 配下の
-/// ベースモデルを候補ディレクトリの外の絶対パスとして読む）、`select` は tokenizer 経路の未接続で 64 になる。
+/// ベースモデルを候補ディレクトリの外の絶対パスとして読む）、`select`・`evaluate` が通り、`package` は
+/// tokenizer 経路の未接続（#662-b）で 64 になる。
 #[test]
 #[ignore = "requires trainer/.venv (make py-sync) and MLX CPU; run via make test-trainer-integration"]
 fn req41_issue628_real_trainer_qwen2_lora_trains_via_cli() {
@@ -187,10 +188,27 @@ fn req41_issue628_real_trainer_qwen2_lora_trains_via_cli() {
             .is_file()
     );
 
-    // `select` 以降の tokenizer 入力表現の経路は未接続（`check_input_representation` が fail-closed で止める）。
-    // 接続したら `evaluate`・`package`・`infer` と、validation 予測との一致まで延ばす。
+    // `select`・`evaluate` は tokenizer 入力表現（`qwen2_lora`）に接続済み（#662-a）。実 trainer の自己完結
+    // パッケージ（tokenizer.json・外部データ shard）で、構造検査・校正・凍結 test への適用が通る。
+    assert_eq!(
+        cli_ok(
+            &work_dir,
+            &["select", "--project-dir", "proj", "--kind", "qwen2_lora"],
+        ),
+        "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":2,\"kind\":\"qwen2_lora\",\"significance\":null}\n"
+    );
+    let evaluated = cli_ok(
+        &work_dir,
+        &["evaluate", "--project-dir", "proj", "--candidate", "2"],
+    );
+    assert!(
+        evaluated.starts_with("{\"step\":\"evaluate\",\"status\":\"ok\""),
+        "{evaluated}"
+    );
+    // `package` の tokenizer 経路は #662-b で接続する。それまでは fail-closed（接続したら `infer` と、
+    // validation 予測との一致まで延ばす）。
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fandhe-edge"));
-    cmd.args(["select", "--project-dir", "proj", "--kind", "qwen2_lora"])
+    cmd.args(["package", "--project-dir", "proj"])
         .current_dir(&work_dir);
     assert_eq!(
         run(cmd),

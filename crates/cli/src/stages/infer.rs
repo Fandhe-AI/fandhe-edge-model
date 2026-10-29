@@ -573,12 +573,11 @@ fn load_calibration(
     }))
 }
 
-/// byte 以外の入力表現を拒否する（byte 前処理で黙って推論すると誤った予測になるため。
-/// REQ-41・TASK-41.3-1・#402）。`infer` の `qwen2_lora`（tokenizer）は
-/// [`build_qwen2_pipeline`] へ分岐して
-/// 本関数を通らない（#626）。`package`・`select`・`evaluate` は tokenizer 経路が未接続のため引き続き拒否する。
+/// 推論できない入力表現を拒否する（byte 前処理で黙って推論すると誤った予測になるため。
+/// REQ-41・TASK-41.3-1・#402）。通すのは byte と、tokenizer かつ `qwen2_lora`（[`build_qwen2_pipeline`]。
+/// `infer` は #626、`select`・`evaluate` は #662 で接続）。`package` の tokenizer 経路は #662-b で接続する。
 pub(crate) fn check_input_representation(meta: &ArtifactMeta) -> Result<(), ErrorReport> {
-    if meta.input_representation() == PackageInputRepresentation::Byte {
+    if meta.input_representation() == PackageInputRepresentation::Byte || is_tokenizer_qwen2(meta) {
         Ok(())
     } else {
         Err(invalid("unsupported input representation"))
@@ -587,7 +586,7 @@ pub(crate) fn check_input_representation(meta: &ArtifactMeta) -> Result<(), Erro
 
 /// 入力表現 `tokenizer` かつ `kind` が `qwen2_lora` のパッケージか。これだけが tokenizer 経路で推論できる
 /// （それ以外の tokenizer 宣言は [`check_input_representation`] が拒否する。REQ-41・#626）。
-fn is_tokenizer_qwen2(meta: &ArtifactMeta) -> bool {
+pub(crate) fn is_tokenizer_qwen2(meta: &ArtifactMeta) -> bool {
     meta.input_representation() == PackageInputRepresentation::Tokenizer
         && meta.kind() == ModelKind::Qwen2Lora.as_str()
 }
@@ -598,7 +597,7 @@ fn is_tokenizer_qwen2(meta: &ArtifactMeta) -> bool {
 /// （パスから開き直さない）。トークナイザーは上限つきで読み sha256 を照合し、shard の sha256・
 /// 件数・サイズ上限はランタイムの `from_bytes_with_shards` が読みながら照合する（不一致は fail-closed）。
 /// 本文・重みはエラーに出さない。
-fn build_qwen2_pipeline(
+pub(crate) fn build_qwen2_pipeline(
     onnx: &[u8],
     package: &ConfinedPackage,
     meta_bytes: &[u8],
@@ -663,14 +662,17 @@ fn build_qwen2_pipeline(
 ///
 /// # Errors
 /// `max_bytes` が範囲外・未対応の `kind`・未許可の版・読み込めない ONNX・出力サイズの不一致は
-/// `invalid_input`（64）。`tokenizer` の宣言は本関数では未対応のため同じく 64
-/// （`infer` の `qwen2_lora` は [`build_qwen2_pipeline`]。REQ-41）。
+/// `invalid_input`（64）。byte 以外（`tokenizer` を含む）の宣言は本関数では未対応のため同じく 64
+/// （`qwen2_lora` は [`build_qwen2_pipeline`]。分岐は `build_candidate_pipeline` と `prepare`。REQ-41）。
 pub(crate) fn build_pipeline(
     onnx: &[u8],
     meta: &ArtifactMeta,
     n_options: usize,
 ) -> Result<Pipeline, ErrorReport> {
-    check_input_representation(meta)?;
+    // byte 前処理を組むのは byte 表現だけ（tokenizer の meta で byte 前処理を黙って組まない内部ガード）。
+    if meta.input_representation() != PackageInputRepresentation::Byte {
+        return Err(invalid("unsupported input representation"));
+    }
     let max_bytes = usize::try_from(meta.max_bytes())
         .ok()
         .filter(|n| (MIN_MAX_BYTES..=MAX_MAX_BYTES).contains(n))

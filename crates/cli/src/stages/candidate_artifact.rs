@@ -7,28 +7,44 @@
 //! ために、読み込みと整合性の検査をここに 1 つだけ置く。候補ディレクトリは [`Project`] の保持 fd
 //! からの相対オープン（`O_NOFOLLOW`・`O_DIRECTORY`）で得て、`artifact_dir` は文字列の前方一致でなく
 //! 候補ディレクトリからの相対パスとして求める（学習結果の差し替えで候補の外を読まない。REQ-39）。
+//!
+//! # kind 別の分岐の集約（REQ-41・#662）
+//!
+//! 入力表現が tokenizer の `qwen2_lora` だけは、成果物に `tokenizer.json` と外部データの shard が付く。
+//! `select`・`evaluate`（・`package`）が kind ごとに同じ分岐を持たないよう、形式許可リスト
+//! （[`crate::infer_guard::format_allowlist_for`]）・パイプライン組立（[`build_candidate_pipeline`]）・
+//! 計測対象の列挙（[`measured_members`]）をここへ置く。読み込み時の構造検査では `tokenizer.json` を
+//! 上限つきで読んで sha256 を照合し、shard は開いて fstat のサイズ上限だけを確認する
+//! （中身は読まない。sha256 の照合は推論のパイプライン組立時にランタイムが読みながら行う）。
 
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use fandhe_edge_core::artifact_meta::{
-    ArtifactMeta, ArtifactMetaError, MAX_ARTIFACT_META_BYTES, VocabStreamError, verify_vocab_stream,
+    ArtifactMeta, ArtifactMetaError, MAX_ARTIFACT_META_BYTES, TokenizerPackageRefs,
+    VocabStreamError, verify_vocab_stream,
 };
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::fs::{FsError, read_bounded_open_file};
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_guard::kind::KindAllowlist;
+use fandhe_edge_guard::package::ConfinedPackage;
 use fandhe_edge_guard::path::PathRejection;
-use fandhe_edge_runtime::capacity::MAX_FILE_BYTES;
+use fandhe_edge_guard::split_files::MAX_SHARD_FILE_BYTES;
+use fandhe_edge_runtime::capacity::{MAX_FILE_BYTES, PackageComponent};
 use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES};
+use fandhe_edge_runtime::tokenizer::MAX_TOKENIZER_JSON_BYTES;
 use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 use fandhe_edge_train::result::SuccessOutcome;
 
 use crate::error_report::ToErrorReport;
 use crate::project::{Project, fs_report, invalid, runtime};
 
+use super::infer::{
+    Pipeline, build_pipeline, build_qwen2_pipeline, check_input_representation, is_tokenizer_qwen2,
+};
 use super::train::candidate_rel;
 
 /// 配布パッケージ・成果物内のメタデータのファイル名（`infer_guard` と同じ）。
@@ -46,6 +62,11 @@ pub(crate) struct CandidateArtifact {
     pub onnx_file: String,
     /// 検証に使った保持 fd（容量計測・語彙の複写に使い回し、パスで開き直さない）。
     pub handles: ArtifactHandles,
+    /// 成果物ディレクトリ（保持 fd 起点。tokenizer 表現の shard を推論時に開く口。REQ-39）。
+    pub dir: ConfinedPackage,
+    /// `tokenizer.json` のバイト列（tokenizer 表現のときだけ。`MAX_TOKENIZER_JSON_BYTES` 以下で、
+    /// `artifact.json` 記載の sha256 と照合済み。`evaluate` が前後ハッシュ照合のために複製する）。
+    pub tokenizer_bytes: Option<Vec<u8>>,
 }
 
 /// [`load_candidate_artifact`] が読んだ成果物の保持 fd（`(fd, 閉じ込め検証済みの実パス)`）。
@@ -58,6 +79,11 @@ pub(crate) struct ArtifactHandles {
     pub onnx: (File, PathBuf),
     /// 語彙ファイル（`vocab.json`。あるときだけ。検証済み）。
     pub vocab: Option<(File, PathBuf)>,
+    /// `tokenizer.json`（tokenizer 表現のときだけ。sha256 照合済み）。
+    pub tokenizer: Option<(File, PathBuf)>,
+    /// 外部データの shard（tokenizer 表現のときだけ。`(location, fd, 実パス)`。fstat のサイズ上限だけ確認済みで、
+    /// 中身の sha256 は未照合）。
+    pub shards: Vec<(String, File, PathBuf)>,
 }
 
 /// 候補 `index` の成果物を閉じ込めつきで読み、メタデータと ONNX の自己整合性を確認する。
@@ -79,8 +105,13 @@ pub(crate) fn load_candidate_artifact(
     if !is_single_component(onnx_file) {
         return Err(invalid("onnx file name is invalid"));
     }
+    // 成果物ディレクトリは保持 fd で 1 回だけ開き、メンバーはすべてそこから相対で開く（ディレクトリを
+    // 辿るのは 1 回。tokenizer 表現の shard を推論時に開き直す口にもなる。REQ-39）。
+    let dir = candidate_dir
+        .open_subdir(&artifact_rel)
+        .map_err(|e| e.to_error_report())?;
     // 各メンバーは 1 回だけ開き、読み込み用に複製した fd で読む（元の fd は容量計測用に保持する）。
-    let open_member = |name: &str| candidate_dir.open_member(&artifact_rel.join(name));
+    let open_member = |name: &str| dir.open_member(Path::new(name));
     let read_member = |name: &str, limit: u64| -> Result<(Vec<u8>, File, PathBuf), ErrorReport> {
         let (file, real) = open_member(name).map_err(|e| e.to_error_report())?;
         let reader = file
@@ -94,6 +125,9 @@ pub(crate) fn load_candidate_artifact(
         read_member(ARTIFACT_META_FILE, MAX_ARTIFACT_META_BYTES)?;
     let (onnx_bytes, onnx_handle, onnx_path) = read_member(onnx_file, MAX_MODEL_FILE_BYTES)?;
     let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
+    // tokenizer 表現は `qwen2_lora` だけが推論できる。それ以外の宣言は構造検査（tokenizer.json・shard の
+    // 読み込み）へ進めず先に拒否する（REQ-41・#662）。
+    check_input_representation(&meta)?;
     // `calibration_sha256`・`definition_sha256` は `package` が配布用の `artifact.json` にだけ書く欄で、候補側に
     // あれば改変として扱う（`package` が追記するときに重複キーを作らない。REQ-39・#497・#491）。
     if meta.onnx_file() != onnx_file
@@ -113,6 +147,16 @@ pub(crate) fn load_candidate_artifact(
         Err(e) => return Err(e.to_error_report()),
     };
     verify_vocab_file(&meta, vocab.as_ref().map(|(f, p)| (f, p.as_path())))?;
+    let (tokenizer, tokenizer_bytes, shards) = if is_tokenizer_qwen2(&meta) {
+        let members = open_tokenizer_members(&dir, &meta_bytes)?;
+        (
+            Some(members.tokenizer),
+            Some(members.tokenizer_bytes),
+            members.shards,
+        )
+    } else {
+        (None, None, Vec::new())
+    };
     Ok(CandidateArtifact {
         meta_bytes,
         meta,
@@ -122,8 +166,156 @@ pub(crate) fn load_candidate_artifact(
             meta: (meta_file, meta_path),
             onnx: (onnx_handle, onnx_path),
             vocab,
+            tokenizer,
+            shards,
         },
+        dir,
+        tokenizer_bytes,
     })
+}
+
+/// [`open_tokenizer_members`] の戻り値。
+struct TokenizerMembers {
+    tokenizer: (File, PathBuf),
+    tokenizer_bytes: Vec<u8>,
+    shards: Vec<(String, File, PathBuf)>,
+}
+
+/// tokenizer 表現の成果物の構造検査（REQ-41・REQ-39・#662）。
+///
+/// `artifact.json` の参照欄（[`TokenizerPackageRefs`]）から `tokenizer.json` を閉じ込めつきで開いて
+/// `MAX_TOKENIZER_JSON_BYTES` 以下で読み、記録の sha256 と照合する。各 shard は開いて fstat で通常ファイルか・
+/// `MAX_SHARD_FILE_BYTES` 以下かだけを確認する（中身は読まない。`select` が GiB を読まないため。sha256 の照合は
+/// [`build_candidate_pipeline`] が組むランタイムが読みながら行い、不一致は fail-closed）。
+fn open_tokenizer_members(
+    dir: &ConfinedPackage,
+    meta_bytes: &[u8],
+) -> Result<TokenizerMembers, ErrorReport> {
+    let refs = TokenizerPackageRefs::parse(meta_bytes).map_err(|e| e.to_error_report())?;
+    let (file, real) = dir
+        .open_member(Path::new(&refs.tokenizer_file))
+        .map_err(|e| e.to_error_report())?;
+    let reader = file
+        .try_clone()
+        .map_err(|_| runtime("cannot read candidate artifact"))?;
+    let tokenizer_bytes = read_bounded_open_file(reader, real.as_path(), MAX_TOKENIZER_JSON_BYTES)
+        .map_err(|e| fs_report(&e))?;
+    if Sha256Digest::of_bytes(&tokenizer_bytes).to_hex() != refs.tokenizer_sha256 {
+        return Err(invalid(
+            "package tokenizer does not match its recorded hash",
+        ));
+    }
+    let mut shards = Vec::with_capacity(refs.external_data.len());
+    for e in &refs.external_data {
+        let (shard, shard_real) = dir
+            .open_member(Path::new(&e.location))
+            .map_err(|err| err.to_error_report())?;
+        check_shard_size(&shard, shard_real.as_path())?;
+        shards.push((e.location.clone(), shard, shard_real.into_path_buf()));
+    }
+    Ok(TokenizerMembers {
+        tokenizer: (file, real.into_path_buf()),
+        tokenizer_bytes,
+        shards,
+    })
+}
+
+/// 開いた shard が通常ファイルで `MAX_SHARD_FILE_BYTES` 以下かを fstat で確認する（1 バイトも読まない）。
+fn check_shard_size(file: &File, path: &Path) -> Result<(), ErrorReport> {
+    let metadata = file.metadata().map_err(|source| {
+        fs_report(&FsError::Read {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    if !metadata.is_file() {
+        return Err(fs_report(&FsError::NotRegularFile {
+            path: path.to_path_buf(),
+        }));
+    }
+    if metadata.len() > MAX_SHARD_FILE_BYTES {
+        return Err(fs_report(&FsError::TooLarge {
+            path: path.to_path_buf(),
+            size: metadata.len(),
+            limit: MAX_SHARD_FILE_BYTES,
+        }));
+    }
+    Ok(())
+}
+
+/// 候補の入力表現に合う推論パイプラインを組む（byte は [`build_pipeline`]、tokenizer の `qwen2_lora` は
+/// [`build_qwen2_pipeline`]。`evaluate` が校正と適用で共有する。REQ-32・REQ-41・REQ-39）。
+///
+/// `onnx` は検証済みのバイト列（評価ではステージングから読み直して sha256 照合した方を渡す）。
+/// tokenizer 表現では shard を成果物ディレクトリの保持 fd から開き、ランタイムが sha256 を照合する。
+pub(crate) fn build_candidate_pipeline(
+    onnx: &[u8],
+    artifact: &CandidateArtifact,
+    n_options: usize,
+) -> Result<Pipeline, ErrorReport> {
+    build_candidate_pipeline_with_meta(
+        onnx,
+        &artifact.dir,
+        &artifact.meta_bytes,
+        &artifact.meta,
+        n_options,
+    )
+}
+
+/// [`build_candidate_pipeline`] の、メタデータ（`artifact.json` のバイト列とその解析結果）を明示する版。
+///
+/// `evaluate` の適用は、評価器が登録照合と前後ハッシュ検証を行ったステージング済みの `artifact.json` から
+/// 読み直したバイト列を渡す。ランタイムの shard sha256 照合が、評価器の識別と同じ記録値に対して行われる
+/// ようにするため（REQ-27・#662）。`dir` は shard を開く成果物ディレクトリ。
+pub(crate) fn build_candidate_pipeline_with_meta(
+    onnx: &[u8],
+    dir: &ConfinedPackage,
+    meta_bytes: &[u8],
+    meta: &ArtifactMeta,
+    n_options: usize,
+) -> Result<Pipeline, ErrorReport> {
+    if is_tokenizer_qwen2(meta) {
+        build_qwen2_pipeline(onnx, dir, meta_bytes, meta, n_options)
+    } else {
+        build_pipeline(onnx, meta, n_options)
+    }
+}
+
+/// 容量計測の対象（`(区分, 実パス, fd)`）を列挙する。ONNX と shard は重み、`artifact.json` はメタデータ、
+/// `vocab.json` と `tokenizer.json` は語彙・特徴量変換に割り当てる（`capacity` の 5 区分は据え置き。REQ-30・#662）。
+/// 選択肢表（`definition.json`）は成果物の外にあるため呼び出し側が足す。
+///
+/// 保持 fd は `try_clone` で複製する（`fstat` で測るだけで、読み位置は共有しても影響しない）。
+pub(crate) fn measured_members(
+    handles: &ArtifactHandles,
+) -> Result<Vec<(PackageComponent, PathBuf, File)>, ErrorReport> {
+    let clone = |file: &File| {
+        file.try_clone()
+            .map_err(|_| runtime("cannot read candidate artifact"))
+    };
+    let mut members = vec![
+        (
+            PackageComponent::Weights,
+            handles.onnx.1.clone(),
+            clone(&handles.onnx.0)?,
+        ),
+        (
+            PackageComponent::Metadata,
+            handles.meta.1.clone(),
+            clone(&handles.meta.0)?,
+        ),
+    ];
+    for (_, file, path) in &handles.shards {
+        members.push((PackageComponent::Weights, path.clone(), clone(file)?));
+    }
+    for (file, path) in handles.vocab.iter().chain(handles.tokenizer.iter()) {
+        members.push((
+            PackageComponent::VocabOrFeatureTransform,
+            path.clone(),
+            clone(file)?,
+        ));
+    }
+    Ok(members)
 }
 
 /// `artifact.json` の `kind`・`label_order`・`max_bytes` を、学習リクエストと定義に照合する
@@ -135,8 +327,8 @@ pub(crate) fn check_meta_consistency(
     trained_kind_version: u32,
     trained_max_bytes: u32,
 ) -> Result<(), ErrorReport> {
-    // 入力表現が tokenizer の候補は推論できない（REQ-41・TASK-41.3-1・#402）。
-    // `package`・`select`・`evaluate` の tokenizer 経路は未接続（`infer` のみ #626 で対応）。
+    // 推論できない入力表現の候補は受け付けない（REQ-41・TASK-41.3-1・#402）。tokenizer は `qwen2_lora` のみ
+    // （`infer` は #626、`select`・`evaluate` は #662-a で接続。`package` は #662-b）。
     super::infer::check_input_representation(meta)?;
     KindAllowlist::supported()
         .check(meta.kind())
@@ -223,5 +415,118 @@ pub(crate) fn verify_vocab_file(
             }
             Ok(Some(size))
         }
+    }
+}
+// 閉じ込めつきの読み込みは Linux・macOS 前提のため、unix に限る（保持 fd の計測は unix の dev/ino を使う）。
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// テスト用の一時ディレクトリ。
+    fn workdir(name: &str) -> PathBuf {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir")
+            .join(format!(
+                "fandhe-candidate-artifact-{name}-{}",
+                std::process::id()
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn meta(kind: &str, extra: &str) -> ArtifactMeta {
+        let z = "0".repeat(64);
+        ArtifactMeta::parse(
+            format!(
+                r#"{{"kind":"{kind}","kind_version":1,"max_bytes":64,"label_order":["a","b"],"onnx_file":"model.onnx","onnx_sha256":"{z}"{extra}}}"#
+            )
+            .as_bytes(),
+        )
+        .expect("meta")
+    }
+
+    /// REQ-41・#662: tokenizer 表現を通すのは `qwen2_lora` だけ。c1 など他の kind の tokenizer 宣言は
+    /// `unsupported input representation`（64）で止まり、byte 前処理の組み立ては byte 表現にしか行わない。
+    #[test]
+    fn req41_only_qwen2_lora_may_declare_tokenizer_representation() {
+        let tokenizer = r#","input_representation":"tokenizer""#;
+        assert!(check_input_representation(&meta("c1", "")).is_ok());
+        assert!(check_input_representation(&meta("qwen2_lora", tokenizer)).is_ok());
+        let err = check_input_representation(&meta("c1", tokenizer)).expect_err("c1 tokenizer");
+        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
+        assert_eq!(err.message, "unsupported input representation");
+        let err = match build_pipeline(b"", &meta("qwen2_lora", tokenizer), 2) {
+            Ok(_) => panic!("must reject"),
+            Err(e) => e,
+        };
+        assert_eq!(err.message, "unsupported input representation");
+    }
+
+    /// REQ-39・#662: shard の fstat 検査は通常ファイルだけを通し、ディレクトリを拒否する。上限は 2 GiB
+    /// （巨大ファイルを作らずに済むよう、定数の値そのものを確認する）。
+    #[test]
+    fn req39_shard_size_check_accepts_regular_file_and_rejects_directory() {
+        let dir = workdir("shard");
+        let file_path = dir.join("weights-00000.bin");
+        std::fs::write(&file_path, b"0123").expect("write");
+        let file = File::open(&file_path).expect("open");
+        assert!(check_shard_size(&file, &file_path).is_ok());
+        let as_dir = File::open(&dir).expect("open dir");
+        let err = check_shard_size(&as_dir, &dir).expect_err("directory");
+        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::RuntimeError);
+        assert_eq!(MAX_SHARD_FILE_BYTES, 2 * 1024 * 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-30・#662: 計測対象は ONNX と shard が重み、`artifact.json` がメタデータ、`tokenizer.json` が語彙・
+    /// 特徴量変換に割り当たる（区分は据え置き）。byte 表現（shard・tokenizer なし）は従来の 2 件だけ。
+    #[test]
+    fn req30_measured_members_assign_components() {
+        let dir = workdir("members");
+        let open = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, name.as_bytes()).expect("write");
+            (File::open(&path).expect("open"), path)
+        };
+        let handles = ArtifactHandles {
+            meta: open("artifact.json"),
+            onnx: open("model.onnx"),
+            vocab: None,
+            tokenizer: Some(open("tokenizer.json")),
+            shards: {
+                let (file, path) = open("weights-00000.bin");
+                vec![("weights-00000.bin".to_string(), file, path)]
+            },
+        };
+        let members = measured_members(&handles).expect("members");
+        let summary: Vec<(PackageComponent, String)> = members
+            .iter()
+            .map(|(c, p, _)| {
+                (
+                    *c,
+                    p.file_name().expect("name").to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (PackageComponent::Weights, "model.onnx".to_string()),
+                (PackageComponent::Metadata, "artifact.json".to_string()),
+                (PackageComponent::Weights, "weights-00000.bin".to_string()),
+                (
+                    PackageComponent::VocabOrFeatureTransform,
+                    "tokenizer.json".to_string()
+                ),
+            ]
+        );
+        let bytes_only = ArtifactHandles {
+            tokenizer: None,
+            shards: Vec::new(),
+            ..handles
+        };
+        assert_eq!(measured_members(&bytes_only).expect("members").len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
