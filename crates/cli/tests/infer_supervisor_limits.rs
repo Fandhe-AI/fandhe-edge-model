@@ -48,6 +48,9 @@ fn child_entry() {
             let proj = std::path::PathBuf::from(std::env::var(DIR_ENV).expect("dir"));
             std::fs::create_dir(proj.join("package.staging")).expect("staging");
             std::fs::write(proj.join("version_ledger.json"), b"{}").expect("ledger");
+            // 台帳の書きかけ（`publish_new_file` の一時名）。
+            let tmp = format!(".tmp-version_ledger.json-{}", std::process::id());
+            std::fs::write(proj.join(tmp), b"{").expect("ledger tmp");
             if mode == "publish" {
                 std::fs::create_dir(proj.join("package")).expect("package");
             }
@@ -206,6 +209,11 @@ fn req39_issue662_killed_package_removes_staging_and_ledger_created_by_worker() 
     assert!(!proj.join("package.staging").exists());
     assert!(!proj.join("version_ledger.json").exists());
     assert!(!proj.join("package").exists());
+    assert_eq!(
+        std::fs::read_dir(&proj).expect("list").count(),
+        1,
+        "only .package.lock remains"
+    );
 }
 
 /// REQ-39・#662: launch 前からあったステージング・台帳は利用者の物として消さない。
@@ -243,6 +251,27 @@ fn req39_issue662_crashed_package_removes_staging_created_by_worker() {
     let (code, _) = supervise_package("crash", &cwd, &proj);
     assert_eq!(code, ExitCode::RuntimeError);
     assert!(!proj.join("package.staging").exists());
+}
+
+/// REQ-39・#662: 後始末はプロジェクトの外を消さない。kill 後にステージング・台帳が外を指す symlink へ
+/// 差し替えられていても、外のディレクトリとファイルは残る（消えるのはプロジェクト内のリンクだけ）。
+#[test]
+fn req39_issue662_cleanup_does_not_follow_symlinks_out_of_project() {
+    use fandhe_edge_cli::infer_supervisor::PackageRemnants;
+    let (cwd, proj) = package_project("symlink");
+    let outside = cwd.join("outside");
+    std::fs::create_dir(&outside).expect("outside");
+    std::fs::write(outside.join("keep"), b"x").expect("keep");
+    let remnants = PackageRemnants::snapshot(&cwd, std::path::Path::new("proj"))
+        .expect("lock")
+        .expect("project");
+    std::os::unix::fs::symlink(&outside, proj.join("package.staging")).expect("staging link");
+    std::os::unix::fs::symlink(outside.join("keep"), proj.join("version_ledger.json"))
+        .expect("ledger link");
+    remnants.discard_created();
+    assert_eq!(std::fs::read(outside.join("keep")).expect("keep"), b"x");
+    assert!(outside.is_dir());
+    assert!(!proj.join("version_ledger.json").exists());
 }
 
 /// REQ-39・#662: 同じプロジェクトの `package` の親は 1 つだけ。ロックを持つ間の 2 つ目は 64 で拒否し、

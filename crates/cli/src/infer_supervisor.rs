@@ -344,9 +344,11 @@ impl PackageRemnants {
         }))
     }
 
-    /// launch 前に無かった `package.staging/` と（`package/` が無いときの）`version_ledger.json` を片付ける
-    /// （best effort。失敗は無視する）。ステージングは保持 fd で同一性を確かめて消す。
+    /// launch 前に無かった `package.staging/` と（`package/` が無いときの）`version_ledger.json`、
+    /// 台帳の書きかけ `.tmp-version_ledger.json-*` を片付ける（best effort。失敗は無視する）。ステージングは
+    /// 保持 fd で同一性を確かめて消す。台帳の書き手は `package` だけで、ロックで排他している。
     pub fn discard_created(&self) {
+        let _ = self.project.remove_tmp_files_of("", VERSION_LEDGER_FILE);
         if !self.staging_before
             && let Ok(held) = self.project.track_existing_dir(PACKAGE_STAGING_DIR)
         {

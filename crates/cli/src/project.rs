@@ -377,15 +377,37 @@ impl Project {
     /// # Errors
     /// 列挙・削除の失敗は `runtime_error`。
     pub fn remove_tmp_files(&self, dir: impl AsRef<Path>) -> Result<(), ErrorReport> {
+        self.remove_tmp_files_of(dir, "")
+    }
+
+    /// ディレクトリ `dir`（空ならプロジェクト直下）の、ファイル名 `file_name` の一時名 `.tmp-<file_name>-*`
+    /// だけを消す（`file_name` が空なら `.tmp-*` すべて）。呼び出し側が `file_name` の書き手を排他している
+    /// ことを前提にする（pid を問わない）。
+    ///
+    /// # Errors
+    /// 列挙・削除の失敗は `runtime_error`。
+    pub fn remove_tmp_files_of(
+        &self,
+        dir: impl AsRef<Path>,
+        file_name: &str,
+    ) -> Result<(), ErrorReport> {
         let dir = dir.as_ref();
-        let names = self
-            .package
-            .open_subdir(dir)
-            .map_err(|e| e.to_error_report())?
-            .list_entry_names(1024)
-            .map_err(|_| runtime("cannot list project directory"))?;
+        let names = if dir.as_os_str().is_empty() {
+            self.package.list_entry_names(1024)
+        } else {
+            self.package
+                .open_subdir(dir)
+                .map_err(|e| e.to_error_report())?
+                .list_entry_names(1024)
+        }
+        .map_err(|_| runtime("cannot list project directory"))?;
+        let prefix = if file_name.is_empty() {
+            ".tmp-".to_owned()
+        } else {
+            format!(".tmp-{file_name}-")
+        };
         for name in names {
-            if name.to_string_lossy().starts_with(".tmp-") {
+            if name.to_string_lossy().starts_with(&prefix) {
                 self.remove_file_if_exists(dir.join(name))?;
             }
         }
