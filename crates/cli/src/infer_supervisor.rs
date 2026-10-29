@@ -317,11 +317,12 @@ pub struct PackageRemnants {
 }
 
 impl PackageRemnants {
-    /// プロジェクトを閉じ込めつきで開いて排他ロックを取り、launch 前の有無を記録する。プロジェクトを開けない・
-    /// 有無を確かめられないときは `Ok(None)`（何も消さない。開けない理由は worker が報告する）。
+    /// プロジェクトを閉じ込めつきで開いて排他ロックを取り、launch 前の有無を記録する。プロジェクトを開けない
+    /// ときは `Ok(None)`（何も消さない。開けない理由は worker が報告する）。
     ///
     /// # Errors
-    /// 他の `package` がロックを持っている、またはロックを取れないときは `invalid_input`（64）。
+    /// 他の `package` がロックを持っている、またはロックを取れないときは `invalid_input`（64）。ロック後に
+    /// 有無を確かめられないときはその経路のエラー（worker は起動しない）。
     pub fn snapshot(cwd: &Path, project_dir: &Path) -> Result<Option<Self>, ErrorReport> {
         let Ok(project) = Project::open(cwd, project_dir) else {
             return Ok(None);
@@ -332,12 +333,9 @@ impl PackageRemnants {
         let (lock, _) = project.open_file(PACKAGE_LOCK_FILE).map_err(|_| busy())?;
         // 待たない（相手は最大で package の時間上限まで走るため）。
         lock.try_lock().map_err(|_| busy())?;
-        let (Ok(staging_before), Ok(ledger_before)) = (
-            project.exists(PACKAGE_STAGING_DIR),
-            project.exists(VERSION_LEDGER_FILE),
-        ) else {
-            return Ok(None);
-        };
+        // ロックを持ったまま有無を確かめる。確かめられなければロックを手放して起動しない（fail-closed）。
+        let staging_before = project.exists(PACKAGE_STAGING_DIR)?;
+        let ledger_before = project.exists(VERSION_LEDGER_FILE)?;
         Ok(Some(Self {
             project,
             _lock: lock,
