@@ -12,9 +12,12 @@
 //!
 //! - **byte 表現**（`manifest` が無い、または入力表現が `tokenizer` でない）: ONNX ファイルの sha256
 //!   （従来どおり。値は変えない）。
-//! - **tokenizer 表現**（`qwen2_lora`）: 領域名 `fandhe-edge/evaluate/weights-identity/v2\0` ‖ ONNX の
-//!   sha256（32B）‖ `tokenizer.json` の sha256（32B）‖ shard 件数（u64 LE）‖ 各 shard の sha256（32B。
-//!   `artifact.json` の `external_data` の記載順）の sha256。shard の location（ファイル名）は入れない。
+//! - **tokenizer 表現**（`qwen2_lora`）: 領域名 `fandhe-edge/evaluate/weights-identity/v3\0` ‖ ONNX の
+//!   sha256（32B）‖ `tokenizer.json` の sha256（32B）‖ shard 件数（u64 LE）‖ 各 shard の
+//!   「location の長さ（u64 LE）‖ location のバイト列 ‖ sha256（32B）」を location のバイト列の昇順に並べたものの
+//!   sha256。ランタイムは shard を location で対応づけるため、`external_data` の記載順だけが違う同一モデルは同じ
+//!   識別になる（記載順を入れ替えて別の構成名で再適用する迂回を作らない）。location と sha256 の対応が違えば
+//!   別の識別になる。location が重複する `artifact.json` は識別を作らない（fail-closed）。
 //!   ONNX 本体は shard の中身が違っても同じバイト列になりうる（重みの大半は外部データ）ため、ONNX だけでは
 //!   shard だけが違う 2 候補が同じ識別になる。
 //!
@@ -36,7 +39,7 @@ use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
 
-const WEIGHTS_IDENTITY_DOMAIN: &[u8] = b"fandhe-edge/evaluate/weights-identity/v2\0";
+const WEIGHTS_IDENTITY_DOMAIN: &[u8] = b"fandhe-edge/evaluate/weights-identity/v3\0";
 
 /// 識別を算出できなかった理由。メッセージは英語で、ファイルの中身は含めない。
 #[derive(Debug)]
@@ -92,12 +95,20 @@ pub(crate) fn resolve(
     let bad = || WeightsIdentityError::ManifestInvalid;
     let refs = TokenizerPackageRefs::parse(manifest).map_err(|_| bad())?;
     let tokenizer: Sha256Digest = refs.tokenizer_sha256.parse().map_err(|_| bad())?;
-    let shards = refs
+    let mut shards = refs
         .external_data
         .iter()
-        .map(|e| e.sha256.parse::<Sha256Digest>().map_err(|_| bad()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut buf = Vec::with_capacity(WEIGHTS_IDENTITY_DOMAIN.len() + 72 + 32 * shards.len());
+        .map(|e| {
+            let sha256 = e.sha256.parse::<Sha256Digest>().map_err(|_| bad())?;
+            Ok((e.location.as_bytes(), sha256))
+        })
+        .collect::<Result<Vec<_>, WeightsIdentityError>>()?;
+    // location の昇順に正準化する（記載順に依存させない）。重複 location は対応が一意でないので拒否する。
+    shards.sort_by(|a, b| a.0.cmp(b.0));
+    if shards.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(bad());
+    }
+    let mut buf = Vec::with_capacity(WEIGHTS_IDENTITY_DOMAIN.len() + 72 + 80 * shards.len());
     buf.extend_from_slice(WEIGHTS_IDENTITY_DOMAIN);
     buf.extend_from_slice(onnx.as_bytes());
     buf.extend_from_slice(tokenizer.as_bytes());
@@ -107,8 +118,10 @@ pub(crate) fn resolve(
             .unwrap_or(u64::MAX)
             .to_le_bytes(),
     );
-    for shard in &shards {
-        buf.extend_from_slice(shard.as_bytes());
+    for (location, sha256) in &shards {
+        buf.extend_from_slice(&(location.len() as u64).to_le_bytes());
+        buf.extend_from_slice(location);
+        buf.extend_from_slice(sha256.as_bytes());
     }
     Ok(ResolvedIdentity {
         digest: Sha256Digest::of_bytes(&buf),
@@ -182,11 +195,26 @@ mod tests {
     }
 
     fn tok_meta_json(created_utc: &str, shards: &[&str], tokenizer: &str, prompt: &str) -> String {
+        let named: Vec<(String, &str)> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (format!("w{i}.bin"), *h))
+            .collect();
+        let pairs: Vec<(&str, &str)> = named.iter().map(|(l, h)| (l.as_str(), *h)).collect();
+        tok_meta_pairs(created_utc, &pairs, tokenizer, prompt)
+    }
+
+    /// shard を `(location, sha256)` の記載順で並べた tokenizer 表現の `artifact.json`。
+    fn tok_meta_pairs(
+        created_utc: &str,
+        shards: &[(&str, &str)],
+        tokenizer: &str,
+        prompt: &str,
+    ) -> String {
         let z = "0".repeat(64);
         let ext = shards
             .iter()
-            .enumerate()
-            .map(|(i, h)| format!(r#"{{"location":"w{i}.bin","sha256":"{h}"}}"#))
+            .map(|(l, h)| format!(r#"{{"location":"{l}","sha256":"{h}"}}"#))
             .collect::<Vec<_>>()
             .join(",");
         format!(
@@ -226,27 +254,76 @@ mod tests {
         assert_ne!(identity_of(&a), Sha256Digest::of_bytes(b"onnx"));
     }
 
-    /// REQ-27・#662: 識別の正準入力は領域名 ‖ ONNX ‖ tokenizer ‖ 件数(u64 LE) ‖ 各 shard。独立に組み立てた
-    /// 値と一致する（定義の固定）。
+    /// REQ-27・#662: 識別の正準入力は領域名(v3) ‖ ONNX ‖ tokenizer ‖ 件数(u64 LE) ‖ 各 shard の
+    /// 「location 長(u64 LE) ‖ location ‖ sha256」(location のバイト列昇順)。独立に組み立てた値と一致する
+    /// (記載順は逆にしておく)。
     #[test]
-    fn req27_issue662_identity_matches_the_v2_definition() {
-        let json = tok_meta_json("t", &[H1, H2], H3, "p");
+    fn req27_issue662_identity_matches_the_v3_definition() {
+        let json = tok_meta_pairs("t", &[("w1.bin", H2), ("w0.bin", H1)], H3, "p");
         let digest = |h: &str| h.parse::<Sha256Digest>().unwrap();
-        let mut buf = b"fandhe-edge/evaluate/weights-identity/v2\0".to_vec();
+        let mut buf = b"fandhe-edge/evaluate/weights-identity/v3\0".to_vec();
         buf.extend_from_slice(Sha256Digest::of_bytes(b"onnx").as_bytes());
         buf.extend_from_slice(digest(H3).as_bytes());
         buf.extend_from_slice(&2u64.to_le_bytes());
-        buf.extend_from_slice(digest(H1).as_bytes());
-        buf.extend_from_slice(digest(H2).as_bytes());
+        for (location, sha) in [("w0.bin", H1), ("w1.bin", H2)] {
+            buf.extend_from_slice(&(location.len() as u64).to_le_bytes());
+            buf.extend_from_slice(location.as_bytes());
+            buf.extend_from_slice(digest(sha).as_bytes());
+        }
         assert_eq!(identity_of(&json), Sha256Digest::of_bytes(&buf));
     }
 
+    /// REQ-27・#662: `external_data` の記載順だけが違う同一モデルは同じ識別になる(ランタイムは location で
+    /// 対応づけるため予測は同じ。記載順を入れ替えて別の構成名で再適用する迂回を作らない)。
     #[test]
-    fn req27_issue662_identity_changes_with_shard_tokenizer_order_and_onnx() {
+    fn req27_issue662_identity_ignores_shard_listing_order() {
+        let a = tok_meta_pairs("t", &[("w0.bin", H1), ("w1.bin", H2)], H3, "p");
+        let b = tok_meta_pairs("t", &[("w1.bin", H2), ("w0.bin", H1)], H3, "p");
+        assert_ne!(a, b);
+        assert_eq!(identity_of(&a), identity_of(&b));
+    }
+
+    /// REQ-27・#662: location と sha256 の対応を入れ替える、または location 名が変わると別の識別になる。
+    #[test]
+    fn req27_issue662_identity_depends_on_location_sha256_pairing() {
+        let base = identity_of(&tok_meta_pairs(
+            "t",
+            &[("w0.bin", H1), ("w1.bin", H2)],
+            H3,
+            "p",
+        ));
+        let swapped = identity_of(&tok_meta_pairs(
+            "t",
+            &[("w0.bin", H2), ("w1.bin", H1)],
+            H3,
+            "p",
+        ));
+        let renamed = identity_of(&tok_meta_pairs(
+            "t",
+            &[("w0.bin", H1), ("x1.bin", H2)],
+            H3,
+            "p",
+        ));
+        assert_ne!(base, swapped);
+        assert_ne!(base, renamed);
+        assert_ne!(swapped, renamed);
+    }
+
+    /// REQ-27・#662: location が重複する `artifact.json` は対応が一意でないため識別を作らない(fail-closed)。
+    #[test]
+    fn req27_issue662_duplicate_shard_location_is_an_error() {
+        let dup = tok_meta_pairs("t", &[("w0.bin", H1), ("w0.bin", H2)], H3, "p");
+        assert!(matches!(
+            weights_identity_from_bytes(b"onnx", Some(dup.as_bytes())),
+            Err(WeightsIdentityError::ManifestInvalid)
+        ));
+    }
+
+    #[test]
+    fn req27_issue662_identity_changes_with_shard_tokenizer_and_onnx() {
         let base = identity_of(&tok_meta_json("t", &[H1, H2], H3, "p"));
         assert_ne!(base, identity_of(&tok_meta_json("t", &[H1, H3], H3, "p")));
         assert_ne!(base, identity_of(&tok_meta_json("t", &[H1, H2], H1, "p")));
-        assert_ne!(base, identity_of(&tok_meta_json("t", &[H2, H1], H3, "p")));
         let json = tok_meta_json("t", &[H1, H2], H3, "p");
         assert_ne!(
             base,
