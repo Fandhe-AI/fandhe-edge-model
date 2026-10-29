@@ -48,7 +48,7 @@ use crate::infer_batch::{
 };
 use crate::infer_guard::peek_checked_kind;
 use crate::output::write_error_report;
-use crate::project::{PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE};
+use crate::project::{PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE, invalid};
 use crate::stages::train::load_trained;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::version_ledger_record::VERSION_LEDGER_FILE;
@@ -64,6 +64,9 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
+
+/// `package` の親がプロジェクト単位の排他に使うロックファイル（中身は空。[`PackageRemnants`]）。
+const PACKAGE_LOCK_FILE: &str = ".package.lock";
 
 /// worker として起動されたことを示す環境変数（値が `"1"` と完全一致するときだけ worker）。
 pub const WORKER_ENV: &str = "FANDHE_EDGE_INFER_WORKER";
@@ -268,7 +271,9 @@ pub fn run_evaluate<W: Write>(
 /// - 組み立て中の kill では `package.staging/` が、台帳の公開と `package/` の公開の間（ごく短い窓）の kill では
 ///   `version_ledger.json` も残りうる。残ると再実行が `directory already exists`・`version ledger already exists`
 ///   （64）で拒否されて利用者が復旧できないため、親が launch の前に両者の有無を記録し（[`PackageRemnants`]）、
-///   kill で戻ったときに **launch 前に無かったものだけ** を閉じ込めつきで片付ける。`package/` 本体には触れず、
+///   kill で戻ったときに **launch 前に無かったものだけ** を閉じ込めつきで片付ける。記録から片付けまでは
+///   プロジェクト単位の排他ロック（`.package.lock` の `flock`）を保持するので、launch 後に現れたものは自分の
+///   worker が作ったものに限られる（同じプロジェクトの並行 `package` は `package already running`（64）で拒否）。`package/` 本体には触れず、
 ///   `package/` が出来ていれば台帳も消さない。片付けに失敗しても出力は `limit_exceeded` のまま（best effort）
 /// - worker が自分で終えた場合（exit 0・10・12・20 等）は親は何も消さない（worker が自分で片付ける）。7 種に写らない
 ///   終了（panic・シグナル死）は worker が片付けられていないので、kill と同じく親が片付ける
@@ -283,7 +288,10 @@ pub fn run_package<W: Write>(
 ) -> io::Result<ExitCode> {
     let limits =
         peek_package_kind(cwd, args).map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(&k));
-    let remnants = PackageRemnants::snapshot(cwd, &args.project_dir);
+    let remnants = match PackageRemnants::snapshot(cwd, &args.project_dir) {
+        Ok(r) => r,
+        Err(report) => return write_error_report(out, &report),
+    };
     launch(
         out,
         Workload::Packaging,
@@ -299,26 +307,43 @@ pub fn run_package<W: Write>(
 }
 
 /// `package` の launch 前に存在していた `package.staging/`・`version_ledger.json` の記録（kill 後の後始末用。
-/// REQ-39・#662）。launch 前から有ったものは利用者の物として消さない。
+/// REQ-39・#662）。launch 前から有ったものは利用者の物として消さない。保持している間はプロジェクト単位の
+/// 排他ロックを持ち、他の `package` の親を締め出す（drop・プロセス終了で解放）。
 pub struct PackageRemnants {
     project: Project,
+    _lock: std::fs::File,
     staging_before: bool,
     ledger_before: bool,
 }
 
 impl PackageRemnants {
-    /// プロジェクトを閉じ込めつきで開き、launch 前の有無を記録する。開けない・有無を確かめられないときは
-    /// `None`（何も消さない）。
-    #[must_use]
-    pub fn snapshot(cwd: &Path, project_dir: &Path) -> Option<Self> {
-        let project = Project::open(cwd, project_dir).ok()?;
-        let staging_before = project.exists(PACKAGE_STAGING_DIR).ok()?;
-        let ledger_before = project.exists(VERSION_LEDGER_FILE).ok()?;
-        Some(Self {
+    /// プロジェクトを閉じ込めつきで開いて排他ロックを取り、launch 前の有無を記録する。プロジェクトを開けない・
+    /// 有無を確かめられないときは `Ok(None)`（何も消さない。開けない理由は worker が報告する）。
+    ///
+    /// # Errors
+    /// 他の `package` がロックを持っている、またはロックを取れないときは `invalid_input`（64）。
+    pub fn snapshot(cwd: &Path, project_dir: &Path) -> Result<Option<Self>, ErrorReport> {
+        let Ok(project) = Project::open(cwd, project_dir) else {
+            return Ok(None);
+        };
+        // 既存なら作成が失敗するだけ（無視）。開けなければ次の open_file が拒否する。
+        let _ = project.write_new(PACKAGE_LOCK_FILE, b"");
+        let busy = || invalid("package already running");
+        let (lock, _) = project.open_file(PACKAGE_LOCK_FILE).map_err(|_| busy())?;
+        // 待たない（相手は最大で package の時間上限まで走るため）。
+        lock.try_lock().map_err(|_| busy())?;
+        let (Ok(staging_before), Ok(ledger_before)) = (
+            project.exists(PACKAGE_STAGING_DIR),
+            project.exists(VERSION_LEDGER_FILE),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
             project,
+            _lock: lock,
             staging_before,
             ledger_before,
-        })
+        }))
     }
 
     /// launch 前に無かった `package.staging/` と（`package/` が無いときの）`version_ledger.json` を片付ける
@@ -706,6 +731,7 @@ mod tests {
     }
 
     /// 候補 2 に `qwen2_lora` の学習結果（共有 fixture の request・result）を置いた小さなプロジェクトを作る。
+    #[cfg(unix)] // Project は Linux・macOS 限定（Windows は unsupported_platform）。
     fn qwen2_project(case: &str) -> (std::path::PathBuf, Project) {
         use crate::project::{REQUEST_FILE, RESULT_FILE};
         let cwd = std::fs::canonicalize(std::env::temp_dir())
@@ -733,6 +759,7 @@ mod tests {
 
     /// REQ-39・REQ-41・#662: 親が上限を選ぶための kind の先読みは、`evaluate` は `--candidate`、`package` は
     /// `selection_record.json` の添字の `result.json` から `qwen2_lora` を読む。読めなければ `None`（厳しい上限へ）。
+    #[cfg(unix)]
     #[test]
     fn req39_issue662_peek_kind_reads_qwen2_lora_for_evaluate_and_package() {
         let (cwd, project) = qwen2_project("kind");
