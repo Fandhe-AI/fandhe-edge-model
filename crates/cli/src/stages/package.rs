@@ -924,7 +924,7 @@ fn assemble_and_measure(
         let (file, path) = project.open_file(pkg.join(name))?;
         files.push((component, path, file));
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     tests::run_after_copy_hook(project);
     // 公開するのはステージングへ複写したファイルなので、複写後の実体も記録どおりか再検証する
     // （検証から複写までの間の差し替え対策。REQ-39）。照合は容量計測に使うのと同じ保持 fd で行い、
@@ -973,6 +973,10 @@ fn staged<'a>(files: &'a [StagedFile], name: &str) -> Result<(&'a File, &'a Path
 
 /// 複写後の語彙ファイル・tokenizer.json・shard を、記録の sha256 と照合する（保持 fd を先頭へ戻して読む。
 /// shard は GiB 級のため固定長バッファで流し読みする。オーナー判断 2026-10-29・REQ-39・#662）。
+///
+/// 検出できるのは保持 fd の実体（同じ inode）への書き換えだけ。ステージング内で名前を別の実体へ rename で
+/// 差し替える攻撃は、照合から公開までの競合として検出外（ステージングは 0700 の所有者専用で、旧方式のパス
+/// 再解決でも防げていなかった）。
 fn verify_staged(
     files: &[StagedFile],
     meta: &ArtifactMeta,
@@ -1962,36 +1966,54 @@ mod tests {
         )
     }
 
-    /// REQ-39・REQ-27・#662: 複写した shard が複写〜照合の間に書き換わると固定文で拒否し、ステージングを残さない
-    /// （照合は容量計測と同じ保持 fd で行う）。差し替えがなければ同じ構成が通る。
-    #[test]
-    fn req39_issue662_swap_between_copy_and_verify_is_rejected_and_staging_is_discarded() {
-        // 差し替えなし: 通る（構成自体が正しいことの対照）。
-        let ok = swap_case("ok");
+    /// 差し替えなしの対照が通り、`target` を複写〜照合の間に in-place で書き換えると `message` で拒否して
+    /// ステージング・`package/`・台帳を残さないことを確かめる。
+    fn assert_swap_rejected(tag: &str, target: &str, message: &str) {
+        let ok = swap_case(&format!("{tag}-ok"));
         assemble_swap_case(&ok).expect("unswapped package assembles");
         let _ = ok.project.remove_created_dir(&ok.staging);
 
-        let c = swap_case("swap");
+        let c = swap_case(tag);
+        let target = target.to_owned();
         AFTER_COPY_HOOK.with(|h| {
-            *h.borrow_mut() = Some(Box::new(|project: &Project| {
-                let staged = project.path(Path::new(PACKAGE_STAGING_DIR).join("m.onnx.data"));
+            *h.borrow_mut() = Some(Box::new(move |project: &Project| {
+                let staged = project.path(Path::new(PACKAGE_STAGING_DIR).join(&target));
                 std::fs::write(staged, b"tampered").expect("tamper in place");
             }));
         });
         let result = discard_on_err(&c.project, &c.staging, assemble_swap_case(&c));
         AFTER_COPY_HOOK.with(|h| *h.borrow_mut() = None);
-        let err = result.expect_err("swapped shard must be rejected");
+        let err = result.expect_err("swapped file must be rejected");
         assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
-        assert_eq!(
-            err.message,
-            "package shard does not match its recorded hash"
-        );
+        assert_eq!(err.message, message);
         assert!(
             !c.project.path(PACKAGE_STAGING_DIR).exists(),
             "staging must not remain"
         );
         assert!(!c.project.path(PACKAGE_DIR).exists());
         assert!(!c.project.path(VERSION_LEDGER_FILE).exists());
+    }
+
+    /// REQ-39・REQ-27・#662: 複写した shard が複写〜照合の間に書き換わると固定文で拒否し、ステージングを残さない
+    /// （照合は容量計測と同じ保持 fd で行う）。差し替えがなければ同じ構成が通る。
+    #[test]
+    fn req39_issue662_swap_between_copy_and_verify_is_rejected_and_staging_is_discarded() {
+        assert_swap_rejected(
+            "swap-shard",
+            "m.onnx.data",
+            "package shard does not match its recorded hash",
+        );
+    }
+
+    /// REQ-39・REQ-27・#662: tokenizer.json も同様に、複写〜照合の間の書き換えを拒否して何も残さない。
+    #[test]
+    fn req39_issue662_tokenizer_swap_between_copy_and_verify_is_rejected_and_staging_is_discarded()
+    {
+        assert_swap_rejected(
+            "swap-tokenizer",
+            "tokenizer.json",
+            "package tokenizer does not match its recorded hash",
+        );
     }
 
     /// REQ-39・#662: `verify_copied_hash` は保持 fd の位置に依らず先頭から読む（計測用に開いた fd を再利用するため）。

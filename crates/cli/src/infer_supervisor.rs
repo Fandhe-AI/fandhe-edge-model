@@ -48,9 +48,10 @@ use crate::infer_batch::{
 };
 use crate::infer_guard::peek_checked_kind;
 use crate::output::write_error_report;
-use crate::project::{Project, SELECTION_FILE};
+use crate::project::{PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE};
 use crate::stages::train::load_trained;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_core::version_ledger_record::VERSION_LEDGER_FILE;
 use fandhe_edge_guard::resource::{
     DEFAULT_STDERR_CAP, GuardRunError, GuardedCommand, GuardedRunOutcome, MAX_OUTPUT_CAP,
     ResourceConfigError, ResourceKind, ResourceLimitExceeded, RunConfig, SafetyLimits, TimeLimit,
@@ -223,6 +224,7 @@ pub fn run<W: Write>(
         supervisor_config(&args.source, limits),
         raw_args,
         cwd,
+        || {},
     )
 }
 
@@ -252,6 +254,7 @@ pub fn run_evaluate<W: Write>(
         evaluate_config(limits),
         raw_args,
         cwd,
+        || {},
     )
 }
 
@@ -260,12 +263,14 @@ pub fn run_evaluate<W: Write>(
 /// RSS・時間の上限は選定候補の `kind`（`selection_record.json` の添字の `result.json` から読む。`evaluate` と同じ
 /// 読み方）で選ぶ。読めない・許可外なら厳しい上限に落とし、本来のエラーは worker が出す。
 ///
-/// worker が kill されたときの残り方（新しい後始末は持たない）:
+/// worker が kill されたとき（時間・RSS 超過、または監督失敗）の残り方と後始末:
 /// - `package/` は原子的な公開（rename）まで作られないので、kill では半端な `package/` は残らない
-/// - 組み立て中なら `package.staging/` が残る。再実行は `directory already exists`（64）で拒否されるため、
-///   利用者が `package.staging/` を消してからやり直す
-/// - 台帳の公開と `package/` の公開の間（ごく短い窓）で kill されると `version_ledger.json` も残り、再実行は
-///   `version ledger already exists`（64）で拒否される。同様に利用者が両方を消す
+/// - 組み立て中の kill では `package.staging/` が、台帳の公開と `package/` の公開の間（ごく短い窓）の kill では
+///   `version_ledger.json` も残りうる。残ると再実行が `directory already exists`・`version ledger already exists`
+///   （64）で拒否されて利用者が復旧できないため、親が launch の前に両者の有無を記録し（[`PackageRemnants`]）、
+///   kill で戻ったときに **launch 前に無かったものだけ** を閉じ込めつきで片付ける。`package/` 本体には触れず、
+///   `package/` が出来ていれば台帳も消さない。片付けに失敗しても出力は `limit_exceeded` のまま（best effort）
+/// - worker が自分で終えた場合（exit 0・10・12・20 等）は親は何も消さない（worker が自分で片付ける）
 ///
 /// # Errors
 /// `out` への書き込み失敗（呼び出し側は exit 70 に写す）。
@@ -277,13 +282,56 @@ pub fn run_package<W: Write>(
 ) -> io::Result<ExitCode> {
     let limits =
         peek_package_kind(cwd, args).map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(&k));
+    let remnants = PackageRemnants::snapshot(cwd, &args.project_dir);
     launch(
         out,
         Workload::Packaging,
         package_config(limits),
         raw_args,
         cwd,
+        || {
+            if let Some(r) = &remnants {
+                r.discard_created();
+            }
+        },
     )
+}
+
+/// `package` の launch 前に存在していた `package.staging/`・`version_ledger.json` の記録（kill 後の後始末用。
+/// REQ-39・#662）。launch 前から有ったものは利用者の物として消さない。
+pub struct PackageRemnants {
+    project: Project,
+    staging_before: bool,
+    ledger_before: bool,
+}
+
+impl PackageRemnants {
+    /// プロジェクトを閉じ込めつきで開き、launch 前の有無を記録する。開けない・有無を確かめられないときは
+    /// `None`（何も消さない）。
+    #[must_use]
+    pub fn snapshot(cwd: &Path, project_dir: &Path) -> Option<Self> {
+        let project = Project::open(cwd, project_dir).ok()?;
+        let staging_before = project.exists(PACKAGE_STAGING_DIR).ok()?;
+        let ledger_before = project.exists(VERSION_LEDGER_FILE).ok()?;
+        Some(Self {
+            project,
+            staging_before,
+            ledger_before,
+        })
+    }
+
+    /// launch 前に無かった `package.staging/` と（`package/` が無いときの）`version_ledger.json` を片付ける
+    /// （best effort。失敗は無視する）。ステージングは保持 fd で同一性を確かめて消す。
+    pub fn discard_created(&self) {
+        if !self.staging_before
+            && let Ok(held) = self.project.track_existing_dir(PACKAGE_STAGING_DIR)
+        {
+            let _ = self.project.remove_created_dir(&held);
+        }
+        if !self.ledger_before && matches!(self.project.exists(PACKAGE_DIR), Ok(false)) {
+            let _ = self.project.remove_file_if_exists(VERSION_LEDGER_FILE);
+        }
+    }
 }
 
 /// 親が種類別の上限を選ぶために、選定候補の `kind` だけを読む（失敗は `None`）。
@@ -309,6 +357,7 @@ fn launch<W: Write>(
     config: Result<RunConfig, ResourceConfigError>,
     raw_args: impl IntoIterator<Item = OsString>,
     cwd: &Path,
+    on_killed: impl FnOnce(),
 ) -> io::Result<ExitCode> {
     let prepared = config
         .map_err(|_| GuardRunError::InvalidConfig)
@@ -323,9 +372,14 @@ fn launch<W: Write>(
             Ok((cmd, config))
         });
     match prepared {
-        Ok((cmd, config)) => {
-            run_supervised_as(workload, out, &mut io::stderr().lock(), &cmd, &config)
-        }
+        Ok((cmd, config)) => run_supervised_cleaning(
+            workload,
+            out,
+            &mut io::stderr().lock(),
+            &cmd,
+            &config,
+            on_killed,
+        ),
         Err(e) => write_error_report(out, &supervisor_failed(workload, e)),
     }
 }
@@ -354,6 +408,23 @@ pub fn run_supervised_as<W: Write, E: Write>(
     cmd: &GuardedCommand,
     config: &RunConfig,
 ) -> io::Result<ExitCode> {
+    run_supervised_cleaning(workload, out, err, cmd, config, || {})
+}
+
+/// [`run_supervised_as`] に、worker が監督側に kill された（時間・RSS 超過、または監督失敗）ときだけ呼ぶ
+/// 後始末 `on_killed` を足したもの（`package` のステージング掃除用。REQ-39・#662）。worker が自分で終えた
+/// 場合は呼ばない。出力の写像は [`run_supervised_as`] と同じ。
+///
+/// # Errors
+/// `out` への書き込み失敗。
+pub fn run_supervised_cleaning<W: Write, E: Write>(
+    workload: Workload,
+    out: &mut W,
+    err: &mut E,
+    cmd: &GuardedCommand,
+    config: &RunConfig,
+    on_killed: impl FnOnce(),
+) -> io::Result<ExitCode> {
     let outcome = run_with_limits(cmd, config);
     // 親の stdout が詰まっても止まらないよう、既存の見張りで守る（書き込み停止は exit 20）。
     let _watchdog = OutputWatchdog::arm(true, MAX_INFER_BATCH_OUTPUT_DURATION)?;
@@ -369,10 +440,17 @@ pub fn run_supervised_as<W: Write, E: Write>(
             )
         }
         Ok(GuardedRunOutcome::LimitExceeded(e)) => {
+            on_killed();
             write_error_report(out, &limit_report(workload, &e))
         }
-        Ok(_) => write_error_report(out, &runtime_error()),
-        Err(e) => write_error_report(out, &supervisor_failed(workload, e)),
+        Ok(_) => {
+            on_killed();
+            write_error_report(out, &runtime_error())
+        }
+        Err(e) => {
+            on_killed();
+            write_error_report(out, &supervisor_failed(workload, e))
+        }
     }
 }
 
@@ -616,5 +694,70 @@ mod tests {
                 format!("inference supervisor failed: {}", e.code())
             );
         }
+    }
+
+    /// 候補 2 に `qwen2_lora` の学習結果（共有 fixture の request・result）を置いた小さなプロジェクトを作る。
+    fn qwen2_project(case: &str) -> (std::path::PathBuf, Project) {
+        use crate::project::{REQUEST_FILE, RESULT_FILE};
+        let cwd = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp")
+            .join(format!("fandhe-sup-peek-{case}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let project = Project::create(&cwd, Path::new("proj")).expect("project");
+        project.create_dir("candidates").expect("candidates");
+        project.create_dir("candidates/2").expect("candidate");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/train_contract");
+        for (name, dest) in [
+            ("request_qwen2_lora.json", REQUEST_FILE),
+            ("result_ok_qwen2_lora.json", RESULT_FILE),
+        ] {
+            // 結果 JSON は 1 行形式（共有 fixture は整形済みなので改行を除く）。
+            let text = std::fs::read_to_string(fixtures.join(name)).expect("fixture");
+            let bytes = text.replace('\n', "").into_bytes();
+            project
+                .write_new(Path::new("candidates/2").join(dest), &bytes)
+                .expect("write");
+        }
+        (cwd, project)
+    }
+
+    /// REQ-39・REQ-41・#662: 親が上限を選ぶための kind の先読みは、`evaluate` は `--candidate`、`package` は
+    /// `selection_record.json` の添字の `result.json` から `qwen2_lora` を読む。読めなければ `None`（厳しい上限へ）。
+    #[test]
+    fn req39_issue662_peek_kind_reads_qwen2_lora_for_evaluate_and_package() {
+        let (cwd, project) = qwen2_project("kind");
+        project
+            .write_new(
+                SELECTION_FILE,
+                br#"{"candidate_index":2,"candidate_id":"qwen2_lora","rule":"r","validation_correct":1,"validation_total":2}"#,
+            )
+            .expect("selection");
+        let evaluate = |candidate| EvaluateArgs {
+            project_dir: "proj".into(),
+            candidate,
+            previous_project_dir: None,
+            seed_run_projects: Vec::new(),
+        };
+        let package = PackageArgs {
+            project_dir: "proj".into(),
+            allow_smoke: false,
+            previous_project_dir: None,
+        };
+        assert_eq!(
+            peek_evaluate_kind(&cwd, &evaluate(2)).as_deref(),
+            Some("qwen2_lora")
+        );
+        assert_eq!(
+            peek_package_kind(&cwd, &package).as_deref(),
+            Some("qwen2_lora")
+        );
+        // 学習結果の無い候補・存在しないプロジェクトは `None`。
+        assert_eq!(peek_evaluate_kind(&cwd, &evaluate(0)), None);
+        let missing = PackageArgs {
+            project_dir: "nope".into(),
+            ..package
+        };
+        assert_eq!(peek_package_kind(&cwd, &missing), None);
     }
 }

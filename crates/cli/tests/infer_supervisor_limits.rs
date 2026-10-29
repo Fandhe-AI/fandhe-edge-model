@@ -12,6 +12,7 @@ use fandhe_edge_guard::resource::{GuardedCommand, MemoryLimit, RunConfig, TimeLi
 use std::time::Duration;
 
 const MODE_ENV: &str = "FANDHE_SUP_TEST_CHILD";
+const DIR_ENV: &str = "FANDHE_SUP_TEST_DIR";
 const MIB: usize = 1024 * 1024;
 
 /// 自己再実行される子の本体。環境変数が無い通常実行では何もしない。
@@ -42,6 +43,16 @@ fn child_entry() {
             std::hint::black_box(&chunks);
         }
         "sleep" => std::thread::sleep(Duration::from_secs(30)),
+        // `package` の kill 後の残骸を模す: ステージング（と、`publish` ならさらに `package/`）と台帳を作って眠る。
+        "stage" | "publish" => {
+            let proj = std::path::PathBuf::from(std::env::var(DIR_ENV).expect("dir"));
+            std::fs::create_dir(proj.join("package.staging")).expect("staging");
+            std::fs::write(proj.join("version_ledger.json"), b"{}").expect("ledger");
+            if mode == "publish" {
+                std::fs::create_dir(proj.join("package")).expect("package");
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        }
         "ok" => println!("{{\"id\":\"input\",\"status\":\"ok\"}}"),
         _ => {}
     }
@@ -128,4 +139,92 @@ fn req39_within_limits_output_is_relayed() {
         text.contains("{\"id\":\"input\",\"status\":\"ok\"}\n"),
         "{text}"
     );
+}
+
+/// 一時 cwd と、その下の空のプロジェクト `proj` を作る。
+fn package_project(case: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let cwd = std::fs::canonicalize(std::env::temp_dir())
+        .expect("temp")
+        .join(format!("fandhe-sup-{case}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cwd);
+    let proj = cwd.join("proj");
+    std::fs::create_dir_all(&proj).expect("proj");
+    (cwd, proj)
+}
+
+/// 偽の package worker（`mode`）を 300 ms で kill させ、launch 前の記録に基づく後始末つきで監督する。
+fn supervise_package(
+    mode: &str,
+    cwd: &std::path::Path,
+    proj: &std::path::Path,
+) -> (ExitCode, String) {
+    use fandhe_edge_cli::infer_supervisor::{PackageRemnants, Workload, run_supervised_cleaning};
+    let remnants = PackageRemnants::snapshot(cwd, std::path::Path::new("proj"));
+    assert!(remnants.is_some());
+    let cmd = child(mode).env(DIR_ENV, proj.to_str().expect("utf8"));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_supervised_cleaning(
+        Workload::Packaging,
+        &mut out,
+        &mut err,
+        &cmd,
+        &config(1_500),
+        || {
+            // 後始末の直前に、worker が（kill 前に）ステージングを作っていたことを確かめる。
+            if mode != "sleep" {
+                assert!(
+                    proj.join("package.staging").is_dir(),
+                    "worker did not stage"
+                );
+            }
+            if let Some(r) = &remnants {
+                r.discard_created();
+            }
+        },
+    )
+    .expect("io");
+    (code, String::from_utf8(out).expect("utf8"))
+}
+
+/// REQ-39・#662: kill された `package` の worker が作ったステージングと台帳（`package/` は無い）は、
+/// launch 前に無かったので親が片付ける。出力は `limit_exceeded` の固定語彙のまま。
+#[test]
+fn req39_issue662_killed_package_removes_staging_and_ledger_created_by_worker() {
+    let (cwd, proj) = package_project("kill");
+    let (code, text) = supervise_package("stage", &cwd, &proj);
+    assert_eq!(code, ExitCode::LimitExceeded);
+    assert_eq!(
+        text,
+        "{\"code\":\"limit_exceeded\",\"message\":\"packaging time limit exceeded\"}\n"
+    );
+    assert!(!proj.join("package.staging").exists());
+    assert!(!proj.join("version_ledger.json").exists());
+    assert!(!proj.join("package").exists());
+}
+
+/// REQ-39・#662: launch 前からあったステージング・台帳は利用者の物として消さない。
+#[test]
+fn req39_issue662_killed_package_keeps_staging_and_ledger_that_existed_before_launch() {
+    let (cwd, proj) = package_project("keep");
+    std::fs::create_dir(proj.join("package.staging")).expect("staging");
+    std::fs::write(proj.join("package.staging").join("note"), b"x").expect("note");
+    std::fs::write(proj.join("version_ledger.json"), b"old").expect("ledger");
+    let (code, _) = supervise_package("sleep", &cwd, &proj);
+    assert_eq!(code, ExitCode::LimitExceeded);
+    assert!(proj.join("package.staging").join("note").is_file());
+    assert_eq!(
+        std::fs::read(proj.join("version_ledger.json")).expect("ledger"),
+        b"old"
+    );
+}
+
+/// REQ-39・#662: `package/` が出来ている場合、`package/` と対の台帳は消さない（ステージングだけ片付ける）。
+#[test]
+fn req39_issue662_killed_package_keeps_ledger_when_package_exists() {
+    let (cwd, proj) = package_project("published");
+    let (code, _) = supervise_package("publish", &cwd, &proj);
+    assert_eq!(code, ExitCode::LimitExceeded);
+    assert!(proj.join("package").is_dir());
+    assert!(proj.join("version_ledger.json").is_file());
+    assert!(!proj.join("package.staging").exists());
 }
