@@ -113,6 +113,7 @@ use fandhe_edge_data::split::SplitResult;
 use fandhe_edge_eval::acceptance::{AcceptanceVerdict, judge_min_accuracy};
 use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
+use fandhe_edge_eval::weights_identity::weights_identity_from_bytes;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_guard::version_ledger::{ArtifactKind, CreatedAt, VersionId, VersionLedger};
 use fandhe_edge_runtime::capacity::{
@@ -151,7 +152,7 @@ use crate::project::{
 use super::baseline::{PreparedBaseline, prepare_baseline, record_matches};
 use super::candidate_artifact::{
     ARTIFACT_META_FILE, CandidateArtifact, check_meta_consistency, load_candidate_artifact,
-    registered_weights_digest, verify_vocab_file,
+    verify_vocab_file,
 };
 
 use super::infer::build_pipeline;
@@ -288,7 +289,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
                 // majority・必要件数は train 分割と定義から計算し直す（評価データは渡さない。#339）。
                 prepare_baseline(&definition, &records, &split)?,
             ),
-            (&meta_bytes, &meta),
+            &meta_bytes,
             &onnx_bytes,
             &format!("{}:seed{}", candidate.candidate_id, seed),
         )?),
@@ -739,7 +740,7 @@ fn verify_evaluation_record(
     (selection, selection_sha256): (&SelectionRecord, &Sha256Digest),
     (freeze, eval_bytes): (&FreezeRecord, &[u8]),
     (definition, baseline): (&Definition, Option<PreparedBaseline>),
-    (meta_bytes, meta): (&[u8], &ArtifactMeta),
+    meta_bytes: &[u8],
     onnx_bytes: &[u8],
     config_id: &str,
 ) -> Result<EvaluationRecord, ErrorReport> {
@@ -799,7 +800,8 @@ fn verify_evaluation_record(
         RepresentativeConfigId::parse(config_id).map_err(|e| acquire_error_report(&e))?;
     // 台帳が見分ける重みの識別は `evaluate` の登録と同じ関数で求める（byte は ONNX の sha256、tokenizer 表現は
     // ONNX・tokenizer.json・各 shard の sha256 から。REQ-27・#662）。
-    let weights_digest = registered_weights_digest(onnx_bytes, meta_bytes, meta)?;
+    let weights_digest = weights_identity_from_bytes(onnx_bytes, Some(meta_bytes))
+        .map_err(|_| invalid("artifact tokenizer references are invalid"))?;
     let Some(held) = HeldLedger::open(project, false)? else {
         return Err(invalid("evaluation has not been completed"));
     };

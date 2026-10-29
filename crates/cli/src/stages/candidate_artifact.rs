@@ -253,100 +253,32 @@ pub(crate) fn build_candidate_pipeline(
     artifact: &CandidateArtifact,
     n_options: usize,
 ) -> Result<Pipeline, ErrorReport> {
-    if is_tokenizer_qwen2(&artifact.meta) {
-        build_qwen2_pipeline(
-            onnx,
-            &artifact.dir,
-            &artifact.meta_bytes,
-            &artifact.meta,
-            n_options,
-        )
+    build_candidate_pipeline_with_meta(
+        onnx,
+        &artifact.dir,
+        &artifact.meta_bytes,
+        &artifact.meta,
+        n_options,
+    )
+}
+
+/// [`build_candidate_pipeline`] の、メタデータ（`artifact.json` のバイト列とその解析結果）を明示する版。
+///
+/// `evaluate` の適用は、評価器が登録照合と前後ハッシュ検証を行ったステージング済みの `artifact.json` から
+/// 読み直したバイト列を渡す。ランタイムの shard sha256 照合が、評価器の識別と同じ記録値に対して行われる
+/// ようにするため（REQ-27・#662）。`dir` は shard を開く成果物ディレクトリ。
+pub(crate) fn build_candidate_pipeline_with_meta(
+    onnx: &[u8],
+    dir: &ConfinedPackage,
+    meta_bytes: &[u8],
+    meta: &ArtifactMeta,
+    n_options: usize,
+) -> Result<Pipeline, ErrorReport> {
+    if is_tokenizer_qwen2(meta) {
+        build_qwen2_pipeline(onnx, dir, meta_bytes, meta, n_options)
     } else {
-        build_pipeline(onnx, &artifact.meta, n_options)
+        build_pipeline(onnx, meta, n_options)
     }
-}
-
-/// 評価台帳が候補を見分ける識別（重みの識別）の正準入力の領域名（v2: 重みの中身だけで決める）。
-const WEIGHTS_IDENTITY_DOMAIN: &[u8] = b"fandhe-edge/evaluate/weights-identity/v2\0";
-
-/// ONNX・`tokenizer.json`・各 shard の sha256 から台帳の識別を求める（正準化は本関数の 1 か所。REQ-27・#662）。
-///
-/// 正準入力は、領域名 ‖ ONNX の sha256（32B）‖ tokenizer の sha256（32B）‖ shard 件数（u64 LE）‖
-/// 各 shard の sha256（32B。`artifact.json` の `external_data` の記載順）。shard の location（ファイル名）は
-/// 入れない。件数を固定長で先に置くので、境界のずらしで別の組が同じ入力にならない。
-fn weights_identity_digest(
-    onnx: &Sha256Digest,
-    tokenizer: &Sha256Digest,
-    shards: &[Sha256Digest],
-) -> Sha256Digest {
-    let mut buf = Vec::with_capacity(WEIGHTS_IDENTITY_DOMAIN.len() + 72 + 32 * shards.len());
-    buf.extend_from_slice(WEIGHTS_IDENTITY_DOMAIN);
-    buf.extend_from_slice(onnx.as_bytes());
-    buf.extend_from_slice(tokenizer.as_bytes());
-    buf.extend_from_slice(
-        &u64::try_from(shards.len())
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    for shard in shards {
-        buf.extend_from_slice(shard.as_bytes());
-    }
-    Sha256Digest::of_bytes(&buf)
-}
-
-/// 評価台帳（`final_test_once`）が候補を見分けるときの重みの識別を返す（REQ-27・#662）。
-///
-/// byte 表現（c1・c3）は `None` で、識別は従来どおり ONNX ファイルの sha256（評価器がファイルから求める。
-/// 記録・挙動は変えない）。tokenizer 表現（`qwen2_lora`）は `Some(ONNX・tokenizer.json・各 shard の sha256 から
-/// 求めた値)`。ONNX 本体は shard の中身が違っても同じバイト列になりうる（重みの大半は外部データで、ONNX には
-/// 場所・オフセット・長さしか入らない）ため、ONNX だけでは shard だけが違う 2 候補が同じ識別になる。
-///
-/// 識別は**重みの中身だけ**で決める（オーナー決定 2026-10-29）。`artifact.json` の生バイトは入れない。
-/// 入れると `created_utc`・来歴・空白だけが違う同一モデルが別の識別になり、別の構成名で最終 test に
-/// 2 回当てられるため。代わりに解析済みの [`TokenizerPackageRefs`] から tokenizer と shard の記録 sha256 を取る。
-/// 記録値と実体の一致は、ロード時の tokenizer.json の sha256 照合と、ランタイムが shard を読みながら行う
-/// sha256 照合（不一致は fail-closed）が保証する前提。この結果、system プロンプトだけが違う同一重みは
-/// 同じ識別になり、評価済みとして断られる（安全側）。
-///
-/// `evaluate`（登録と適用）と `package`（評価済みの照会）が同じ関数を使い、識別を 1 か所で決める。
-///
-/// # Errors
-/// tokenizer 表現で参照欄を読めない・sha256 を復号できないとき `invalid_input`（ロード時の検査で弾かれるため
-/// 通常は起きない。識別を作れないまま続けない fail-closed）。
-pub(crate) fn ledger_weights_identity(
-    onnx_bytes: &[u8],
-    meta_bytes: &[u8],
-    meta: &ArtifactMeta,
-) -> Result<Option<Sha256Digest>, ErrorReport> {
-    if !is_tokenizer_qwen2(meta) {
-        return Ok(None);
-    }
-    let bad = || invalid("artifact tokenizer references are invalid");
-    let refs = TokenizerPackageRefs::parse(meta_bytes).map_err(|_| bad())?;
-    let tokenizer: Sha256Digest = refs.tokenizer_sha256.parse().map_err(|_| bad())?;
-    let shards = refs
-        .external_data
-        .iter()
-        .map(|e| e.sha256.parse::<Sha256Digest>().map_err(|_| bad()))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(weights_identity_digest(
-        &Sha256Digest::of_bytes(onnx_bytes),
-        &tokenizer,
-        &shards,
-    )))
-}
-
-/// 評価台帳へ事前登録する重みの識別（byte は ONNX ファイルの sha256。[`ledger_weights_identity`]）。
-///
-/// # Errors
-/// [`ledger_weights_identity`] と同じ。
-pub(crate) fn registered_weights_digest(
-    onnx_bytes: &[u8],
-    meta_bytes: &[u8],
-    meta: &ArtifactMeta,
-) -> Result<Sha256Digest, ErrorReport> {
-    Ok(ledger_weights_identity(onnx_bytes, meta_bytes, meta)?
-        .unwrap_or_else(|| Sha256Digest::of_bytes(onnx_bytes)))
 }
 
 /// 容量計測の対象（`(区分, 実パス, fd)`）を列挙する。ONNX と shard は重み、`artifact.json` はメタデータ、
@@ -512,129 +444,6 @@ mod tests {
             .as_bytes(),
         )
         .expect("meta")
-    }
-
-    fn tok_meta_json(created_utc: &str, shards: &[&str], tokenizer: &str, prompt: &str) -> String {
-        let z = "0".repeat(64);
-        let ext = shards
-            .iter()
-            .enumerate()
-            .map(|(i, h)| format!(r#"{{"location":"w{i}.bin","sha256":"{h}"}}"#))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            r#"{{"kind":"qwen2_lora","kind_version":1,"max_bytes":64,"label_order":["a","b"],"onnx_file":"model.onnx","onnx_sha256":"{z}","input_representation":"tokenizer","created_utc":"{created_utc}","tokenizer_file":"tokenizer.json","tokenizer_sha256":"{tokenizer}","external_data":[{ext}],"scoring":{{"system_prompt":"{prompt}","choices":[{{"token_ids":[1]}},{{"token_ids":[2]}}]}},"config":{{"max_seq_length":64}}}}"#
-        )
-    }
-
-    fn identity_of(json: &str) -> Sha256Digest {
-        let meta = ArtifactMeta::parse(json.as_bytes()).expect("meta");
-        registered_weights_digest(b"onnx", json.as_bytes(), &meta).expect("identity")
-    }
-
-    const H1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    const H2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-    const H3: &str = "3333333333333333333333333333333333333333333333333333333333333333";
-
-    /// REQ-27・#662: 推論と無関係な欄（`created_utc`）・空白だけが違う `artifact.json` は同じ識別になる
-    /// （同一モデルを別の識別で最終 test に 2 回当てられない）。
-    #[test]
-    fn req27_issue662_identity_ignores_unrelated_fields_and_whitespace() {
-        let a = tok_meta_json("2026-10-01T00:00:00Z", &[H1, H2], H3, "p");
-        let b = tok_meta_json("2026-12-31T23:59:59Z", &[H1, H2], H3, "p");
-        let spaced = a.replace(',', " ,\n ");
-        assert_ne!(a, b);
-        assert_ne!(a, spaced);
-        assert_eq!(identity_of(&a), identity_of(&b));
-        assert_eq!(identity_of(&a), identity_of(&spaced));
-        // 識別は ONNX の sha256 とも区別される。
-        assert_ne!(identity_of(&a), Sha256Digest::of_bytes(b"onnx"));
-    }
-
-    /// REQ-27・#662: shard の sha256 が 1 つ違えば別の識別になる。
-    #[test]
-    fn req27_issue662_identity_changes_with_a_shard_sha256() {
-        let a = tok_meta_json("t", &[H1, H2], H3, "p");
-        let b = tok_meta_json("t", &[H1, H3], H3, "p");
-        assert_ne!(identity_of(&a), identity_of(&b));
-    }
-
-    /// REQ-27・#662: tokenizer.json の sha256 が違えば別の識別になる。
-    #[test]
-    fn req27_issue662_identity_changes_with_the_tokenizer_sha256() {
-        let a = tok_meta_json("t", &[H1, H2], H3, "p");
-        let b = tok_meta_json("t", &[H1, H2], H1, "p");
-        assert_ne!(identity_of(&a), identity_of(&b));
-    }
-
-    /// REQ-27・#662: shard の記載順を入れ替えると別の識別になる（順序つきの正準入力）。
-    #[test]
-    fn req27_issue662_identity_depends_on_shard_order() {
-        let a = tok_meta_json("t", &[H1, H2], H3, "p");
-        let b = tok_meta_json("t", &[H2, H1], H3, "p");
-        assert_ne!(identity_of(&a), identity_of(&b));
-    }
-
-    /// REQ-27・#662: ONNX が違えば別の識別になる。system プロンプトだけが違う同一重みは同じ識別（評価済みとして断られる安全側）。
-    #[test]
-    fn req27_issue662_identity_depends_on_onnx_not_on_prompt() {
-        let a = tok_meta_json("t", &[H1], H3, "p");
-        let b = tok_meta_json("t", &[H1], H3, "other prompt");
-        assert_eq!(identity_of(&a), identity_of(&b));
-        let meta = ArtifactMeta::parse(a.as_bytes()).expect("meta");
-        assert_ne!(
-            registered_weights_digest(b"onnx", a.as_bytes(), &meta).expect("a"),
-            registered_weights_digest(b"onnx2", a.as_bytes(), &meta).expect("b")
-        );
-    }
-
-    /// REQ-27・#662: 台帳へ登録・照会する重みの識別は、byte（c1・c3）では従来どおり ONNX の sha256 のままで値が
-    /// 変わらず、tokenizer 表現（`qwen2_lora`）だけ中身の sha256 から求めた値になる。参照欄を読めない tokenizer 表現は
-    /// 識別を作らず `invalid_input`（fail-closed）。
-    #[test]
-    fn req27_issue662_registered_digest_is_unchanged_for_byte_kinds() {
-        let onnx_digest = Sha256Digest::of_bytes(b"onnx");
-        for kind_meta in [meta("c1", ""), meta("c3", "")] {
-            assert_eq!(
-                ledger_weights_identity(b"onnx", b"meta", &kind_meta).expect("byte"),
-                None
-            );
-            assert_eq!(
-                registered_weights_digest(b"onnx", b"meta", &kind_meta).expect("byte"),
-                onnx_digest
-            );
-        }
-        let json = tok_meta_json("t", &[H1], H3, "p");
-        let qwen2 = ArtifactMeta::parse(json.as_bytes()).expect("meta");
-        let identity = registered_weights_digest(b"onnx", json.as_bytes(), &qwen2).expect("id");
-        assert_ne!(identity, onnx_digest);
-        assert_eq!(
-            Some(identity),
-            ledger_weights_identity(b"onnx", json.as_bytes(), &qwen2).expect("id")
-        );
-        let err = registered_weights_digest(b"onnx", b"not json", &qwen2).expect_err("refs");
-        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
-    }
-
-    /// REQ-27・#662: fixture の `qwen2_lora` 成果物で、`model.onnx` が同じまま shard の sha256（`artifact.json`）
-    /// だけが違う候補は、ONNX の sha256 が同じでも台帳の識別が別になる。
-    #[test]
-    fn req27_issue662_fixture_candidates_differing_only_in_shard_get_distinct_identities() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/qwen2_parity");
-        let onnx_bytes = std::fs::read(dir.join("model.onnx")).expect("onnx");
-        let meta = std::fs::read_to_string(dir.join("artifact.json")).expect("meta");
-        let shard =
-            Sha256Digest::of_bytes(&std::fs::read(dir.join("weights-00000.bin")).expect("shard"))
-                .to_hex();
-        assert!(meta.contains(&shard), "shard sha256 is recorded");
-        let other = meta.replace(&shard, &"1".repeat(64));
-        assert_ne!(meta, other);
-        let id = |json: &str| {
-            let parsed = ArtifactMeta::parse(json.as_bytes()).expect("meta");
-            registered_weights_digest(&onnx_bytes, json.as_bytes(), &parsed).expect("id")
-        };
-        assert_ne!(id(&meta), id(&other));
-        assert_ne!(id(&meta), Sha256Digest::of_bytes(&onnx_bytes));
     }
 
     /// REQ-41・#662: tokenizer 表現を通すのは `qwen2_lora` だけ。c1 など他の kind の tokenizer 宣言は

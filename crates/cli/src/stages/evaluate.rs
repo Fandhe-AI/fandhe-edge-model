@@ -49,7 +49,7 @@
 //! （パスへ戻る経路なし。検証後の差し替えでプロジェクト外を読み書きしない。#168）。
 //!
 //! 指標の算出・結果の検証・記録ファイルの書き込みは、台帳へ完了を記録する前
-//! （[`fandhe_edge_eval::final_test_once::apply_once_then_with_identity`] の `finish`）に行う。これらが失敗しても
+//! （[`fandhe_edge_eval::final_test_once::apply_once_then`] の `finish`）に行う。これらが失敗しても
 //! 台帳は完了状態にならず（適用権のロックのみが残る）、記録の無い完了を作らない（REQ-27）。
 //!
 //! # 1 件ごとの予測の保存（REQ-27・REQ-41・#445）
@@ -126,6 +126,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::evaluation_record::{
     AbstentionRecord, CalibrationRecord, EvaluationRecord, MAX_EVALUATION_RECORD_BYTES,
@@ -148,9 +149,9 @@ use fandhe_edge_eval::calibration::{
 use fandhe_edge_eval::eval_data_invariance::FrozenEvalData;
 use fandhe_edge_eval::final_test_once::{
     AcquireError, AppliedOnce, DecodeFailed, FinalTestLedger, LabeledInput, RegisteredConfig,
-    RepresentativeConfigId, apply_once_then_with_identity,
+    RepresentativeConfigId, apply_once_then,
 };
-use fandhe_edge_eval::invariance::ModelPackagePaths;
+use fandhe_edge_eval::invariance::{ModelPackageBytes, ModelPackagePaths};
 use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome};
 use fandhe_edge_guard::format::check_bytes;
 use fandhe_edge_guard::resource::safety_limits_for_kind;
@@ -177,8 +178,8 @@ use crate::stage_output::{EvaluateStart, evaluate_start};
 
 use super::baseline::{PreparedBaseline, compare, prepare_baseline};
 use super::candidate_artifact::{
-    CandidateArtifact, build_candidate_pipeline, check_meta_consistency, ledger_weights_identity,
-    load_candidate_artifact, registered_weights_digest,
+    CandidateArtifact, build_candidate_pipeline, build_candidate_pipeline_with_meta,
+    check_meta_consistency, load_candidate_artifact,
 };
 use super::diagnostics::{PreparedStats, prepare_stats};
 use super::infer::Pipeline;
@@ -266,24 +267,22 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         else {
             continue;
         };
-        // 重みの識別は byte が ONNX の sha256、tokenizer 表現が ONNX・tokenizer.json・各 shard の sha256 から
-        // 求めた値（重みの中身だけで決める。REQ-27・#662。`ledger_weights_identity` の doc）。
-        let mut entry = RegisteredConfig::new(
+        // 重みの識別は評価器が同じ関数（`weights_identity`）で求める（byte が ONNX の sha256、tokenizer 表現が
+        // ONNX・tokenizer.json・各 shard の sha256 から。REQ-27・#662）。登録の構成要素は実際に当てるものと同じ
+        // バイト列から評価器に作らせる。tokenizer 表現は tokenizer.json と `artifact.json`（プロンプト等を含む）の
+        // sha256 も結び付け、登録後の差し替えを適用時の照合で止める。byte 表現は従来どおり ONNX だけ。
+        let tokenizer = prepared.artifact.tokenizer_bytes.as_deref();
+        let entry = RegisteredConfig::from_package_bytes(
             prepared.config_id.clone(),
-            registered_weights_digest(
-                &prepared.artifact.onnx_bytes,
-                &prepared.artifact.meta_bytes,
-                &prepared.artifact.meta,
-            )?,
-        );
-        // tokenizer 表現は tokenizer.json の sha256 も代表構成の登録へ結び付ける（登録の完全性のため。REQ-27・
-        // #662）。評価器が前後で照合するのは私用ディレクトリへ複製したバイト列で、複製のハッシュは常に一致する
-        // ため、この登録自体は成果物の改変を検出しない。改変を止めているのは `build_qwen2_pipeline` の
-        // tokenizer.json の sha256 照合（`artifact.json` の記録との照合）と、ランタイムが shard を読みながら行う
-        // sha256 照合（不一致は fail-closed）。
-        if let Some(tokenizer) = &prepared.artifact.tokenizer_bytes {
-            entry = entry.with_vocab(Sha256Digest::of_bytes(tokenizer));
-        }
+            &ModelPackageBytes {
+                weights: Some(&prepared.artifact.onnx_bytes),
+                vocab: tokenizer,
+                calibration: None,
+                thresholds: None,
+                manifest: tokenizer.map(|_| prepared.artifact.meta_bytes.as_slice()),
+            },
+        )
+        .map_err(|e| acquire_error_report(&e))?;
         entries.push(entry);
         if is_target {
             prepared_target = Some(prepared);
@@ -1083,6 +1082,12 @@ fn apply_to_frozen_data<R>(
         .as_deref()
         .map(|bytes| staged.write("tokenizer.json", bytes))
         .transpose()?;
+    // tokenizer 表現は `artifact.json` もステージングし、評価器の識別の算出・登録照合・前後ハッシュ検証の対象にする。
+    // 適用での推論も、ここから読み直したバイト列でパイプラインを組む（REQ-27・#662）。
+    let manifest_path = vocab_path
+        .as_ref()
+        .map(|_| staged.write("artifact.json", &target.artifact.meta_bytes))
+        .transpose()?;
     let frozen = FrozenEvalData {
         path: &eval_path,
         sha256: freeze.sha256(),
@@ -1093,19 +1098,14 @@ fn apply_to_frozen_data<R>(
         vocab: vocab_path.as_deref(),
         calibration: None,
         thresholds: None,
+        manifest: manifest_path.as_deref(),
     };
     let options = definition.options();
-    apply_once_then_with_identity(
+    apply_once_then(
         ledger,
         &frozen,
         target.config_id.clone(),
         &model,
-        // tokenizer 表現だけ識別を明示する（登録時と同じ値。byte は `None` で従来どおりファイルの sha256）。
-        ledger_weights_identity(
-            &target.artifact.onnx_bytes,
-            &target.artifact.meta_bytes,
-            &target.artifact.meta,
-        )?,
         |bytes| decode_evaluation(bytes, definition).map_err(|_| DecodeFailed),
         // 推論関数へは `input` の列だけが渡る（正解ラベルは評価器側に残る。REQ-27）。
         |_ticket, inputs, paths| {
@@ -1119,8 +1119,25 @@ fn apply_to_frozen_data<R>(
             // 試し組み立てからここまでの間に shard が差し替えられる、またはメモリが足りなくなると、適用権だけが
             // 消費されて `Failed`（`runtime_error`・70）になる。評価は成功を記録せず `package` は配布を許さない
             // ので fail-closed で契約違反ではないが、その候補は再評価できない（モジュール doc の適用権の規則）。
-            let pipeline = build_candidate_pipeline(&weights, &target.artifact, options.len())
-                .map_err(|_| EvalPredictFailure::Failed)?;
+            // tokenizer 表現は、評価器が識別と照合に使ったステージング済みの `artifact.json` から読み直した
+            // バイト列でパイプラインを組む（ランタイムの shard sha256 照合が、識別と同じ記録値に対して行われる）。
+            let pipeline = match paths.manifest {
+                Some(manifest) => {
+                    let meta_bytes = read_bounded(manifest, MAX_ARTIFACT_META_BYTES)
+                        .map_err(|_| EvalPredictFailure::Failed)?;
+                    let meta =
+                        ArtifactMeta::parse(&meta_bytes).map_err(|_| EvalPredictFailure::Failed)?;
+                    build_candidate_pipeline_with_meta(
+                        &weights,
+                        &target.artifact.dir,
+                        &meta_bytes,
+                        &meta,
+                        options.len(),
+                    )
+                }
+                None => build_candidate_pipeline(&weights, &target.artifact, options.len()),
+            }
+            .map_err(|_| EvalPredictFailure::Failed)?;
             let item_time_limit = item_time_limit_for_kind(&target.kind_name);
             let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
             let mut outcomes = Vec::with_capacity(inputs.len());

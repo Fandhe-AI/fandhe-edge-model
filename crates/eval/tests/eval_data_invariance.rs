@@ -373,6 +373,7 @@ fn req27_nested_model_and_eval_data_invariance_happy_path() {
         vocab: None,
         calibration: None,
         thresholds: None,
+        manifest: None,
     };
     let model_dir_label = "nested-model";
     let model_guard = write_unique_temp_file(model_dir_label, package.weights.expect("値あり"));
@@ -381,6 +382,7 @@ fn req27_nested_model_and_eval_data_invariance_happy_path() {
         vocab: None,
         calibration: None,
         thresholds: None,
+        manifest: None,
     };
 
     let record = freeze_eval_data(SYNTHETIC_EVAL_DATA).expect("凍結は失敗しないはず");

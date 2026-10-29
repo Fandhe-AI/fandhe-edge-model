@@ -54,6 +54,7 @@ fn synthetic_package() -> ModelPackageBytes<'static> {
         vocab: Some(b"synthetic-vocab-bytes-v1"),
         calibration: Some(b"synthetic-calibration-bytes-v1"),
         thresholds: Some(b"synthetic-thresholds-bytes-v1"),
+        manifest: None,
     }
 }
 
@@ -189,6 +190,7 @@ impl PackageFixture {
             vocab: Some(&self.vocab),
             calibration: Some(&self.calibration),
             thresholds: Some(&self.thresholds),
+            manifest: None,
         }
     }
 }
@@ -508,6 +510,7 @@ fn req27_comparator_disk_round_trip_of_unchanged_files_matches() {
         vocab: Some(&vocab_bytes),
         calibration: Some(&calibration_bytes),
         thresholds: Some(&thresholds_bytes),
+        manifest: None,
     })
     .expect("合成データは失敗しないはず");
 
@@ -520,6 +523,7 @@ fn req27_comparator_disk_round_trip_of_unchanged_files_matches() {
         vocab: Some(&vocab_bytes_after),
         calibration: Some(&calibration_bytes_after),
         thresholds: Some(&thresholds_bytes_after),
+        manifest: None,
     })
     .expect("合成データは失敗しないはず");
 
