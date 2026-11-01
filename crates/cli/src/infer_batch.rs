@@ -534,6 +534,7 @@ pub(crate) fn emit_infer_batch_scoped<W, R, P, B>(
     options: &[Choice],
     scope: &JudgmentScope,
     pipeline: Arc<InferencePipeline<P, B>>,
+    batch_duration: Duration,
 ) -> io::Result<ExitCode>
 where
     W: Write,
@@ -549,7 +550,10 @@ where
         options,
         scope,
         pipeline,
-        BatchLimits::default(),
+        BatchLimits {
+            duration: batch_duration,
+            ..BatchLimits::default()
+        },
         StallPolicy::TerminateProcess,
     )
 }
@@ -635,6 +639,7 @@ impl WriteFailure {
 ///
 /// # Errors
 /// [`emit_infer_batch_with_limits`] と同じ（`results` への書き込み失敗を含む）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_infer_batch_split<W, R, P, B>(
     out: &mut W,
     results: &mut dyn BatchResults,
@@ -643,6 +648,7 @@ pub(crate) fn emit_infer_batch_split<W, R, P, B>(
     options: &[Choice],
     scope: &JudgmentScope,
     pipeline: Arc<InferencePipeline<P, B>>,
+    batch_duration: Duration,
 ) -> io::Result<ExitCode>
 where
     W: Write,
@@ -658,7 +664,10 @@ where
         options,
         scope,
         pipeline,
-        BatchLimits::default(),
+        BatchLimits {
+            duration: batch_duration,
+            ..BatchLimits::default()
+        },
         StallPolicy::TerminateProcess,
     )
 }
@@ -1457,6 +1466,7 @@ mod tests {
             definition.options(),
             &scope,
             Arc::new(InferencePipeline::new(UnitPre, MixBackend)),
+            BatchLimits::default().duration,
         )
         .unwrap();
         assert_eq!(code, ExitCode::Ok);
@@ -1490,6 +1500,7 @@ mod tests {
             definition.options(),
             &scope(Some("a"), None),
             Arc::new(InferencePipeline::new(UnitPre, MixBackend)),
+            BatchLimits::default().duration,
         )
         .unwrap();
         assert_eq!(code, ExitCode::Ok);

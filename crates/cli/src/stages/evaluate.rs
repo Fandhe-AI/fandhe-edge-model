@@ -157,8 +157,7 @@ use fandhe_edge_guard::format::check_bytes;
 use fandhe_edge_guard::resource::safety_limits_for_kind;
 use fandhe_edge_runtime::onnx::MAX_MODEL_FILE_BYTES;
 use fandhe_edge_runtime::pipeline::{
-    BackendError, InferError, MAX_INFER_BATCH_DURATION, MAX_INFER_BATCH_LEN,
-    MAX_INFER_BATCH_TOTAL_SCORES,
+    BackendError, InferError, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_SCORES,
 };
 use fandhe_edge_train::request::{Device, TrainRequest};
 use fandhe_edge_train::result::TrainOutcome;
@@ -331,6 +330,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     let calibration = calibrate_on_validation(
         &pipeline,
         item_time_limit_for_kind(&target.kind_name),
+        batch_duration_for_kind(&target.kind_name),
         &definition,
         &records,
         &split,
@@ -574,6 +574,7 @@ fn check_candidate_artifact(
 fn calibrate_on_validation(
     pipeline: &Pipeline,
     item_time_limit: Duration,
+    batch_duration: Duration,
     definition: &Definition,
     records: &[ValidRecord],
     split: &fandhe_edge_data::split::SplitResult,
@@ -600,7 +601,7 @@ fn calibrate_on_validation(
             "validation data has too many scores",
         ));
     }
-    let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
+    let deadline = Instant::now().checked_add(batch_duration);
     let mut logits: Vec<Vec<f64>> = Vec::with_capacity(validation.len());
     for record in &validation {
         if deadline.is_some_and(|d| Instant::now() > d) {
@@ -630,6 +631,12 @@ fn calibrate_on_validation(
 /// 既存 3 種と未知の kind は従来の 10 秒、追加学習は 60 秒。REQ-39・REQ-41・#662）。
 fn item_time_limit_for_kind(kind: &str) -> Duration {
     safety_limits_for_kind(kind).time().get()
+}
+
+/// 一括推論（validation の校正・凍結 test への適用）の全体上限を候補の `kind` の安全上限から引く。
+/// 既存 3 種と未知の kind は 600 秒、追加学習は 1500 秒（REQ-39・REQ-41・#662。7B は収まらない既知の限界）。
+fn batch_duration_for_kind(kind: &str) -> Duration {
+    safety_limits_for_kind(kind).batch_duration()
 }
 
 /// 校正・保留の計算用に保持するロジットの総数（件数 × 選択肢数）が上限内か。桁あふれは上限超過として扱う。
@@ -1139,7 +1146,7 @@ fn apply_to_frozen_data<R>(
             }
             .map_err(|_| EvalPredictFailure::Failed)?;
             let item_time_limit = item_time_limit_for_kind(&target.kind_name);
-            let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
+            let deadline = Instant::now().checked_add(batch_duration_for_kind(&target.kind_name));
             let mut outcomes = Vec::with_capacity(inputs.len());
             for input in inputs {
                 if deadline.is_some_and(|d| Instant::now() > d) {
@@ -1239,6 +1246,17 @@ mod tests {
     /// 適用権を取る前の確認が `limit_exceeded` になる。ちょうど上限なら通る。
     /// REQ-39・REQ-41・#662: 1 件ごとの推論上限は kind で決まる。byte 系は従来の `INFER_TIME_LIMIT`（10 秒）、
     /// `qwen2_lora` は 60 秒、未知の kind は厳しい側（10 秒）。
+    #[test]
+    fn req39_req41_issue662_batch_duration_follows_kind() {
+        for kind in ["c1", "c3", "autoregressive", "unknown"] {
+            assert_eq!(batch_duration_for_kind(kind), Duration::from_secs(600));
+        }
+        assert_eq!(
+            batch_duration_for_kind("qwen2_lora"),
+            Duration::from_secs(1500)
+        );
+    }
+
     #[test]
     fn req39_issue662_item_time_limit_follows_kind() {
         for kind in ["c1", "c3", "autoregressive", "unknown"] {

@@ -133,6 +133,8 @@ struct Prepared {
     scope: JudgmentScope,
     /// 単件推論の協調的な期限（`kind` 別の安全上限の時間。REQ-39・TASK-41.8・#435）。
     single_time: Duration,
+    /// 一括推論の全体上限（`kind` 別。既存 3 種 600 秒・追加学習 1500 秒。REQ-39・REQ-41・#662）。
+    batch_time: Duration,
 }
 
 /// `infer` を実行し、結果（または `ErrorReport`）を `out` へ書く。
@@ -187,6 +189,7 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
                     prepared.definition.options(),
                     &prepared.scope,
                     pipeline,
+                    prepared.batch_time,
                 );
             };
             let mut sink = LazyOut::new(&target);
@@ -198,6 +201,7 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
                 prepared.definition.options(),
                 &prepared.scope,
                 pipeline,
+                prepared.batch_time,
             )
         }
     }
@@ -505,6 +509,7 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         pipeline,
         scope,
         single_time: safety_limits_for_kind(checked.kind.as_str()).time().get(),
+        batch_time: safety_limits_for_kind(checked.kind.as_str()).batch_duration(),
     })
 }
 
