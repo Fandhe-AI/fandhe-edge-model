@@ -206,6 +206,18 @@ impl MemoryLimit {
 /// （1.5B・bf16。件数差分による推定。#442）で、上限の 60 秒は余裕がある（#632）。
 pub const FINETUNE_INFER_TIME_LIMIT: Duration = Duration::from_secs(60);
 
+/// 追加学習の種類の一括推論（`infer --input-file`・`evaluate`）の全体上限。1500 秒（REQ-39・REQ-41・#662）。
+///
+/// 根拠は実機測定（2026-10-30。証拠種別: 実機）。Qwen 1.5B は 1 件約 2.15 秒で、凍結 test 324 件の一括推論が
+/// 約 700 秒かかり、従来の 600 秒では `evaluate` が `limit_exceeded`（20）になる。1500 秒はその約 2 倍の余裕で、
+/// `evaluate` の監督上限（2×60 + 2×1500 + 60 + 猶予 = 3182 秒）が天井 [`MAX_TIME_LIMIT`]（3600 秒）に収まる最大に近い値。
+/// 既知の限界: 7B は 1 件約 10.7 秒で 324 件が約 3470 秒かかり、本値では `evaluate` が収まらない（対象外）。
+pub const FINETUNE_INFER_BATCH_DURATION: Duration = Duration::from_secs(1500);
+
+/// 既存のバイト入力の種類の一括推論の全体上限。600 秒（runtime の `MAX_INFER_BATCH_DURATION` と同値。
+/// guard は runtime に依存しないため値を持ち、cli のテストで一致を固定する。REQ-39）。
+pub const STRICT_INFER_BATCH_DURATION: Duration = Duration::from_secs(600);
+
 /// 追加学習の種類の安全上限（RSS）。24 GiB（2^30 × 24。REQ-39・REQ-41・TASK-39.5-4・#578・#654）。
 ///
 /// 7B の推定 RSS 16〜17 GB（#651 の見積。証拠種別: 推定）に余裕を見た暴走止め。目標の 2 GiB（REQ-39）は
@@ -220,9 +232,16 @@ pub const FINETUNE_INFER_RSS_LIMIT_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 pub struct SafetyLimits {
     time: TimeLimit,
     memory: MemoryLimit,
+    batch: Duration,
 }
 
 impl SafetyLimits {
+    /// 一括推論（`infer --input-file`・`evaluate`）の全体上限（REQ-39・REQ-41・#662）。
+    #[must_use]
+    pub const fn batch_duration(self) -> Duration {
+        self.batch
+    }
+
     /// 時間上限。
     #[must_use]
     pub const fn time(self) -> TimeLimit {
@@ -239,12 +258,14 @@ impl SafetyLimits {
     pub const STRICT: Self = Self {
         time: TimeLimit::infer_default(),
         memory: MemoryLimit::infer_default(),
+        batch: STRICT_INFER_BATCH_DURATION,
     };
 
     /// 追加学習の種類の値（60 秒・24 GiB）。
     const FINETUNE: Self = Self {
         time: TimeLimit(FINETUNE_INFER_TIME_LIMIT),
         memory: MemoryLimit(FINETUNE_INFER_RSS_LIMIT_BYTES),
+        batch: FINETUNE_INFER_BATCH_DURATION,
     };
 }
 
@@ -1493,6 +1514,22 @@ mod tests {
             assert_eq!(l.time().get(), Duration::from_secs(10));
             assert_eq!(l.memory().get(), 2_147_483_648);
         }
+    }
+
+    /// REQ-39・REQ-41・#662: 一括推論の全体上限は追加学習が 1500 秒、既存 3 種と未知の kind が 600 秒。
+    #[test]
+    fn req39_req41_batch_duration_per_kind() {
+        assert_eq!(
+            safety_limits_for_kind("qwen2_lora").batch_duration(),
+            Duration::from_secs(1500)
+        );
+        for k in ["c1", "c3", "autoregressive", "unknown"] {
+            assert_eq!(
+                safety_limits_for_kind(k).batch_duration(),
+                Duration::from_secs(600)
+            );
+        }
+        assert!(FINETUNE_INFER_BATCH_DURATION <= MAX_TIME_LIMIT);
     }
 
     /// REQ-39・TASK-39.5-4・#578: 追加学習の値は 60 秒・24 GiB で、天井内。

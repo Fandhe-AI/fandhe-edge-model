@@ -58,7 +58,6 @@ use fandhe_edge_guard::resource::{
     run_with_limits, safety_limits_for_kind,
 };
 use fandhe_edge_runtime::latency::DEFAULT_LATENCY_TOTAL_TIMEOUT_NS;
-use fandhe_edge_runtime::pipeline::MAX_INFER_BATCH_DURATION;
 use fandhe_edge_train::stage_files::SelectionRecord;
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -85,7 +84,8 @@ pub fn is_worker() -> bool {
 /// 入力源と種類別の安全上限 `limits` からの監督設定（RSS は `limits.memory()`。迂回しない）。
 ///
 /// 親の時間上限は worker 内の上限（協調的な期限＋見張りまでの猶予）より必ず長い。
-/// バッチの時間（全体 600 秒＋出力 60 秒）は種類に依らず追加学習の 60 秒より長いので据え置く。
+/// バッチの時間は `limits.batch_duration()`（既存 3 種 600 秒・追加学習 1500 秒。REQ-41・#662）＋出力 60 秒で、
+/// いずれも 1 件の上限（10 秒・60 秒）より長い。
 ///
 /// # Errors
 /// 上限が範囲外（定数から作るため通常は起きない）。
@@ -95,9 +95,9 @@ pub fn supervisor_config(
 ) -> Result<RunConfig, ResourceConfigError> {
     let inner = match source {
         InferSource::Text { .. } => limits.time().get().saturating_add(SINGLE_HARD_LIMIT_GRACE),
-        InferSource::InputFile { .. } => {
-            MAX_INFER_BATCH_DURATION.saturating_add(MAX_INFER_BATCH_OUTPUT_DURATION)
-        }
+        InferSource::InputFile { .. } => limits
+            .batch_duration()
+            .saturating_add(MAX_INFER_BATCH_OUTPUT_DURATION),
     };
     config_with(inner, limits)
 }
@@ -105,15 +105,17 @@ pub fn supervisor_config(
 /// `evaluate` の監督設定（REQ-39・REQ-41・#662。RSS は `limits.memory()`）。
 ///
 /// 親の時間上限は
-/// `2 × limits.time() + 2 × MAX_INFER_BATCH_DURATION + MAX_INFER_BATCH_OUTPUT_DURATION + SUPERVISOR_GRACE`。内訳:
+/// `2 × limits.time() + 2 × limits.batch_duration() + MAX_INFER_BATCH_OUTPUT_DURATION + SUPERVISOR_GRACE`。内訳:
 /// - `2 × limits.time()`: パイプライン構築が 2 回ある（適用権を取る前の試し組み立てと、取得後の再構築。
 ///   どちらも `infer` の 1 件上限と同じく「読み込み込み」の上限を 1 回ぶんずつ見込む）
-/// - `2 × MAX_INFER_BATCH_DURATION`: 1 件ずつの推論の期限が 2 回ある（validation の校正と、凍結 test への適用）
+/// - `2 × limits.batch_duration()`（既存 3 種 600 秒・追加学習 1500 秒）: 1 件ずつの推論の期限が 2 回ある（validation の校正と、凍結 test への適用）
 /// - `MAX_INFER_BATCH_OUTPUT_DURATION`: 推論の後の結果の書き出し(指標・予測 JSONL・評価記録の `finish`・stdout)。
 ///   `infer --input-file` の出力段と同じ定数を使う
 ///
 /// `--previous-project-dir`・`--seed-run-project` は保存済みの記録を読むだけで推論しないので数えない。
-/// 値は種類が 10 秒の既存 3 種で 1282 秒、追加学習（60 秒）で 1382 秒（どちらも `MAX_TIME_LIMIT` 3600 秒以内）。
+/// 値は既存 3 種（1 件 10 秒・一括 600 秒）で 1282 秒、追加学習（1 件 60 秒・一括 1500 秒）で
+/// 2×60 + 2×1500 + 60 + 猶予 2 = 3182 秒（どちらも `MAX_TIME_LIMIT` 3600 秒以内）。
+/// 追加学習の一括 1500 秒は Qwen 1.5B（凍結 test 324 件で約 700 秒）の 2 倍の余裕。7B（約 3470 秒）は収まらず対象外（既知の限界）。
 ///
 /// # Errors
 /// 上限が範囲外（定数から作るため通常は起きない）。
@@ -122,7 +124,7 @@ pub fn evaluate_config(limits: SafetyLimits) -> Result<RunConfig, ResourceConfig
         .time()
         .get()
         .saturating_mul(2)
-        .saturating_add(MAX_INFER_BATCH_DURATION.saturating_mul(2))
+        .saturating_add(limits.batch_duration().saturating_mul(2))
         .saturating_add(MAX_INFER_BATCH_OUTPUT_DURATION);
     config_with(inner, limits)
 }
@@ -558,22 +560,33 @@ mod tests {
         let t = supervisor_config(&text(), l).unwrap();
         assert_eq!(t.time_limit(), Duration::from_millis(62_500));
         assert_eq!(t.memory_limit(), Some(25_769_803_776));
+        // REQ-41・#662: 一括推論は 1500 秒 + 出力 60 秒 + 猶予 2 秒。
         let f = supervisor_config(&file(), l).unwrap();
-        assert_eq!(f.time_limit(), Duration::from_secs(662));
+        assert_eq!(f.time_limit(), Duration::from_secs(1562));
         assert_eq!(f.memory_limit(), Some(25_769_803_776));
     }
 
-    /// REQ-39・REQ-41・#662: `evaluate` の親の時間は `2 × limits.time() + 2 × 600 秒 + 60 秒 + 2 秒`。
-    /// 既存 3 種と未知の種類は 1282 秒・2 GiB、追加学習は 1382 秒・24 GiB。
+    /// REQ-39・REQ-41・#662: guard の既存 3 種の一括上限は runtime の `MAX_INFER_BATCH_DURATION`（600 秒）と同値。
     #[test]
-    fn req39_evaluate_config_is_1282_seconds_for_byte_kinds_and_1382_for_qwen2_lora() {
+    fn req39_strict_batch_duration_matches_runtime_constant() {
+        assert_eq!(
+            SafetyLimits::STRICT.batch_duration(),
+            fandhe_edge_runtime::pipeline::MAX_INFER_BATCH_DURATION
+        );
+    }
+
+    /// REQ-39・REQ-41・#662: `evaluate` の親の時間は `2 × limits.time() + 2 × 600 秒 + 60 秒 + 2 秒`。
+    /// 既存 3 種と未知の種類は 1282 秒・2 GiB、追加学習は 3182 秒・24 GiB。
+    #[test]
+    fn req39_req41_evaluate_config_is_1282_seconds_for_byte_kinds_and_3182_for_qwen2_lora() {
         for kind in ["c1", "c3", "autoregressive", "unknown"] {
             let c = evaluate_config(safety_limits_for_kind(kind)).unwrap();
             assert_eq!(c.time_limit(), Duration::from_secs(1282));
             assert_eq!(c.memory_limit(), Some(2_147_483_648));
         }
         let c = evaluate_config(safety_limits_for_kind("qwen2_lora")).unwrap();
-        assert_eq!(c.time_limit(), Duration::from_secs(1382));
+        assert_eq!(c.time_limit(), Duration::from_secs(3182));
+        assert!(c.time_limit() <= fandhe_edge_guard::resource::MAX_TIME_LIMIT);
         assert_eq!(c.memory_limit(), Some(25_769_803_776));
         // kind を読めなかったときの厳しい側は byte kind と同じ値になる。
         let s = evaluate_config(SafetyLimits::STRICT).unwrap();
