@@ -639,6 +639,9 @@ impl WriteFailure {
 ///
 /// # Errors
 /// [`emit_infer_batch_with_limits`] と同じ（`results` への書き込み失敗を含む）。
+// 引数が 8 個になるのは、本体 `emit_infer_batch_inner` へそのまま渡す入力・出力先 2 つ・定義・パイプラインに、
+// kind 別の一括上限（`batch_duration`。#662）が加わったため。呼び出し元は `infer --out` の 1 か所だけで、
+// 束ねる型を足しても組み立てが増えるだけなので引数のまま渡す。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_infer_batch_split<W, R, P, B>(
     out: &mut W,
