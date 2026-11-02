@@ -18,7 +18,7 @@
 
 ## 2. 採点グラフの構成（演算を導く参照設計）
 
-隠れ状態は 2 次元 `[rows, H]` で持つ。prefix は `rows=T`、選択肢ブロックは `rows=K*M`。線形層がすべて `Gemm(transB=1)` になり、重みを HF の (out, in) のまま bf16 で持てる（転置コピーを作らない）。
+隠れ状態は 2 次元 `[rows, H]` で持つ。prefix は `rows=T`、選択肢の木のノード列は `rows=N`（4 節）。線形層がすべて `Gemm(transB=1)` になり、重みを HF の (out, in) のまま bf16 で持てる（転置コピーを作らない）。
 
 1. 共通の前処理: `Reshape(ids,[-1])`。`Shape`・`Gather`（INT64 の形状から INT64 スカラー T を取る。出力は INT64 のまま `Range(0,T,1)` へ渡す）で位置を作り、`Cast`（INT64 → FLOAT）・`Unsqueeze`・`Mul(inv_freq)` から `Cos`・`Sin` で RoPE 表を作る。prefix の因果マスクは `Unsqueeze`・`Greater` → `Where(future, -1e30, s)`（Trilu は opset 14 のため使わない）
    - system 区間の同梱（#634）: 入力 `ids [N,T]` の先頭 P 列（`[im_start, encode("system\n"+system), im_end, encode("\n")]`。特殊トークンで区切られ区間ごとに encode されるため、入力テキストに依らず不変。P はラベル集合で決まる定数）は採点に使わない。先頭で `Slice(ids, P, ∞, axis=1)` して入力テキスト以降（長さ T-P）だけを forward する。入力側の位置は `Range(P, T)`、選択肢ブロックの位置は従来どおり `T + arange(M)`。グラフ入力の形 `ids [N,T]` は変えない。前提として実行時の `ids` は P+1 個以上（通常経路の `build_chat_ids` は P+3 以上を作る）。T<=P の拒否はグラフ内に無い
@@ -32,17 +32,17 @@
    - SwiGLU: `Sigmoid` → `Mul`（SiLU）、`Mul(up)` → `Gemm(down)`
    - 各層で RoPE 後の K と V をブロック側へ渡す
    - 同梱 K/V（#634）: system 区間の K/V（RoPE 適用後・位置 0〜P-1・f32）を層ごとの定数として持ち、入力側の prefix の K/V の前へ `Concat`（seq 軸）する。system の列は全行から見え、因果マスクは入力側の列に掛ける。定数は rank 2 `[nkv*P, hd]` の initializer で保存し、`Reshape` で `[1,nkv,1,P,hd]` に戻す。値は package 時に numpy f32 で層ごとに prefix forward して計算する（`qwen2_onnx.py`）
-4. 選択肢ブロック（K 件。長さ M に右 pad した定数 `cand: INT64 [K,M]`。pad は `endoftext`）
-   - 位置は `Add(Cast(T), arange(M))`（arange は定数）から RoPE 表
-   - prefix の KV（同梱の system 分を含む）を `Expand` で K 件に広げ、ブロックの KV と `Concat`（seq 軸）で連結する
-   - スコアに加算マスクを足す。prefix は全位置を見せ、ブロック内は因果（`Where`）。pad は実 token の後ろにあるため、因果マスクで実 token からは見えない
+4. 選択肢の木のノード列（REQ-41・#684。選択肢の token 列〔ラベル＋`<|im_end|>`〕を木にし、異なる接頭辞を 1 ノードとする。N = ノード数、ノードは (深さ, 接頭辞) の昇順で入力順に依らず決定的。親が子より先）
+   - ノード列を `b=1`・長さ N で全層へ通す。入力は `Gather(embed, node_token[N])`。位置は `Add(T, depth)`（depth は定数。0 始まり）から RoPE 表
+   - K/V の `Expand` は無い。prefix の KV（同梱の system 分を含む）をそのまま連結し、ノードの KV と `Concat`（seq 軸）で連結する
+   - 加算マスク `[N, T+N]`（FLOAT。遮蔽 = -1e30）: prefix 側 T 列は全部見え（0）、ノード側 N 列は自分と祖先だけ見える（定数）。T 列分の 0 は `Cast(Range)`・`Mul(0)`・`Add` で作り、定数と `Concat` する（BOOL は Concat 対象外のため `Where` ではなくスコアへ `Add` する）
    - 残りは prefix の層と同じ演算
 5. 採点
-   - 予測に使う行: prefix の最後の行（`Slice` → `Expand` で K 件）とブロックの先頭 M-1 行（`Slice`）を `Concat` → `Reshape([K*M,H])`
-   - 最終 RMSNorm → `Gemm(h, Cast(embed_bf16 または lm_head_bf16), transB=1)` → `Reshape([K,M,V])`。tie でも非 tie でも同じ形で、Transpose は要らない
-   - `LogSoftmax` → `GatherElements(index=cand に次元を足した [K,M,1])`（行 j の予測対象は cand[j]。上の「予測に使う行」で prefix の最終行とブロック先頭 M-1 行を連結済みのため、ずらさない。`score.py::score_chunk` が位置 p-1+j に対し c[j] を採点するのと一致。REQ-41） → `Mul`（有効位置の重み定数。pad 位置は 0）→ `ReduceSum` → `[K]`
-   - `Unsqueeze` → `Softmax` で `probs [1,K]`。この Softmax だけ f64
-   - logits は `K*M` 行だけ計算する（PoC の全 T 行より少ない）
+   - lm_head の行: prefix の最終行（root）と、子を持つノードの行（`Gather` → `Concat`）。行数 = 接頭辞の親の種類数（root 含む）
+   - 最終 RMSNorm → `Gemm(h, Cast(embed_bf16 または lm_head_bf16), transB=1)` → `LogSoftmax`（`[P,V]`）。tie でも非 tie でも同じ形で、Transpose は要らない
+   - `GatherElements(index=親の行ごとの子 token の定数 [P,C])`→ `Reshape([-1])` → `Gather(index=ノードごとの位置の定数 [N])`（余りの枠はここで捨てる）→ `Reshape([-1,1])` → `MatMul(経路行列 [K,N], ·)` で各選択肢の対数尤度（経路上のノードの対数確率の和）`[K,1]`
+   - `Reshape([1,K])` → `Softmax` で `probs [1,K]`。この Softmax だけ f64
+   - 行数の例（Playwright MCP の実パッケージ K=26・M=6）: 全層 156 → 70、lm_head 156 → 45（#684）
 6. 不採用の案
    - OneHot＋ReduceSum による対数尤度の取り出し: GatherElements の 1 演算で足りる
    - スコアを Concat して KV の Expand を避ける案: 演算が増える。Expand のコピーは層ごとに一時的（推定: 数十 MB 程度）
@@ -69,7 +69,7 @@
 | Concat | RoPE・KV の seq 連結（同梱 K/V を含む）・行の連結 | axis を明示する。入力数に上限 | #417 |
 | Slice | 最後の行・ブロックの前半・入力 ids の先頭 P 列の除外（#634） | starts・ends・axes は入力。steps は省略か 1 | #417 |
 | Split | RoPE の半分割 | `axis=-1`。split は入力で、等分 2 つ | #417 |
-| Expand | prefix の KV・最後の行を K 件に複製 | shape は INT64 の入力 | #417 |
+| Expand | 旧グラフ（#684 前）の prefix の KV・最後の行を K 件に複製。新グラフは使わない | shape は INT64 の入力 | #417 |
 | ReduceMean | RMSNorm | axes は属性で `[-1]`。`keepdims=1` | #418 |
 | ReduceSum | 対数尤度の合計 | axes は入力（opset 13）。`keepdims=0`。`noop_with_empty_axes=0` | #418 |
 | Sigmoid | SiLU | FLOAT | #418 |

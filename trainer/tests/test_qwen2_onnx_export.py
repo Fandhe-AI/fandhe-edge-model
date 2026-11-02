@@ -370,3 +370,56 @@ def test_invalid_system_ids_is_runtime_error(base, bad) -> None:
     with pytest.raises(WorkerError) as e:
         qo.export_scoring_onnx(base, io.BytesIO(), lambda n: Keep(), system_ids=bad)
     assert e.value.exit_code == ExitCode.RUNTIME_ERROR
+
+
+def test_choice_trie_counts_and_order() -> None:
+    """REQ-41・#684: `[a,b,E] [a,c,E] [d,E]` のノード数・lm_head 行数・順序が入力順に依らない。"""
+    a, b, c, d, e = 1, 2, 3, 4, 9
+    t = qo._choice_trie([[a, b, e], [a, c, e], [d, e]])
+    # ノード 7 個（旧構造は 3*3=9 行）。深さ・接頭辞の昇順
+    assert t.token == [a, d, b, c, e, e, e]
+    assert t.depth == [0, 0, 1, 1, 1, 2, 2]
+    # lm_head の行は root と子を持つ (a)・(a,b)・(a,c)・(d) の 5 行（root 以外のノード添字）
+    assert t.rows == [0, 1, 2, 3]
+    assert t.slots.shape[0] == 5
+    assert t.path.sum(axis=1).tolist() == [3.0, 3.0, 2.0]
+    assert qo._choice_trie([[d, e], [a, c, e], [a, b, e]]).token == t.token
+    # (a,b)（添字 2）は自分と祖先 (a)（添字 0）だけ見える
+    neg = float(np.float32(qo.NEG))
+    assert t.anc[2].tolist() == [0.0, neg, 0.0] + [neg] * 4
+
+
+def test_choice_trie_size_limit() -> None:
+    """REQ-39・#684: 定数行列を確保する前に大きさを検査する。上限の選択肢数の平坦な木は通る。"""
+    t = qo._choice_trie([[i, 99_999] for i in range(1024)])
+    assert t.anc.nbytes + t.slots.nbytes + t.path.nbytes == 33_562_624
+    with pytest.raises(WorkerError) as e:
+        qo._choice_trie([[i, 99_999] for i in range(2000)])
+    assert e.value.code == "limit_exceeded"
+
+
+@pytest.mark.parametrize(
+    "seqs",
+    [
+        [[5, 6, 9], [5, 7, 9], [8, 9]],  # 共通の頭あり・長さ違い
+        [[5, 9], [6, 6, 6, 9]],  # 2 個
+        [[5, 9], [6, 9], [7, 9], [8, 9]],  # 共通の頭なし
+        [[5, 6, 7, 9], [5, 6, 7, 9]],  # 同じ列の重複
+    ],
+)
+def test_trie_graph_matches_naive_scoring(base, monkeypatch, seqs, tmp_path) -> None:
+    """REQ-41・#684: 木のグラフの確率が、選択肢ごとに全行を計算する素朴な採点と一致する。"""
+    monkeypatch.setattr(qo, "choice_token_ids", lambda *_a, **_k: seqs)
+    t = _stand_in(base, base.model.config)
+    mb, shards, _ = export(t, shard_max_bytes=SHARD_MAX, external_threshold=THRESHOLD)
+    ids = t.tokenizer.build_chat_ids(
+        q.build_system_prompt(t.label_order), "hello", add_generation_prompt=True
+    )
+    run = evaluator(load(mb, shards, tmp_path))
+    # 通常の入力と、入力テキストが 1 token（T=P+1）の境界
+    for cur in (ids, ids[: len(_sys_ids(t)) + 1]):
+        ll = q.score_labels(reference_model(t), cur, seqs, 0)
+        want = np.exp(ll - ll.max())
+        want /= want.sum()
+        (got,) = run.run(None, {"ids": np.array([cur], dtype=np.int64)})
+        np.testing.assert_allclose(got[0], want, atol=TOL)

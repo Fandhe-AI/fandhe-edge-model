@@ -5,7 +5,10 @@
 グラフで、入出力契約は `ids: INT64 [N,T]` → `probs: FLOAT [N,K]`（N は常に 1）。選択肢の
 採点（ラベル token 列＋`<|im_end|>` の対数尤度の合計 → 選択肢間 softmax。`kinds/qwen2_lora.py` の
 `score_chunk` と同じ）はグラフの中で行い、共通 prefix は 1 回だけ forward して各層の K/V を
-選択肢ブロックから参照する（KV の使い回し）。
+選択肢ブロックから参照する（KV の使い回し）。選択肢の token 列は木（接頭辞 = ノード）にし、
+共通の頭と pad の行を計算しない: ノード列を b=1 で全層へ通し（各ノードは prefix の全部と
+自分の祖先だけを見て、RoPE の位置は T＋深さ）、lm_head は root と子を持つノードの行だけ、
+各選択肢の対数尤度は経路上のノードの対数確率の和にする（REQ-41・#684）。
 system 区間（`ids` の先頭 P 個。入力に依らず不変）の K/V は書き出し時に numpy（f32）で求めて
 f32 の initializer として同梱し、グラフは `ids[:, P:]` だけを forward する（REQ-41・#634）。
 グラフ入力は従来どおり全体の `ids` で、`ids[:P]` は読み捨てる（system 区間の一致は呼び出し側が
@@ -238,37 +241,39 @@ def _layer(
     d: _Dims,
     w: dict[str, str],
     x: str,
-    b: int,
     cs: tuple[str, str],
     mask: str,
     kv_prefix: tuple[str, str] | None,
+    *,
+    additive_mask: bool = False,
 ) -> tuple[str, str, str]:
-    """1 層。入力テキスト（b=1・kv_prefix は system の同梱 K/V）と選択肢ブロック（b=K・
-    kv_prefix は system＋入力テキストの K/V）で共有する。
+    """1 層。入力テキスト（kv_prefix は system の同梱 K/V）と選択肢の木のノード列（
+    kv_prefix は system＋入力テキストの K/V。#684）で共有する。
 
-    隠れ状態は `[b*S, H]`。`(出力, K, V)` を返し、K・V は kv_prefix を連結した後の
-    RoPE 後 `[b, nkv, 1, 全長, hd]`（次の段の kv_prefix にそのまま使える）。
+    `additive_mask` が偽なら mask は BOOL（真 = 遮蔽）で `Where`、真なら FLOAT（遮蔽 = NEG）で
+    スコアに加える（BOOL は Concat できないため、実行時に長さが決まる列を含む mask に使う）。
+
+    隠れ状態は `[S, H]`。`(出力, K, V)` を返し、K・V は kv_prefix を連結した後の
+    RoPE 後 `[1, nkv, 1, 全長, hd]`（次の段の kv_prefix にそのまま使える）。
     """
     nh, nkv, hd, grp = d.nh, d.nkv, d.hd, d.grp
     a = _rms(g, d, x, w["ln1"])
-    q = g.op("Reshape", [_lin(g, a, w["q"], w["qb"]), g.i64(b, -1, nkv, grp, hd)])
-    q = _rope(g, g.op("Transpose", [q], perm=[0, 2, 3, 1, 4]), cs, hd)  # [b,nkv,grp,S,hd]
-    k = g.op("Reshape", [_lin(g, a, w["k"], w["kb"]), g.i64(b, -1, nkv, hd)])
+    q = g.op("Reshape", [_lin(g, a, w["q"], w["qb"]), g.i64(1, -1, nkv, grp, hd)])
+    q = _rope(g, g.op("Transpose", [q], perm=[0, 2, 3, 1, 4]), cs, hd)  # [1,nkv,grp,S,hd]
+    k = g.op("Reshape", [_lin(g, a, w["k"], w["kb"]), g.i64(1, -1, nkv, hd)])
     k = _rope(g, g.op("Transpose", [k], perm=[0, 2, 1, 3]), cs, hd)
-    k = g.op("Unsqueeze", [k, g.i64(2)])  # [b,nkv,1,S,hd]
-    v = g.op("Reshape", [_lin(g, a, w["v"], w["vb"]), g.i64(b, -1, nkv, hd)])
+    k = g.op("Unsqueeze", [k, g.i64(2)])  # [1,nkv,1,S,hd]
+    v = g.op("Reshape", [_lin(g, a, w["v"], w["vb"]), g.i64(1, -1, nkv, hd)])
     v = g.op("Unsqueeze", [g.op("Transpose", [v], perm=[0, 2, 1, 3]), g.i64(2)])
     kf, vf = k, v
     if kv_prefix is not None:
         pk, pv = kv_prefix
-        if b != 1:
-            shape = g.i64(b, 1, 1, 1, 1)
-            pk, pv = g.op("Expand", [pk, shape]), g.op("Expand", [pv, shape])
         kf = g.op("Concat", [pk, k], axis=3)
         vf = g.op("Concat", [pv, v], axis=3)
     s = g.op("MatMul", [q, g.op("Transpose", [kf], perm=[0, 1, 2, 4, 3])])
-    s = g.op("Where", [mask, g.const(NEG), g.op("Mul", [s, g.const(hd**-0.5)])])
-    ctx = g.op("MatMul", [g.op("Softmax", [s], axis=-1), vf])  # [b,nkv,grp,S,hd]
+    s = g.op("Mul", [s, g.const(hd**-0.5)])
+    s = g.op("Add", [s, mask]) if additive_mask else g.op("Where", [mask, g.const(NEG), s])
+    ctx = g.op("MatMul", [g.op("Softmax", [s], axis=-1), vf])  # [1,nkv,grp,S,hd]
     ctx = g.op("Reshape", [g.op("Transpose", [ctx], perm=[0, 3, 1, 2, 4]), g.i64(-1, nh * hd)])
     h = g.op("Add", [x, _lin(g, ctx, w["o"])])
     m = _rms(g, d, h, w["ln2"])
@@ -308,7 +313,7 @@ def _np_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
 def _np_prefix_layer(
     d: _Dims, rw: dict[str, np.ndarray], x: np.ndarray, rope: tuple[np.ndarray, np.ndarray]
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """system 区間 1 層分の f32 forward（`_layer` の b=1・kv_prefix なしと同じ式）。
+    """system 区間 1 層分の f32 forward（`_layer` の kv_prefix なしと同じ式）。
 
     `rw` は bf16 丸め済み（グラフの `Cast(bf16→f32)` 後と同値）の重み。`(出力, K, V)` を返し、
     K・V は RoPE 後の `[nkv, P, hd]`。縮約順は onnx / Rust と異なりうる。K/V の直接比較は
@@ -366,21 +371,15 @@ def export_scoring_onnx(
     cap = limits.max_model_bytes_for_kind("qwen2_lora")
     if c.estimated_params() * 2 > cap:
         raise _limit("estimated model size exceeds the limit")
-    cand = np.array(
-        _pad(choice_token_ids(tok, order, c.vocab_size), tok.special_ids["endoftext"]),
-        dtype=np.int64,
-    )  # [K, M]
-    k_n, m = cand.shape
-    if m < 2:  # ラベル 1 token 以上＋im_end なので起きない。起きたらグラフの前提が崩れる
-        raise WorkerError("runtime_error", "choice block is too short", ExitCode.RUNTIME_ERROR)
-    weights = np.zeros((k_n, m), dtype=np.float32)
-    for i, ids in enumerate(choice_token_ids(tok, order, c.vocab_size)):
-        weights[i, : len(ids)] = 1.0  # pad 位置は 0
+    seqs = choice_token_ids(tok, order, c.vocab_size)
+    # ラベル 1 token 以上＋im_end なので起きない。起きたら前提が崩れる
+    if any(len(x) < 2 for x in seqs):
+        raise WorkerError("runtime_error", "choice sequence is too short", ExitCode.RUNTIME_ERROR)
 
     shards = _Shards(open_shard, shard_max_bytes)
     try:
         g = _Graph(shards, external_threshold, trained.resource_budget)
-        proto = _build(g, model, c, cand, weights, k_n, m, system_ids)
+        proto = _build(g, model, c, _choice_trie(seqs), len(seqs), system_ids)
         shards_done = shards.finish()
     except BaseException:
         shards._close()  # 途中で止めても開いた shard は閉じる
@@ -411,19 +410,74 @@ def _check(proto: onnx.ModelProto) -> None:
     onnx.checker.check_model(copy, full_check=True)
 
 
-def _pad(rows: list[list[int]], pad_id: int) -> list[list[int]]:
-    m = max(len(r) for r in rows)
-    return [r + [pad_id] * (m - len(r)) for r in rows]
+@dataclass(frozen=True)
+class _Trie:
+    """選択肢の token 列の木（REQ-41・#684）。ノード = 空でない異なる接頭辞。
+
+    ノードは (深さ, 接頭辞) の昇順で並べる（入力順に依らず決定的。親が子より先）。
+    `parents` は子を持つ接頭辞（空接頭辞 = root を先頭）で、lm_head の行になる。
+    """
+
+    token: list[int]  # ノードの最後の token [N]
+    depth: list[int]  # 0 始まりの深さ [N]
+    anc: np.ndarray  # [N,N] f32。ノード c が i の祖先または自分なら 0、それ以外は NEG
+    rows: list[int]  # 子を持つノード（root 以外）の添字。lm_head の行 1.. に対応
+    slots: np.ndarray  # [P,C] int64。親の行ごとの子 token（余りは 0）
+    node_slot: np.ndarray  # [N] int64。ノードごとの、slots を平坦にしたときの位置
+    path: np.ndarray  # [K,N] f32。選択肢の経路上のノードを 1 にする
+
+
+# 木の定数行列（anc・slots・path）は model.onnx に inline で入る。runtime の上限
+# `MAX_MODEL_FILE_BYTES`（44 MiB）に残りのグラフの余地を残した値（REQ-39・#684）。
+# 1024 選択肢（`MAX_META_LABELS`）が全部 1 token＋終端でも約 32 MiB で収まる。
+_MAX_TRIE_CONST_BYTES = 40 * 1024 * 1024
+
+
+def _choice_trie(seqs: list[list[int]]) -> _Trie:
+    prefixes = sorted(
+        {tuple(s[:i]) for s in seqs for i in range(1, len(s) + 1)}, key=lambda p: (len(p), p)
+    )
+    index = {p: i for i, p in enumerate(prefixes)}
+    parents = sorted({p[:-1] for p in prefixes}, key=lambda p: (len(p), p))  # () が先頭
+    children: dict[tuple[int, ...], list[tuple[int, ...]]] = {q: [] for q in parents}
+    for p in prefixes:
+        children[p[:-1]].append(p)
+    width = max(len(v) for v in children.values())
+    n_nodes, n_rows = len(prefixes), len(parents)
+    # 行列を確保する前に必要量を検査する（REQ-39）
+    if n_nodes**2 * 4 + n_rows * width * 8 + len(seqs) * n_nodes * 4 > _MAX_TRIE_CONST_BYTES:
+        raise _limit("choice tree is too large")
+    node_slot = np.zeros(n_nodes, dtype=np.int64)
+    slots = np.zeros((len(parents), width), dtype=np.int64)
+    for r, q in enumerate(parents):
+        for j, p in enumerate(children[q]):
+            node_slot[index[p]] = r * width + j
+            slots[r, j] = p[-1]
+    anc = np.full((len(prefixes), len(prefixes)), NEG, dtype=np.float32)
+    for i, p in enumerate(prefixes):
+        for n in range(1, len(p) + 1):
+            anc[i, index[p[:n]]] = 0.0
+    path = np.zeros((len(seqs), n_nodes), dtype=np.float32)
+    for k, sq in enumerate(seqs):
+        for n in range(1, len(sq) + 1):
+            path[k, index[tuple(sq[:n])]] = 1.0
+    return _Trie(
+        token=[p[-1] for p in prefixes],
+        depth=[len(p) - 1 for p in prefixes],
+        anc=anc,
+        rows=[index[q] for q in parents[1:]],
+        slots=slots,
+        node_slot=node_slot,
+        path=path,
+    )
 
 
 def _build(
     g: _Graph,
     model: Any,
     c: Any,
-    cand: np.ndarray,
-    weights: np.ndarray,
+    trie: _Trie,
     k_n: int,
-    m: int,
     system_ids: list[int],
 ) -> onnx.ModelProto:
     d = _Dims(c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.rms_norm_eps)
@@ -449,16 +503,20 @@ def _build(
     t_len = g.op("Gather", [g.op("Shape", [ids]), g.const(1, np.int64)], axis=0)
     zero, one = g.const(0, np.int64), g.const(1, np.int64)
     pos = g.op("Range", [g.const(n_sys, np.int64), t_len, one])  # 入力テキストの位置 P..T-1
-    bpos = g.op("Add", [t_len, g.const(np.arange(m), np.int64)])  # [M]。ブロックの位置
     keys = g.op("Range", [zero, t_len, one])  # 入力テキスト側のキー位置 0..T-1
-    total = g.op("Range", [zero, g.op("Add", [t_len, g.const(m, np.int64)]), one])
-    # 因果マスク（真 = 遮蔽）。入力は [T-P,T]、ブロックは [M,T+M]（入力・system は全部見える）
+    # 入力テキストの因果マスク（真 = 遮蔽）
     pmask = g.op(
         "Greater", [g.op("Unsqueeze", [keys, g.i64(0)]), g.op("Unsqueeze", [pos, g.i64(1)])]
     )
-    bmask = g.op(
-        "Greater", [g.op("Unsqueeze", [total, g.i64(0)]), g.op("Unsqueeze", [bpos, g.i64(1)])]
+    # 選択肢の木のノード列: 位置は T + 深さ。マスクは [N,T+N] の加算形式で、prefix 側 T 列は
+    # 全部見え（0）、ノード側 N 列は自分と祖先だけ見える（REQ-41・#684）
+    n_nodes = len(trie.token)
+    bpos = g.op("Add", [t_len, g.const(trie.depth, np.int64)])  # [N]
+    zrow = g.op("Mul", [g.op("Cast", [keys], to=TensorProto.FLOAT), g.const(0.0)])  # [T]
+    zeros = g.op(
+        "Add", [g.op("Unsqueeze", [zrow, g.i64(0)]), g.const(np.zeros((n_nodes, 1), np.float32))]
     )
+    bmask = g.op("Concat", [zeros, g.const(trie.anc)], axis=1)
     pcs, bcs = _rope_table(g, pos, d.hd, c.rope_theta), _rope_table(g, bpos, d.hd, c.rope_theta)
 
     layer_w: list[dict[str, str]] = []
@@ -494,38 +552,30 @@ def _build(
         sx, sk, sv = _np_prefix_layer(d, rw, sx, srope)
         pk = g.op("Reshape", [g.kv(p + "sysk", sk.reshape(-1, d.hd)), kv_shape])
         pv = g.op("Reshape", [g.kv(p + "sysv", sv.reshape(-1, d.hd)), kv_shape])
-        x, k, v = _layer(g, d, w, x, 1, pcs, pmask, (pk, pv))
+        x, k, v = _layer(g, d, w, x, pcs, pmask, (pk, pv))
         kvs.append((k, v))
     last = g.op("Slice", [x, g.i64(-1), g.i64(_INT64_MAX), g.i64(0)])  # 入力テキストの最終行 [1,H]
 
-    y = g.op("Gather", [embed, g.const(cand, np.int64)], axis=0)  # [K,M,H]
-    y = g.op("Reshape", [y, g.i64(-1, c.hidden_size)])
+    y = g.op("Gather", [embed, g.const(trie.token, np.int64)], axis=0)  # [N,H]
     for w, kv in zip(layer_w, kvs, strict=True):
-        y, _, _ = _layer(g, d, w, y, k_n, bcs, bmask, kv)
+        y, _, _ = _layer(g, d, w, y, bcs, bmask, kv, additive_mask=True)
 
-    # 行 j の予測対象は cand[j]（先頭は prefix の最終行、以降はブロックの先頭 M-1 行）
-    y = g.op("Reshape", [y, g.i64(k_n, m, c.hidden_size)])
-    y = g.op("Slice", [y, g.i64(0), g.i64(m - 1), g.i64(1)])
-    head = g.op("Expand", [g.op("Reshape", [last, g.i64(1, 1, c.hidden_size)]), g.i64(k_n, 1, 1)])
-    h = g.op("Reshape", [g.op("Concat", [head, y], axis=1), g.i64(-1, c.hidden_size)])
+    # lm_head は root（入力テキストの最終行）と子を持つノードの行だけ。行 r の次 token の
+    # 対数確率を slots[r] で拾い、各選択肢の対数尤度を経路の和（path との積）にする
+    rows = g.op("Gather", [y, g.const(trie.rows, np.int64)], axis=0)
+    h = g.op("Concat", [last, rows], axis=0)
     h = _rms(g, d, h, g.weight("norm", _f32(inner.norm.weight)))
     if c.tie_word_embeddings:
         lm = embed
     else:
         lm = g.weight("lm_head", _f32(model.lm_head.weight))
-    logp = g.op(
-        "LogSoftmax",
-        [g.op("Reshape", [g.op("Gemm", [h, lm], transB=1), g.i64(k_n, m, -1)])],
-        axis=-1,
-    )
-    picked = g.op(
-        "GatherElements",
-        [logp, g.op("Unsqueeze", [g.const(cand, np.int64), g.i64(2)])],
-        axis=2,
-    )  # [K,M,1]。最後の軸（ONNX 1.23 の ReferenceEvaluator は axis=-1 を受け付けないため正の値）
-    picked = g.op("Reshape", [picked, g.i64(k_n, m)])
-    ll = g.op("ReduceSum", [g.op("Mul", [picked, g.const(weights)]), g.i64(1)], keepdims=0)
-    g.op("Softmax", [g.op("Unsqueeze", [ll, g.i64(0)])], out="probs", axis=-1)
+    logp = g.op("LogSoftmax", [g.op("Gemm", [h, lm], transB=1)], axis=-1)  # [P,V]
+    # 最後の軸（ONNX 1.23 の ReferenceEvaluator は axis=-1 を受け付けないため正の値）
+    picked = g.op("GatherElements", [logp, g.const(trie.slots, np.int64)], axis=1)  # [P,C]
+    flat = g.op("Reshape", [picked, g.i64(-1)])
+    node_logp = g.op("Gather", [flat, g.const(trie.node_slot, np.int64)], axis=0)  # [N]
+    ll = g.op("MatMul", [g.const(trie.path), g.op("Reshape", [node_logp, g.i64(-1, 1)])])  # [K,1]
+    g.op("Softmax", [g.op("Reshape", [ll, g.i64(1, -1)])], out="probs", axis=-1)
 
     graph = helper.make_graph(
         g.nodes,
