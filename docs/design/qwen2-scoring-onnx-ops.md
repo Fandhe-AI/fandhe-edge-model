@@ -40,7 +40,7 @@
 5. 採点
    - lm_head の行: prefix の最終行（root）と、子を持つノードの行（`Gather` → `Concat`）。行数 = 接頭辞の親の種類数（root 含む）
    - 最終 RMSNorm → `Gemm(h, Cast(embed_bf16 または lm_head_bf16), transB=1)` → `LogSoftmax`（`[P,V]`）。tie でも非 tie でも同じ形で、Transpose は要らない
-   - `GatherElements(index=親の行ごとの子 token の定数 [P,C])`（余りの枠は 0 で、経路行列の重み 0 により捨てる）→ `Reshape([-1,1])` → `MatMul(経路行列 [K,P*C], ·)` で各選択肢の対数尤度（経路上のノードの対数確率の和）`[K,1]`
+   - `GatherElements(index=親の行ごとの子 token の定数 [P,C])`→ `Reshape([-1])` → `Gather(index=ノードごとの位置の定数 [N])`（余りの枠はここで捨てる）→ `Reshape([-1,1])` → `MatMul(経路行列 [K,N], ·)` で各選択肢の対数尤度（経路上のノードの対数確率の和）`[K,1]`
    - `Reshape([1,K])` → `Softmax` で `probs [1,K]`。この Softmax だけ f64
    - 行数の例（Playwright MCP の実パッケージ K=26・M=6）: 全層 156 → 70、lm_head 156 → 45（#684）
 6. 不採用の案

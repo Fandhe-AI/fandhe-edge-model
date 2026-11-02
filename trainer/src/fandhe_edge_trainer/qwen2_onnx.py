@@ -423,7 +423,14 @@ class _Trie:
     anc: np.ndarray  # [N,N] f32。ノード c が i の祖先または自分なら 0、それ以外は NEG
     rows: list[int]  # 子を持つノード（root 以外）の添字。lm_head の行 1.. に対応
     slots: np.ndarray  # [P,C] int64。親の行ごとの子 token（余りは 0）
-    path: np.ndarray  # [K,P*C] f32。選択肢の経路上のノードの slot を 1 にする
+    node_slot: np.ndarray  # [N] int64。ノードごとの、slots を平坦にしたときの位置
+    path: np.ndarray  # [K,N] f32。選択肢の経路上のノードを 1 にする
+
+
+# 木の定数行列（anc・slots・path）は model.onnx に inline で入る。runtime の上限
+# `MAX_MODEL_FILE_BYTES`（44 MiB）に残りのグラフの余地を残した値（REQ-39・#684）。
+# 1024 選択肢（`MAX_META_LABELS`）が全部 1 token＋終端でも約 32 MiB で収まる。
+_MAX_TRIE_CONST_BYTES = 40 * 1024 * 1024
 
 
 def _choice_trie(seqs: list[list[int]]) -> _Trie:
@@ -436,26 +443,31 @@ def _choice_trie(seqs: list[list[int]]) -> _Trie:
     for p in prefixes:
         children[p[:-1]].append(p)
     width = max(len(v) for v in children.values())
-    slot_of: dict[tuple[int, ...], int] = {}
+    n_nodes, n_rows = len(prefixes), len(parents)
+    # 行列を確保する前に必要量を検査する（REQ-39）
+    if n_nodes**2 * 4 + n_rows * width * 8 + len(seqs) * n_nodes * 4 > _MAX_TRIE_CONST_BYTES:
+        raise _limit("choice tree is too large")
+    node_slot = np.zeros(n_nodes, dtype=np.int64)
     slots = np.zeros((len(parents), width), dtype=np.int64)
     for r, q in enumerate(parents):
         for j, p in enumerate(children[q]):
-            slot_of[p] = r * width + j
+            node_slot[index[p]] = r * width + j
             slots[r, j] = p[-1]
     anc = np.full((len(prefixes), len(prefixes)), NEG, dtype=np.float32)
     for i, p in enumerate(prefixes):
         for n in range(1, len(p) + 1):
             anc[i, index[p[:n]]] = 0.0
-    path = np.zeros((len(seqs), len(parents) * width), dtype=np.float32)
+    path = np.zeros((len(seqs), n_nodes), dtype=np.float32)
     for k, sq in enumerate(seqs):
         for n in range(1, len(sq) + 1):
-            path[k, slot_of[tuple(sq[:n])]] = 1.0
+            path[k, index[tuple(sq[:n])]] = 1.0
     return _Trie(
         token=[p[-1] for p in prefixes],
         depth=[len(p) - 1 for p in prefixes],
         anc=anc,
         rows=[index[q] for q in parents[1:]],
         slots=slots,
+        node_slot=node_slot,
         path=path,
     )
 
@@ -560,7 +572,9 @@ def _build(
     logp = g.op("LogSoftmax", [g.op("Gemm", [h, lm], transB=1)], axis=-1)  # [P,V]
     # 最後の軸（ONNX 1.23 の ReferenceEvaluator は axis=-1 を受け付けないため正の値）
     picked = g.op("GatherElements", [logp, g.const(trie.slots, np.int64)], axis=1)  # [P,C]
-    ll = g.op("MatMul", [g.const(trie.path), g.op("Reshape", [picked, g.i64(-1, 1)])])  # [K,1]
+    flat = g.op("Reshape", [picked, g.i64(-1)])
+    node_logp = g.op("Gather", [flat, g.const(trie.node_slot, np.int64)], axis=0)  # [N]
+    ll = g.op("MatMul", [g.const(trie.path), g.op("Reshape", [node_logp, g.i64(-1, 1)])])  # [K,1]
     g.op("Softmax", [g.op("Reshape", [ll, g.i64(1, -1)])], out="probs", axis=-1)
 
     graph = helper.make_graph(

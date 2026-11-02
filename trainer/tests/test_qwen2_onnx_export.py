@@ -389,6 +389,15 @@ def test_choice_trie_counts_and_order() -> None:
     assert t.anc[2].tolist() == [0.0, neg, 0.0] + [neg] * 4
 
 
+def test_choice_trie_size_limit() -> None:
+    """REQ-39・#684: 定数行列を確保する前に大きさを検査する。上限の選択肢数の平坦な木は通る。"""
+    t = qo._choice_trie([[i, 99_999] for i in range(1024)])
+    assert t.anc.nbytes + t.slots.nbytes + t.path.nbytes == 33_562_624
+    with pytest.raises(WorkerError) as e:
+        qo._choice_trie([[i, 99_999] for i in range(2000)])
+    assert e.value.code == "limit_exceeded"
+
+
 @pytest.mark.parametrize(
     "seqs",
     [
