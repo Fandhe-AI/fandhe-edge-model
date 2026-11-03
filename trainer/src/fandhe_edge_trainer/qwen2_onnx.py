@@ -6,9 +6,11 @@
 採点（ラベル token 列＋`<|im_end|>` の対数尤度の合計 → 選択肢間 softmax。`kinds/qwen2_lora.py` の
 `score_chunk` と同じ）はグラフの中で行い、共通 prefix は 1 回だけ forward して各層の K/V を
 選択肢ブロックから参照する（KV の使い回し）。選択肢の token 列は木（接頭辞 = ノード）にし、
-共通の頭と pad の行を計算しない: ノード列を b=1 で全層へ通し（各ノードは prefix の全部と
-自分の祖先だけを見て、RoPE の位置は T＋深さ）、lm_head は root と子を持つノードの行だけ、
-各選択肢の対数尤度は経路上のノードの対数確率の和にする（REQ-41・#684）。
+共通の頭と pad の行を計算しない: 子を持つノードだけを b=1 で全層へ通し（各ノードは prefix の
+全部と自分の祖先だけを見て、RoPE の位置は T＋深さ）、lm_head は root と層を通した全行、
+各選択肢の対数尤度は経路上のノード（葉を含む）の対数確率の和にする。葉（選択肢の終端）は
+層の出力がどこにも使われないので通さず、葉の対数確率は親の行の lm_head から拾う
+（REQ-41・#684）。
 system 区間（`ids` の先頭 P 個。入力に依らず不変）の K/V は書き出し時に numpy（f32）で求めて
 f32 の initializer として同梱し、グラフは `ids[:, P:]` だけを forward する（REQ-41・#634）。
 グラフ入力は従来どおり全体の `ids` で、`ids[:P]` は読み捨てる（system 区間の一致は呼び出し側が
@@ -416,20 +418,21 @@ class _Trie:
 
     ノードは (深さ, 接頭辞) の昇順で並べる（入力順に依らず決定的。親が子より先）。
     `parents` は子を持つ接頭辞（空接頭辞 = root を先頭）で、lm_head の行になる。
+    層へ通すのは子を持つノード（`parents[1:]`。L 個）だけ。全ノード（葉を含む N 個）は
+    `node_slot`・`path` の長さにだけ現れ、L 個と取り違えない。
     """
 
-    token: list[int]  # ノードの最後の token [N]
-    depth: list[int]  # 0 始まりの深さ [N]
-    anc: np.ndarray  # [N,N] f32。ノード c が i の祖先または自分なら 0、それ以外は NEG
-    rows: list[int]  # 子を持つノード（root 以外）の添字。lm_head の行 1.. に対応
-    slots: np.ndarray  # [P,C] int64。親の行ごとの子 token（余りは 0）
-    node_slot: np.ndarray  # [N] int64。ノードごとの、slots を平坦にしたときの位置
-    path: np.ndarray  # [K,N] f32。選択肢の経路上のノードを 1 にする
+    token: list[int]  # 層へ通すノード（子を持つもの）の最後の token [L]
+    depth: list[int]  # 層へ通すノードの 0 始まりの深さ [L]
+    anc: np.ndarray  # [L,L] f32。層へ通すノード c が i の祖先または自分なら 0、それ以外は NEG
+    slots: np.ndarray  # [R,C] int64。親の行（R = L+1。root が先頭）ごとの子 token（余りは 0）
+    node_slot: np.ndarray  # [N] int64。全ノードごとの、slots を平坦にしたときの位置
+    path: np.ndarray  # [K,N] f32。選択肢の経路上の全ノードを 1 にする
 
 
 # 木の定数行列（anc・slots・path）は model.onnx に inline で入る。runtime の上限
 # `MAX_MODEL_FILE_BYTES`（44 MiB）に残りのグラフの余地を残した値（REQ-39・#684）。
-# 1024 選択肢（`MAX_META_LABELS`）が全部 1 token＋終端でも約 32 MiB で収まる。
+# 1024 選択肢（`MAX_META_LABELS`）が全部 1 token＋終端なら約 21 MB で収まる。
 _MAX_TRIE_CONST_BYTES = 40 * 1024 * 1024
 
 
@@ -444,8 +447,13 @@ def _choice_trie(seqs: list[list[int]]) -> _Trie:
         children[p[:-1]].append(p)
     width = max(len(v) for v in children.values())
     n_nodes, n_rows = len(prefixes), len(parents)
+    inner = parents[1:]  # 層へ通すノード（子を持つもの）。root は除く
+    n_inner = len(inner)
     # 行列を確保する前に必要量を検査する（REQ-39）
-    if n_nodes**2 * 4 + n_rows * width * 8 + len(seqs) * n_nodes * 4 > _MAX_TRIE_CONST_BYTES:
+    if (
+        n_inner**2 * 4 + n_rows * width * 8 + n_nodes * 8 + len(seqs) * n_nodes * 4
+        > _MAX_TRIE_CONST_BYTES
+    ):
         raise _limit("choice tree is too large")
     node_slot = np.zeros(n_nodes, dtype=np.int64)
     slots = np.zeros((len(parents), width), dtype=np.int64)
@@ -453,19 +461,19 @@ def _choice_trie(seqs: list[list[int]]) -> _Trie:
         for j, p in enumerate(children[q]):
             node_slot[index[p]] = r * width + j
             slots[r, j] = p[-1]
-    anc = np.full((len(prefixes), len(prefixes)), NEG, dtype=np.float32)
-    for i, p in enumerate(prefixes):
-        for n in range(1, len(p) + 1):
-            anc[i, index[p[:n]]] = 0.0
+    inner_index = {q: i for i, q in enumerate(inner)}
+    anc = np.full((n_inner, n_inner), NEG, dtype=np.float32)
+    for i, q in enumerate(inner):
+        for n in range(1, len(q) + 1):  # 子を持つノードの祖先は必ず子を持つ
+            anc[i, inner_index[q[:n]]] = 0.0
     path = np.zeros((len(seqs), n_nodes), dtype=np.float32)
     for k, sq in enumerate(seqs):
         for n in range(1, len(sq) + 1):
             path[k, index[tuple(sq[:n])]] = 1.0
     return _Trie(
-        token=[p[-1] for p in prefixes],
-        depth=[len(p) - 1 for p in prefixes],
+        token=[q[-1] for q in inner],
+        depth=[len(q) - 1 for q in inner],
         anc=anc,
-        rows=[index[q] for q in parents[1:]],
         slots=slots,
         node_slot=node_slot,
         path=path,
@@ -508,10 +516,11 @@ def _build(
     pmask = g.op(
         "Greater", [g.op("Unsqueeze", [keys, g.i64(0)]), g.op("Unsqueeze", [pos, g.i64(1)])]
     )
-    # 選択肢の木のノード列: 位置は T + 深さ。マスクは [N,T+N] の加算形式で、prefix 側 T 列は
-    # 全部見え（0）、ノード側 N 列は自分と祖先だけ見える（REQ-41・#684）
+    # 選択肢の木の、子を持つノード列（L 個。葉は通さない）: 位置は T + 深さ。マスクは [L,T+L] の
+    # 加算形式で、prefix 側 T 列は全部見え（0）、ノード側 L 列は自分と祖先だけ見える
+    # （REQ-41・#684）
     n_nodes = len(trie.token)
-    bpos = g.op("Add", [t_len, g.const(trie.depth, np.int64)])  # [N]
+    bpos = g.op("Add", [t_len, g.const(trie.depth, np.int64)])  # [L]
     zrow = g.op("Mul", [g.op("Cast", [keys], to=TensorProto.FLOAT), g.const(0.0)])  # [T]
     zeros = g.op(
         "Add", [g.op("Unsqueeze", [zrow, g.i64(0)]), g.const(np.zeros((n_nodes, 1), np.float32))]
@@ -556,14 +565,14 @@ def _build(
         kvs.append((k, v))
     last = g.op("Slice", [x, g.i64(-1), g.i64(_INT64_MAX), g.i64(0)])  # 入力テキストの最終行 [1,H]
 
-    y = g.op("Gather", [embed, g.const(trie.token, np.int64)], axis=0)  # [N,H]
+    y = g.op("Gather", [embed, g.const(trie.token, np.int64)], axis=0)  # [L,H]
     for w, kv in zip(layer_w, kvs, strict=True):
         y, _, _ = _layer(g, d, w, y, bcs, bmask, kv, additive_mask=True)
 
-    # lm_head は root（入力テキストの最終行）と子を持つノードの行だけ。行 r の次 token の
-    # 対数確率を slots[r] で拾い、各選択肢の対数尤度を経路の和（path との積）にする
-    rows = g.op("Gather", [y, g.const(trie.rows, np.int64)], axis=0)
-    h = g.op("Concat", [last, rows], axis=0)
+    # lm_head は root（入力テキストの最終行）と層を通した全行（= 子を持つノード）。行 r の
+    # 次 token の対数確率を slots[r] で拾い（葉の分も親の行から拾う）、各選択肢の対数尤度を
+    # 経路の和（path との積）にする
+    h = g.op("Concat", [last, y], axis=0)
     h = _rms(g, d, h, g.weight("norm", _f32(inner.norm.weight)))
     if c.tie_word_embeddings:
         lm = embed

@@ -376,25 +376,29 @@ def test_choice_trie_counts_and_order() -> None:
     """REQ-41・#684: `[a,b,E] [a,c,E] [d,E]` のノード数・lm_head 行数・順序が入力順に依らない。"""
     a, b, c, d, e = 1, 2, 3, 4, 9
     t = qo._choice_trie([[a, b, e], [a, c, e], [d, e]])
-    # ノード 7 個（旧構造は 3*3=9 行）。深さ・接頭辞の昇順
-    assert t.token == [a, d, b, c, e, e, e]
-    assert t.depth == [0, 0, 1, 1, 1, 2, 2]
-    # lm_head の行は root と子を持つ (a)・(a,b)・(a,c)・(d) の 5 行（root 以外のノード添字）
-    assert t.rows == [0, 1, 2, 3]
+    # 層へ通すのは子を持つ (a)・(d)・(a,b)・(a,c) の 4 個だけ（葉 3 個は通さない）。
+    # 深さ・接頭辞の昇順。全ノードは 7 個で、path・node_slot の長さはこちら
+    assert t.token == [a, d, b, c]
+    assert t.depth == [0, 0, 1, 1]
+    assert t.anc.shape == (4, 4)
+    # lm_head の行は root と層を通した 4 行の計 5 行
     assert t.slots.shape[0] == 5
+    assert t.node_slot.shape == (7,)
+    assert t.path.shape == (3, 7)
     assert t.path.sum(axis=1).tolist() == [3.0, 3.0, 2.0]
     assert qo._choice_trie([[d, e], [a, c, e], [a, b, e]]).token == t.token
     # (a,b)（添字 2）は自分と祖先 (a)（添字 0）だけ見える
     neg = float(np.float32(qo.NEG))
-    assert t.anc[2].tolist() == [0.0, neg, 0.0] + [neg] * 4
+    assert t.anc[2].tolist() == [0.0, neg, 0.0, neg]
 
 
 def test_choice_trie_size_limit() -> None:
     """REQ-39・#684: 定数行列を確保する前に大きさを検査する。上限の選択肢数の平坦な木は通る。"""
     t = qo._choice_trie([[i, 99_999] for i in range(1024)])
-    assert t.anc.nbytes + t.slots.nbytes + t.path.nbytes == 33_562_624
+    assert t.anc.nbytes + t.slots.nbytes + t.path.nbytes == 20_979_712
     with pytest.raises(WorkerError) as e:
-        qo._choice_trie([[i, 99_999] for i in range(2000)])
+        # 共有のない 10 token の選択肢 1024 個: 子を持つノードが 9216 個で anc が上限を超える
+        qo._choice_trie([[i * 10 + j for j in range(10)] for i in range(1024)])
     assert e.value.code == "limit_exceeded"
 
 
@@ -423,3 +427,18 @@ def test_trie_graph_matches_naive_scoring(base, monkeypatch, seqs, tmp_path) -> 
         want /= want.sum()
         (got,) = run.run(None, {"ids": np.array([cur], dtype=np.int64)})
         np.testing.assert_allclose(got[0], want, atol=TOL)
+
+
+def test_leaves_are_not_run_through_layers(base, monkeypatch, tmp_path) -> None:
+    """REQ-41・#684: 層へ通す行数と lm_head の行数は子を持つノード数（葉は通さない）に一致する。"""
+    seqs = [[5, 6, 9], [5, 7, 9], [8, 9]]  # 全ノード 7、子を持つノード 4、葉 3
+    monkeypatch.setattr(qo, "choice_token_ids", lambda *_a, **_k: seqs)
+    t = _stand_in(base, base.model.config)
+    mb, _, _ = export(t, shard_max_bytes=SHARD_MAX, external_threshold=THRESHOLD)
+    inits = {i.name: i for i in onnx.load_from_string(mb).graph.initializer}
+    trie = qo._choice_trie(seqs)
+    assert len(trie.token) == 4
+    # 層のマスクの定数 [L,L] と、lm_head の行の選択 [R,C]（R = L+1）
+    assert any(tuple(i.dims) == (4, 4) for i in inits.values())
+    assert trie.slots.shape[0] == 5
+    assert not any(tuple(i.dims) == (7, 7) for i in inits.values())
