@@ -25,7 +25,7 @@
 
 ## 前提
 
-1. 他のアプリをすべて終了し、電源に接続した静かな Mac で実行する。実行前に `uptime` の load average が低いことを確認する（記録に 1 分平均が入る）
+1. 他のアプリをすべて終了し、電源に接続した静かな Mac で、低電力モードをオフにして実行する（`pmset -g | grep lowpowermode` が 0。2026-11-03 オーナー決定）。実行前に `uptime` の load average が低いことを確認する（記録に 1 分平均が入る）
 2. ベースモデル一式（#387）と seed 0 のアダプタ（`~/poc26/work/grid_i600_lr5e-5`）、入力のみの validation（`~/poc26/work/val_input_only.jsonl`）がある
 3. アダプタの dtype（bf16）と `--max-seq-length`（512）が学習時と一致すること。`predict` が `adapter_config.json` の記録と照合し、不一致は終了コード 64 で止まる（その条件は `status: error` で記録される）
 4. 出力先は存在しない新しいディレクトリ（既存は上書きしない。0700 で作る）

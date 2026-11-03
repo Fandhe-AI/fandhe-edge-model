@@ -1799,6 +1799,7 @@ def test_classify_p95_is_reference_only_under_harness_or_bin_override(tmp_path: 
     """evidence_hint と矛盾させない: 静かな状態の申告があっても代役・CLI 差し替えでは参考値。"""
     ctx = _ctx(tmp_path, _fake_cli(tmp_path, "exit 0\n"))
     ctx.quiet_machine, ctx.harness, ctx.bin_override = True, False, False
+    ctx.low_power_mode = 0
     assert mod.classify_p95(ctx) == "real_machine"
     ctx.harness = True
     assert mod.classify_p95(ctx) == "reference_only"
@@ -3131,6 +3132,30 @@ def test_huge_integers_do_not_raise_and_fail_range_checks() -> None:
     assert mod.compare_infer(b, s)["scores_nonfinite"] == 1
 
 
+def test_classify_p95_requires_low_power_mode_off_on_macos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-31: macOS の p95 は低電力モードオフを確認できたときだけ real_machine（不明は参考値）。"""
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    ctx = _ctx(tmp_path, _fake_cli(tmp_path, "exit 0\n"))
+    ctx.quiet_machine, ctx.harness, ctx.bin_override = True, False, False
+    ctx.low_power_mode = 0
+    assert mod.classify_p95(ctx) == "real_machine"
+    ctx.low_power_mode = 1
+    assert mod.classify_p95(ctx) == "reference_only"
+    ctx.low_power_mode = None
+    assert mod.classify_p95(ctx) == "reference_only"
+
+
+def test_parse_low_power_mode() -> None:
+    """REQ-31: `pmset -g` の lowpowermode 行だけを読み、無い・想定外の値は None。"""
+    assert mod.parse_low_power_mode("Active:\n lowpowermode         0\n sleep 1\n") == 0
+    assert mod.parse_low_power_mode(" lowpowermode\t1") == 1
+    assert mod.parse_low_power_mode(" lowpowermode 2\n") is None
+    assert mod.parse_low_power_mode(" not_lowpowermode 0\n") is None
+    assert mod.parse_low_power_mode(None) is None
+
+
 def test_collect_environment_validates_probe_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4177,6 +4202,7 @@ def test_resolve_tool_uses_fixed_candidates_and_never_searches_path(
         "sysctl": ("/usr/sbin/sysctl",),
         "sw_vers": ("/usr/bin/sw_vers",),
         "otool": ("/usr/bin/otool",),
+        "pmset": ("/usr/bin/pmset",),
     }
 
 

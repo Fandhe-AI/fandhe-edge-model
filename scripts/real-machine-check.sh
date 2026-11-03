@@ -36,7 +36,7 @@
 #   --with-ci:  A（make ci）を実行する明示の同意。A は通信を伴いうる（uv sync・advisory DB・npx）。
 #               --items に A があり --with-ci が無ければ invalid_input(64) で何も実行しない
 #   --repeat:   F の回数（1〜1000。既定 50）
-#   --quiet-machine: 他のアプリを閉じた静かな状態という人の申告。あるときだけ p95 の区分が real_machine
+#   --quiet-machine: 他のアプリを閉じた静かな状態という人の申告。あり、かつ低電力モードがオフのときだけ p95 の区分が real_machine
 #   --p95-limit-us / --package-limit-bytes: C-1・C-2 の limits（既定 50000 / 1000）。
 #               --p95-limit-us は 1〜3600000000（定義ファイル側の上限と同じ）、
 #               --package-limit-bytes は 1〜999999999999999（15 桁まで）

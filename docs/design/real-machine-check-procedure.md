@@ -44,7 +44,7 @@ make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--
 | `--items LIST` | 実行する項目。`A,B,C,D,E,F,G,H,I,J,K` の部分集合（カンマ区切り・大文字・重複不可）。E・J は B の成果物を使うため B と一緒に指定する（B なしの E・J は引数エラー〔exit 64。何も実行しない〕。#362）。`A`〜`K` とカンマ以外の文字（`*`・`?`・`[` 等）を含む値は、分割の前に拒否する（パス名展開でカレントのファイル名に化けない。#364）。A は通信しうる（`--with-ci`）、I は学習を 4 回行い GPU・時間を長く占有しうる（#103）ため、既定に入れず `--items I` で明示したときだけ実行する。K は人が用意したパッケージが要るため、同じく既定に入れず `--items K --k-package DIR` で明示したときだけ実行する | `B,C,D,E,F,G,H,J`（A・I・K は既定では含まない） |
 | `--with-ci` | A（`make ci`）を実行する明示の同意。通信を伴いうる（`uv sync`・advisory DB・`npx`）。`--items` に A があり `--with-ci` が無ければ引数エラー（exit 64）で、何も実行しない | — |
 | `--repeat N` | F（ガード層の時間制限テスト）の実行回数。1 以上 1000 以下の整数 | 50 |
-| `--quiet-machine` | 「他のアプリを閉じた静かな状態」という人の申告。p95 の分類が `real_machine` になるのは、これがあり、かつ `make`・`cargo` の代役も `FANDHE_EDGE_BIN` の差し替えも無いときだけ。それ以外は `reference_only` | — |
+| `--quiet-machine` | 「他のアプリを閉じた静かな状態」という人の申告。p95 の分類が `real_machine` になるのは、これがあり、`make`・`cargo` の代役も `FANDHE_EDGE_BIN` の差し替えも無く、macOS では低電力モードがオフと確認できたときだけ。それ以外は `reference_only` | — |
 | `--p95-limit-us N` | C-1 の推論 p95 上限（マイクロ秒）。1 以上 3600000000 以下の整数（上限は定義ファイルの `limits.max_infer_p95_us` の上限と同じ。REQ-31）。範囲外は CLI・make・cargo を起動する前に引数エラー（exit 64） | 50000 |
 | `--package-limit-bytes N` | C-2 の容量上限（バイト）。1 以上 999999999999999（15 桁）以下の整数（桁あふれを避けるための上限。シェルと Python が同じ値で検査する）。範囲外は引数エラー（exit 64） | 1000 |
 | `--overall-timeout-sec N` | 実行全体の上限時間（秒。入力の採取・CLI のビルド・開始時の環境採取を含み、終了時の再採取と記録の書き出しは含まない）。1 以上 86400 以下の整数。範囲外は引数エラー（exit 64）。契約に定めのない暫定値（自分で決めた点。REQ-39）。超えたら §5 のとおり打ち切る。`--repeat` を大きくする場合は併せて上げる | 14400（4 時間） |
@@ -117,6 +117,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 
 実行の前に知っておくと原因の切り分けが早くなる点です。証拠種別は各項に書きます。
 
+- **計測は低電力モードオフで行う**（2026-11-03 オーナー決定。REQ-31）: 同じ 7B のパッケージで、検証データの 1 件がオン 4.31 秒、オフ 2.08 秒と約 2 倍違った（証拠種別: 実機）。実行前に `pmset -g | grep lowpowermode` が 0 であることを確かめる。スクリプトは値を `environment.low_power_mode` に記録し、オンまたは確認できないときは p95 を `reference_only` にする。数値を比べるときはモードを揃え、数値にモードを明記する
 - **出力先を変えた環境でも D は追従する**（証拠種別: 推定。コードの読解で、出力先を変えた実行での確認はしていない）: CLI のビルド（`build_cli`）も `check-runtime-linkage.sh` も、CLI の場所を cargo の報告（`compiler-artifact` の `executable`）から取る。どちらもリポジトリのルートで同じ環境の cargo を起動するため、`build.target-dir`・`CARGO_BUILD_TARGET_DIR`・`CARGO_TARGET_DIR` のどれで出力先を変えても同じ実物を指す。`target/` を決め打ちする箇所はない。D が `linkage_target_mismatch` になるのは、`FANDHE_EDGE_BIN` で差し替えた CLI が cargo のビルドした CLI とバイト単位で違うときである（§3-3・§4-D）
 - **色を強制する環境では A が `no_test_results` になりうる**: A の合否は `make ci` の stdout を行頭一致で読んで決める（Rust の `test result:` 行・pytest の要約行）。ANSI エスケープ（色）は取り除かないため、どちらかの行に色が付くと読めず、exit 0 でも `no_test_results` で `failed` になる（`rust_tests.passed` が 0、または `pytest` が `null`）。
   - 確認できた発生条件（証拠種別: 模擬。計画時の小さな試行で、`make ci` 全体での再現ではない）: pytest 9.1.1 は `FORCE_COLOR=1` または `PY_COLORS=1` で、出力先がファイルでも要約行に色が付く（`NO_COLOR=1` は `FORCE_COLOR=1` に勝つ）。cargo 1.98.1 の libtest の `test result:` 行は、`CARGO_TERM_COLOR=always`・`.cargo/config.toml` の `[term] color`・`FORCE_COLOR`・`CLICOLOR_FORCE` のいずれでも、出力先がファイルなら色が付かなかった（色が付いたのは `-- --color always` を渡したときだけで、`make ci` も F もこれを渡さない）
@@ -402,7 +403,7 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 - **何を測るか**: ① 容量（直下のファイル数・バイト数の合計。目安 40,000,000 バイトは `over_reference` の警告）② 最大 RSS（`/usr/bin/time -l` の `maximum resident set size`。目標 2 GiB〔REQ-39 の暫定上限〕は `over_target` の警告）③ `infer` 1 回ごとの E2E 時間（`/usr/bin/time -l` の `real`。目標 250 ms は `over_guideline` の警告）。目標の超過は警告であり失敗にしない（TASK-41.9 と同じ方針）。合否は人が判断する
 - **回数**: `--k-runs N`（既定 20）回の測定の前に、ウォームアップ 1 回を実行する。ウォームアップは p95 に含めず、RSS には含める。p95 は runtime の `latency_report` と同じ定義（線形補間・外れ値を除かない・µs の整数へ切り上げ）で、中央値・最大値も記録する
 - **E2E と推論のみの違い（誤読しやすい点）**: `infer` は 1 呼び出し 1 プロセスのため、記録する時間はプロセスの起動とパッケージの読み込みを含む E2E で、REQ-31 の「推論のみ・バッチ 1 件」の p95 そのものではない。推論のみの p95 は CLI の外からは分けられないので `inference_only_p95` は `null`。Jev の公表値（E2E 70〜500 ms）と並べる場合は E2E 同士で比べる（指標の違いを必ず明記する）。分解能は `time -l` の 0.01 秒（`resolution_us: 10000`）
-- **静かな状態で測る**: `--quiet-machine` があり、`make`・`cargo`・`time` の代役も `FANDHE_EDGE_BIN` の差し替えも無いときだけ `classification` が `real_machine` になる（C-1 と同じ。それ以外は `reference_only`）
+- **静かな状態で測る**: `--quiet-machine` があり、`make`・`cargo`・`time` の代役も `FANDHE_EDGE_BIN` の差し替えも無く、低電力モードがオフと確認できたときだけ `classification` が `real_machine` になる（C-1 と同じ。それ以外は `reference_only`）
 - **今の main での結果**: CLI の `infer` は入力表現 `tokenizer` の `qwen2_lora` パッケージを推論できる（#626。単体と `--input-file` が学習側の予測ラベルと全件一致することをテストハーネスの合成パッケージ `fixtures/qwen2_parity/` で確認済み。実重みでの測定は本項の人の作業）。パッケージが `infer` を exit 64 で拒否した場合（`artifact.json` の不整合・ハッシュ不一致など）は、K は `failed`（`reason: "unexpected_exit_code"`・`exit_code: 64`・`run: 0`）として記録される
 - **実機での突き合わせ（未確認事項）**: `time -l` の最大 RSS（wait4 の rusage）が CLI の worker（子プロセス）の RSS を含むかどうかは未確認。実機で 1 回、アクティビティモニタ等の値と突き合わせて記録する（`rss.scope` は `process_tree_via_time_l` と書くが、これは主張でなく測定方法の名前）
 - **合格条件（`status: ok`）**: パッケージ直下が通常ファイルだけ、`artifact.json` の `kind` が追加学習の種類、すべての `infer` が exit 0・11・12 のいずれかで出力の `status` と対応、各回の stderr から最大 RSS と real が取れること
@@ -518,7 +519,7 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 **項目ごとの扱い**:
 
 - **A**: 終了のみが実機証拠。中のテスト（Rust unit・integration、pytest）はテストハーネス。記録には区別して記載する
-- **C-1 の p95**: `--quiet-machine` フラグが **あり、かつ実際に他のアプリを閉じた状態** でのみ `classification: "real_machine"`。フラグが無い、フラグはあるが実際に静かでない、`make`・`cargo` の代役か `FANDHE_EDGE_BIN` の差し替えの下で実行した = `reference_only`（最後の 2 つはフラグがあっても `reference_only`）。参考値扱いで「実機の p95」としない
+- **C-1 の p95**: `--quiet-machine` フラグが **あり、かつ実際に他のアプリを閉じた状態** でのみ `classification: "real_machine"`。フラグが無い、フラグはあるが実際に静かでない、`make`・`cargo` の代役か `FANDHE_EDGE_BIN` の差し替えの下で実行した、低電力モードがオンまたは確認できない = `reference_only`（最後の 3 つはフラグがあっても `reference_only`）。参考値扱いで「実機の p95」としない
 - **E**: 学習データ（`train.jsonl`）のみ使用し、評価データ（`evaluation.jsonl`）は使わない（REQ-27。評価の独立性）
 - **G・H・J**: 実 CLI・実 trainer（CPU）を実機で実行した結果。`FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` の下（偽 CLI）の実行は `test_harness` で、実機の証拠にならない。H の子孫の観測は `ps`（固定パス）の `ppid` の連鎖によるもので、証拠種別は実機（人が確認して記入）
 - **I**: `--i-device` で証拠種別を区別して記録する（`cpu_real_machine`・`gpu_real_machine_declared`）。後者は人の申告で、CLI が GPU で学習した確認はスクリプトにはできない（CLI は CPU 固定）。再現性の合否・回帰の多寡の解釈は人が行い、スクリプトは出力の整合までを確かめる
