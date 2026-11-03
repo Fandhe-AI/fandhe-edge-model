@@ -315,18 +315,19 @@ INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # 2 回目の中断シグナルによる強制終了で stdout へ書く固定の 1 行（record は無い）
 FORCED_EXIT_LINE = b'{"code":"runtime_error","message":"interrupted (forced exit)"}\n'
 
-# 環境採取（git・sysctl・sw_vers・otool）に使うコマンドの固定パス（PATH を探さない。
+# 環境採取（git・sysctl・sw_vers・otool・pmset）に使うコマンドの固定パス（PATH を探さない。
 # REQ-38・REQ-39）。PATH の先頭に同名の実行ファイルを置かれても別物の出力が記録に入らない
 # ようにする。`/usr/local/bin` は
 # 利用者が書ける構成があるため候補に入れない。表に無い・実行できない場合は「使えない」として扱い、
 # PATH へは戻らない（git が無ければ commit・worktree_clean が null → stable が null → exit 10。
 # sysctl・sw_vers が無ければ該当欄が null。macOS で otool が無ければ D は otool_failed）。
-# Linux 側の表はテストハーネス用で、実機の証拠にならない（sysctl・sw_vers・otool は使わない）
+# Linux 側の表はテストハーネス用で、実機の証拠にならない（sysctl・sw_vers・otool・pmset は使わない）
 TOOL_CANDIDATES_DARWIN: dict[str, tuple[str, ...]] = {
     "git": ("/usr/bin/git",),
     "sysctl": ("/usr/sbin/sysctl",),
     "sw_vers": ("/usr/bin/sw_vers",),
     "otool": ("/usr/bin/otool",),
+    "pmset": ("/usr/bin/pmset",),
 }
 TOOL_CANDIDATES_OTHER: dict[str, tuple[str, ...]] = {
     "git": ("/usr/bin/git", "/bin/git"),
@@ -1062,6 +1063,8 @@ class Ctx:
     k_package: Path | None = None
     k_runs: int = DEFAULT_K_RUNS
     time_cmd: str = TIME_CMD_DEFAULT
+    # 開始時に採取した低電力モード（0・1。取れなければ None。p95 の区分に使う）
+    low_power_mode: int | None = None
 
 
 # rustup プロキシ（~/.cargo/bin/cargo）は `rust-toolchain.toml` の指すツールチェーンが未導入だと
@@ -1929,8 +1932,14 @@ def package_files(pdir: Path) -> list[dict[str, Any]] | None:
 
 
 def classify_p95(ctx: Ctx) -> str:
-    """p95 の区分。静かな状態の申告があり、代役・CLI 差し替えが無いときだけ real_machine。"""
-    if ctx.quiet_machine and not ctx.harness and not ctx.bin_override:
+    """p95 の区分。実機として扱える条件がすべて揃ったときだけ real_machine（REQ-31）。
+
+    条件は、静かな状態の申告があり、代役・CLI 差し替えが無く、macOS では低電力モードがオフと
+    確認できること。計測の基準はオフ（2026-11-03 オーナー決定）で、同じパッケージでも 1 件の
+    時間が約 2 倍違う（7B の実機）。確認できないときは fail-closed で参考値にする。
+    """
+    low_power_ok = sys.platform != "darwin" or ctx.low_power_mode == 0
+    if ctx.quiet_machine and not ctx.harness and not ctx.bin_override and low_power_ok:
         return "real_machine"
     return "reference_only"
 
@@ -3888,6 +3897,12 @@ def fill_end_environment(env: dict[str, Any], end: dict[str, Any] | None) -> Non
     env["stable"] = judge_environment_stable(env)
 
 
+def parse_low_power_mode(text: str | None) -> int | None:
+    """`pmset -g` の出力から低電力モード（0・1）を読む。行が無い・値が他なら None。"""
+    m = re.search(r"^[ \t]*lowpowermode[ \t]+([01])[ \t]*$", text or "", re.MULTILINE)
+    return int(m[1]) if m else None
+
+
 def collect_environment(ctx: Ctx, cli_profile: str | None) -> dict[str, Any]:
     """環境の採取。macOS 以外・コマンド不在で取れない欄は null。"""
     w, rp = ctx.work, ctx.repo
@@ -3914,6 +3929,9 @@ def collect_environment(ctx: Ctx, cli_profile: str | None) -> dict[str, Any]:
         "os_name": env_text(sw_vers("-productName", "osn")),
         "os_version": env_text(sw_vers("-productVersion", "osv")),
         "os_build": env_text(sw_vers("-buildVersion", "osb")),
+        "low_power_mode": parse_low_power_mode(_probe(w, rp, ["pmset", "-g"], "pmset"))
+        if on_mac
+        else None,
         "commit": vol["commit"],
         "worktree_clean": vol["worktree_clean"],
         "started_local": None,
@@ -4139,7 +4157,7 @@ def render_markdown(rec: dict[str, Any]) -> str:
         "## 検証済みと扱わない点",
         "",
         "- `not_run` の項目は実行していない。成功扱いにしない",
-        "- `reference_only` の p95 は静かな状態の申告が無い参考値",
+        "- `reference_only` の p95 は実機の条件（静かな申告・低電力オフ）を満たさない参考値",
         "- このスクリプトは測定と整形まで。「実機」の証拠としての確定と合否の判断は人が行う",
         "- 実行環境の通信 0 件（REQ-38）は対象外（`sandbox-monitor.sh` の担当）",
         "",
@@ -4434,6 +4452,7 @@ def _run(args: argparse.Namespace) -> int:
         env = collect_environment(ctx, cli_profile)
         env["started_local"] = started
         ctx.cli_sha256 = env["cli_sha256"]
+        ctx.low_power_mode = env["low_power_mode"]
         rec["environment"] = env
     except Interrupted:
         interrupted = True  # 前半の中断。以降の項目はすべて not_run（interrupted）
