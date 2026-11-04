@@ -440,7 +440,7 @@ def validate_request(raw: Any) -> TrainRequest:
     ):
         raise _invalid(f"time_limit_seconds must be an integer in [1, {MAX_TRAIN_WALL_SECONDS}]")
 
-    # kind ごとの既定・上限（qwen2_lora のみ 12 GiB。#665・REQ-39）。
+    # kind ごとの既定・上限（qwen2_lora のみ 24 GiB。#665・#689・REQ-39）。
     max_rss = max_train_rss_bytes_for_kind(kind)
     rss_limit_bytes = raw.get("rss_limit_bytes", max_rss)
     if (

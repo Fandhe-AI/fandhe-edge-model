@@ -111,6 +111,10 @@ pub const TRAIN_SEED_FILE: &str = "train_seed.txt";
 /// 記録が無い候補・#665 以前の候補は cpu として扱う）。下流は `request.json` の device がこの記録と
 /// 一致することを要求する（学習後に request 側だけを書き換えても通さない。REQ-27・REQ-41・#665）。
 pub const TRAIN_DEVICE_FILE: &str = "train_device.txt";
+/// `train --batch-size N` で学習した qwen2_lora の候補だけに置く、batch 件数の記録（10 進数の u32。省略時は
+/// 作らず、記録が無い候補は既定どおり）。下流は `request.json` の `config.batch_size` がこの記録と一致する
+/// ことを要求する（`--device` と同じ扱い。学習後に request 側だけを書き換えても通さない。REQ-27・REQ-41・#689）。
+pub const TRAIN_BATCH_SIZE_FILE: &str = "train_batch_size.txt";
 /// 候補ディレクトリ内の学習結果。
 pub const RESULT_FILE: &str = "result.json";
 /// 候補ディレクトリ内の trainer 形式の学習データ。

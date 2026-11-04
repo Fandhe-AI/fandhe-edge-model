@@ -112,8 +112,9 @@ def test_req39_limits_fixture_matches_python_constants() -> None:
     assert (
         _LIMITS["max_qwen2_lora_train_rss_bytes"]
         == limits.MAX_QWEN2_LORA_TRAIN_RSS_BYTES
-        == 12 << 30
+        == 24 << 30
     )
+    assert _LIMITS["max_qwen2_lora_batch_size"] == limits.MAX_LORA_BATCH_SIZE == 64
     assert _LIMITS["max_validation_input_bytes"] == limits.MAX_VALIDATION_INPUT_BYTES
     assert _LIMITS["max_validation_id_bytes"] == limits.MAX_VALIDATION_ID_BYTES
     assert _LIMITS["max_validation_input_total_bytes"] == limits.MAX_VALIDATION_INPUT_TOTAL_BYTES

@@ -411,6 +411,16 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 - **記録する `record.json` フィールド**: `package`（`kind`・`artifact_sha256`〔`artifact.json` の sha256。パッケージの同一性の手がかり。数 GB の重みはハッシュを取らない〕・`files`〔`name`・`bytes`〕・`file_count`・`total_bytes`・`reference_bytes`・`over_reference`）・`rss`（`max_rss_bytes`・`target_bytes`・`over_target`・`scope`）・`e2e`（`runs`・`warmup`・`p95_us`・`median_us`・`max_us`・`guideline_us`・`over_guideline`・`resolution_us`・`classification`）・`inference_only_p95`（`null`）。パス・入力本文・stderr は書かない。`options` には `k_runs` と `k_package_given`（真偽のみ）
 - **限界**: 証拠種別は、偽の CLI・偽の `time` の下では `test_harness`、実機では人が確認して記入する。E2E に含まれるプロセス起動の時間は個体差と OS のキャッシュ（2 回目以降のファイル読み込み）に左右される
 
+### 4-L. 7B（Qwen2.5-7B-Instruct）の `train` の実機確認（REQ-41・REQ-39・REQ-30・#689）
+
+7B の学習が製品の `train` で完走するかの確認。**スクリプトの項目ではなく、人が手で実行して記録する**（`--items` には無い）。結果は未実施で、実機で測るまで書かない。
+
+- **前提**: 低電力モードオフ（`pmset -g | grep lowpowermode` が 0）。定義ファイルに 7B の `base_model` を書いた `inspect` 済みプロジェクトと、7B のベースモデルのディレクトリ（cwd 配下）を用意する。学習中は他の重い処理を動かさない。学習 RSS の上限は `qwen2_lora` のみ 24 GiB（他の kind は 8 GiB のまま）
+- **実行**: `/usr/bin/time -l fandhe-edge train --project-dir PROJ --kind qwen2_lora --candidate 2 --base-model-dir DIR --device gpu --batch-size 2`（候補番号 2 は `qwen2_lora`。既定候補の後ろ）。batch 4 は 32 GB 機で swap 超過のため使わない
+- **記録する値**: ① 進捗行（stderr の `qwen2_lora: step ...`）の最大 `rss_bytes` ② `time -l` の `maximum resident set size` ③ 所要時間（`real`。ジョブ全体の壁時計上限 3600 秒に収まるか）④ 実行前後の swap 使用量の増分（`sysctl vm.swapusage`）⑤ 終了コードと `train` の stdout の `status`。GPU の学習は同一 seed でも完全再現しない（`train_device.txt` の `gpu`）
+- **未確定（実機で確かめる）**: 書き出しピーク（PoC の実測 24.44 GB）に対する余裕は約 1.3 GB（5%）で、GPU 学習後の同一プロセスでの書き出しピークは未測定。学習ジョブ全体が 3600 秒に収まるかも未測定（学習 458〜529 秒・書き出し 113 秒の個別の実測のみ）
+- **証拠種別**: 人が実機（Apple M5・32 GiB 等）で測った値は「実機」と明記して記録する。偽ワーカーのテストは「テストハーネス」で、本項の代わりにならない
+
 ## 5. 判定の読み方
 
 スクリプトの終了コードは 4 種です（120・141・1 など 7 種の外の値は出さず、70 へ写します。下の 70 の行の「stdout へ書けなかった場合」）。

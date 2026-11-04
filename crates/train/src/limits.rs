@@ -81,13 +81,18 @@ pub fn max_model_bytes_for_kind(kind: &str) -> u64 {
 /// 1 学習ジョブあたりの RSS 上限（バイト）。`limits.py::MAX_TRAIN_RSS_BYTES`。
 pub const MAX_TRAIN_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// qwen2_lora の学習 RSS の既定・上限（12 GiB）。`limits.py::MAX_QWEN2_LORA_TRAIN_RSS_BYTES`。
-/// 根拠: 1.5B の GPU 学習の実測ピーク 7.37 GB・見積式は実測の約 1.4 倍で max_seq_length 512 に約 10 GB、
-/// PoC は 12 GiB で完走（PoC-26・#628 の実機）。7B の学習は収まらず範囲外。
-/// 上限緩和はオーナー判断 2026-10-27（上限の見直しを一任）・#665。REQ-39・REQ-41。
-pub const MAX_QWEN2_LORA_TRAIN_RSS_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+/// qwen2_lora の学習 RSS の既定・上限（24 GiB）。`limits.py::MAX_QWEN2_LORA_TRAIN_RSS_BYTES`。
+/// 根拠: 7B（Qwen2.5-7B-Instruct）の実機 PoC のピークは学習約 18.3 GB・書き出し 24.44 GB。
+/// 24 GiB は Metal の推奨ワーキングセット 24.96 GiB を下回り、PoC 追補 2 で 7B に固定した値で、
+/// 推論側 `FINETUNE_INFER_RSS_LIMIT_BYTES` と同じ。証拠種別: 実機（Apple M5・32 GiB の PoC）。
+/// 上限緩和はオーナー判断 2026-11-04・#689（先の 12 GiB は 2026-10-27・#665）。REQ-39・REQ-41。
+pub const MAX_QWEN2_LORA_TRAIN_RSS_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 
-/// `kind` ごとの学習 RSS の既定・上限。qwen2_lora のみ 12 GiB、他は [`MAX_TRAIN_RSS_BYTES`]。
+/// qwen2_lora の `config.batch_size` の上限。`limits.py::MAX_LORA_BATCH_SIZE`（CLI の `train --batch-size` の
+/// 範囲 `1..=64` もこの値を使う。一致は `fixtures/train_contract/limits.json` で照合）。REQ-39・REQ-41・#689。
+pub const MAX_QWEN2_LORA_BATCH_SIZE: u32 = 64;
+
+/// `kind` ごとの学習 RSS の既定・上限。qwen2_lora のみ 24 GiB、他は [`MAX_TRAIN_RSS_BYTES`]。
 /// `limits.py::max_train_rss_bytes_for_kind`。
 pub fn max_train_rss_bytes_for_kind(kind: &str) -> u64 {
     if kind == "qwen2_lora" {

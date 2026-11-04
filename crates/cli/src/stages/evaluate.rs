@@ -188,9 +188,9 @@ use super::previous_comparison::{PreparedPrevious, current_correctness, prepare_
 use super::reproducibility::{OwnRun, SeedRuns, check_run_count, load_seed_runs};
 use super::select::compute_selection;
 use super::train::{
-    allotted_time_limit, candidate_rel, effective_train_seed, load_trained, recorded_device,
-    request_is_smoke_trained, request_matches_candidate, resolve_candidates, train_rows,
-    verified_split,
+    allotted_time_limit, apply_batch_size, candidate_rel, effective_train_seed, load_trained,
+    recorded_batch_size, recorded_device, request_is_smoke_trained, request_matches_candidate,
+    resolve_candidates, train_rows, verified_split,
 };
 
 /// `evaluate` の成功結果（stdout の JSON 1 つへ写す）。
@@ -505,7 +505,7 @@ fn prepare_candidate(
     explicit_kinds: &[String],
 ) -> Result<Option<PreparedCandidate>, ErrorReport> {
     let seed = effective_train_seed(project, index, seed)?;
-    let candidates = resolve_candidates(
+    let mut candidates = resolve_candidates(
         project,
         definition,
         index,
@@ -514,8 +514,9 @@ fn prepare_candidate(
         recorded_device(project, index)?,
     )?;
     let candidate = candidates
-        .get(index)
+        .get_mut(index)
         .ok_or_else(|| invalid("candidate index is out of range"))?;
+    apply_batch_size(candidate, recorded_batch_size(project, index)?);
     let loaded = load_trained(project, index)?;
     let Some((request, TrainOutcome::Ok(success))) = loaded else {
         return if is_target {

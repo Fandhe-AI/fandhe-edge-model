@@ -56,7 +56,10 @@ from .qwen2_tokenizer import Qwen2Tokenizer, limit_error, loads_json, sha256_hex
 
 _SUPPORTED = "supported: model_type=qwen2, no rope_scaling, use_sliding_window=false"
 
-#: forward が同時に保持するメモリの見積もり上限（暴走止め。読み込みの上限は `ResourceBudget`）。
+#: forward が同時に保持するメモリの見積もりの既定上限（暴走止め）。budget の無い経路（直接構築した
+#: `Qwen2Model`）はこの値のまま。`load_base_model_at` は読み込み時の `ResourceBudget.rss_bytes` が
+#: これより大きければ `Qwen2Model.forward_limit_bytes` をその値へ引き上げる（7B は重みだけで
+#: 15.2 GB のため固定 8 GiB では常に拒否される。#689・REQ-39）。下げることはしない。
 #: 学習時の LoRA 行列の追加分は `apply_lora` が `ResourceBudget.rss_bytes` と別に比べる。
 MAX_FORWARD_MEMORY_BYTES = 8 << 30
 
@@ -311,6 +314,7 @@ class Qwen2Model(nn.Module):
     def __init__(self, c: Qwen2Config) -> None:
         super().__init__()
         self.config = c
+        self.forward_limit_bytes = MAX_FORWARD_MEMORY_BYTES
         self.model = Qwen2Inner(c)
         if not c.tie_word_embeddings:
             self.lm_head = nn.Linear(c.hidden_size, c.vocab_size, bias=False)
@@ -366,7 +370,7 @@ class Qwen2Model(nn.Module):
                 raise limit_error("attention mask would be too large for one forward")
         if (
             self.forward_bytes(b, n, attention_mask is not None, with_logits)
-            > MAX_FORWARD_MEMORY_BYTES
+            > self.forward_limit_bytes
         ):
             raise limit_error("forward would exceed the memory limit")
         # 値の検証（embed 参照・マスク構築の前）。
@@ -437,7 +441,7 @@ class Qwen2Model(nn.Module):
         呼び出し元が保持している隠れ状態・活性を含めて合算する: `source_shape=(B, L)`（`h` の元に
         なった `hidden_states` の入力形状）と `with_mask`（そのマスクの有無）から
         `forward_bytes(B, L, with_mask, with_logits=False)`（hidden_states が保持する量）を求め、
-        この呼び出しが作る logits のバイト数と足して `MAX_FORWARD_MEMORY_BYTES` と比べる。
+        この呼び出しが作る logits のバイト数と足して `forward_limit_bytes` と比べる。
         """
         c = self.config
         if len(source_shape) != 2 or not all(
@@ -452,7 +456,7 @@ class Qwen2Model(nn.Module):
         if rows * c.vocab_size > MAX_FORWARD_ELEMENTS:
             raise limit_error("logits would be too large for one projection")
         held = self.forward_bytes(*source_shape, with_mask, with_logits=False)
-        if held + rows * c.vocab_size * max(4, h.dtype.size) > MAX_FORWARD_MEMORY_BYTES:
+        if held + rows * c.vocab_size * max(4, h.dtype.size) > self.forward_limit_bytes:
             raise limit_error("projection would exceed the memory limit")
         if c.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(h)
@@ -856,6 +860,7 @@ def load_base_model_at(
     _check_keys(config, set(weights) | unknown, "weight files")
     model = Qwen2Model(config)
     model.load_weights(list(weights.items()), strict=True)
+    model.forward_limit_bytes = max(MAX_FORWARD_MEMORY_BYTES, resource_budget.rss_bytes)
     del weights
     mx.eval(model.parameters())
     return BaseModel(

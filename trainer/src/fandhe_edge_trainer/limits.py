@@ -127,7 +127,7 @@ MAX_SEED = 2**32 - 1
 MAX_TRAIN_WALL_SECONDS = 3600
 
 #: 現行値: 8 GiB（学習ジョブ 1 回あたりのプロセス RSS の既定・上限。qwen2_lora だけ
-#: 下の `MAX_QWEN2_LORA_TRAIN_RSS_BYTES`＝12 GiB）。
+#: 下の `MAX_QWEN2_LORA_TRAIN_RSS_BYTES`＝24 GiB）。
 #: 根拠: 仮置き。証拠種別: 仮置き（開発機の実メモリ規模に対する妥当性の検証は
 #: PR #15 時点で未実施。CPU smoke 学習の実測ピーク RSS を参考値として計測する
 #: 案があるが、計測自体は本 Issue のスコープ外〔`outOfScope` 参照〕）。
@@ -138,18 +138,20 @@ MAX_TRAIN_WALL_SECONDS = 3600
 #: 状態: オーナー確認済み（2026-09-27。Issue #11。現行値のまま確定）。
 MAX_TRAIN_RSS_BYTES = 8 * 1024 * 1024 * 1024
 
-#: qwen2_lora の学習ジョブ 1 回あたりの RSS の既定・上限（12 GiB）。他の kind は
-#: `MAX_TRAIN_RSS_BYTES`（8 GiB）のまま。根拠: 1.5B の GPU 学習の実測ピークは 7.37 GB で、
-#: 見積式（`_activation_bytes` 等）は実測の約 1.4 倍のため max_seq_length 512 では約 10 GB 要る。
-#: PoC は 12 GiB で完走した（PoC-26・#628 の実機）。7B の学習はこの上限に収まらず範囲外。
+#: qwen2_lora の学習ジョブ 1 回あたりの RSS の既定・上限（24 GiB）。他の kind は
+#: `MAX_TRAIN_RSS_BYTES`（8 GiB）のまま。
+#: 根拠: 7B（Qwen2.5-7B-Instruct）の実機 PoC のピークは学習約 18.3 GB・書き出し 24.44 GB。
+#: 24 GiB（25,769,803,776）は Metal の推奨ワーキングセット 24.96 GiB を下回り、PoC 追補 2 で 7B に
+#: 固定した値で、推論側 `FINETUNE_INFER_RSS_LIMIT_BYTES` と同じ。
+#: 証拠種別: 実機（Apple M5・32 GiB の PoC）。
 #: 値は Rust `crates/train/src/limits.rs::MAX_QWEN2_LORA_TRAIN_RSS_BYTES` と同値
-#: （fixtures/train_contract/limits.json で照合）。証拠種別: 実機（1.5B）＋見積。
-#: 上限緩和はオーナー判断 2026-10-27（上限の見直しを一任）・#665。REQ-39・REQ-41。
-MAX_QWEN2_LORA_TRAIN_RSS_BYTES = 12 * 1024 * 1024 * 1024
+#: （fixtures/train_contract/limits.json で照合）。
+#: 上限緩和はオーナー判断 2026-11-04・#689（先の 12 GiB は 2026-10-27・#665）。REQ-39・REQ-41。
+MAX_QWEN2_LORA_TRAIN_RSS_BYTES = 24 * 1024 * 1024 * 1024
 
 
 def max_train_rss_bytes_for_kind(kind: str) -> int:
-    """`kind` ごとの学習 RSS の既定・上限。qwen2_lora のみ 12 GiB、他は 8 GiB。"""
+    """`kind` ごとの学習 RSS の既定・上限。qwen2_lora のみ 24 GiB、他は 8 GiB。"""
     if kind == "qwen2_lora":
         return MAX_QWEN2_LORA_TRAIN_RSS_BYTES
     return MAX_TRAIN_RSS_BYTES

@@ -366,3 +366,42 @@ def test_malformed_tokenizer_rejected(tmp_path: Path) -> None:
     with pytest.raises(WorkerError) as exc:
         load(tmp_path, exp=expected(d))
     fails(exc, "invalid_data", ExitCode.INVALID_INPUT)
+
+
+# --- forward 上限が budget に追従する（#689） ------------------------------
+
+
+def test_forward_limit_follows_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39・#689: 8 GiB 超 24 GiB 未満の見積もりは、budget 24 GiB なら通り、8 GiB なら拒否。"""
+    make_dir(tmp_path)
+    need = 10 << 30  # 7B の重み込みの見積もりを模す（実重みは作らない）
+    monkeypatch.setattr(qwen2_model.Qwen2Model, "forward_bytes", lambda self, *a, **k: need)
+    ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    wide = load(tmp_path, resource_budget=budget(rss=24 << 30)).model
+    assert wide.forward_limit_bytes == 24 << 30
+    h = wide.hidden_states(ids)  # 通る
+    assert wide.project(h, source_shape=(1, 3), with_mask=False).shape[-1] == 300
+    assert wide(ids).shape == (1, 3, 300)
+
+    narrow = load(tmp_path, resource_budget=budget(rss=8 << 30)).model
+    assert narrow.forward_limit_bytes == 8 << 30
+    with pytest.raises(WorkerError) as exc:
+        narrow.hidden_states(ids)
+    fails(exc, "limit_exceeded", ExitCode.LIMIT_EXCEEDED)
+    with pytest.raises(WorkerError) as exc:
+        narrow.project(h, source_shape=(1, 3), with_mask=False)
+    fails(exc, "limit_exceeded", ExitCode.LIMIT_EXCEEDED)
+    with pytest.raises(WorkerError) as exc:
+        narrow(ids)
+    fails(exc, "limit_exceeded", ExitCode.LIMIT_EXCEEDED)
+
+
+def test_forward_limit_not_lowered_below_default(tmp_path: Path) -> None:
+    """REQ-39・#689: budget が 8 GiB 未満でも forward 上限は既定 8 GiB（下げない）。budget 無しの
+    直接構築も既定のまま。"""
+    make_dir(tmp_path)
+    small = load(tmp_path, resource_budget=budget(rss=1 << 30)).model
+    assert small.forward_limit_bytes == qwen2_model.MAX_FORWARD_MEMORY_BYTES == 8 << 30
+    direct = qwen2_model.Qwen2Model(small.config)
+    assert direct.forward_limit_bytes == 8 << 30
