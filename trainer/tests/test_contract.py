@@ -505,7 +505,7 @@ def test_load_request_rejects_rss_limit_above_max(tmp_path: Path) -> None:
 
 
 def test_rss_limit_is_kind_dependent(tmp_path: Path) -> None:
-    """REQ-39・#665: qwen2_lora は 12 GiB まで可（既定も 12 GiB）、他 kind は 8 GiB 超を拒否。"""
+    """REQ-39・#665: qwen2_lora は 24 GiB まで可（既定も 24 GiB）、他 kind は 8 GiB 超を拒否。"""
     from fandhe_edge_trainer.limits import MAX_QWEN2_LORA_TRAIN_RSS_BYTES, MAX_TRAIN_RSS_BYTES
 
     def load(kind: str, rss: int | None) -> int | None:
@@ -518,9 +518,9 @@ def test_rss_limit_is_kind_dependent(tmp_path: Path) -> None:
         except WorkerError:
             return None
 
-    assert load("qwen2_lora", 12 << 30) == 12 << 30
+    assert load("qwen2_lora", 24 << 30) == 24 << 30
     assert load("qwen2_lora", None) == MAX_QWEN2_LORA_TRAIN_RSS_BYTES
-    assert load("qwen2_lora", (12 << 30) + 1) is None
+    assert load("qwen2_lora", (24 << 30) + 1) is None
     assert load("c3", 8 << 30) == MAX_TRAIN_RSS_BYTES
     assert load("c3", (8 << 30) + 1) is None
 

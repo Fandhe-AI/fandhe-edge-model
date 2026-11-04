@@ -1063,6 +1063,7 @@ mod tests {
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
                 base_model_dir: None,
+                batch_size: None,
                 device: fandhe_edge_train::request::Device::Cpu,
                 project_dir: p(),
                 op: TrainOp::Run(TrainTarget::Candidate(0)),

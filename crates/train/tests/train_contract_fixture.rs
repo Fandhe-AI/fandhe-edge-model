@@ -113,6 +113,10 @@ fn req39_limits_fixture_matches_rust_constants() {
         Some(limits::MAX_QWEN2_LORA_TRAIN_RSS_BYTES)
     );
     assert_eq!(
+        fixture["max_qwen2_lora_batch_size"].as_u64(),
+        Some(u64::from(limits::MAX_QWEN2_LORA_BATCH_SIZE))
+    );
+    assert_eq!(
         fixture["max_result_bytes"].as_u64(),
         Some(limits::MAX_RESULT_BYTES as u64)
     );

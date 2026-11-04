@@ -27,6 +27,7 @@
 
 use crate::project::DEFAULT_SEED;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_train::limits::MAX_QWEN2_LORA_BATCH_SIZE;
 use fandhe_edge_train::request::Device;
 use fandhe_edge_train::search::SearchBudget;
 use std::ffi::OsString;
@@ -207,17 +208,23 @@ const TRAIN_OPTS: &[OptSpec] = &[
         false,
         "Training device (default: cpu; gpu is not bit-reproducible across runs)",
     ),
+    opt(
+        "--batch-size",
+        "N",
+        false,
+        "Training batch size for --kind qwen2_lora (1 to 64, default: 4)",
+    ),
     OptSpec {
         name: "--status",
         value: None,
         required: false,
-        help: "Report recorded training jobs (optionally only --candidate N); not with --all, --budget-seconds, --smoke, --train-seed or --device",
+        help: "Report recorded training jobs (optionally only --candidate N); not with --all, --budget-seconds, --smoke, --train-seed, --device or --batch-size",
     },
     OptSpec {
         name: "--cancel",
         value: None,
         required: false,
-        help: "Request cancellation of running training jobs (optionally only --candidate N) and return immediately; not with --status, --all, --budget-seconds, --smoke, --train-seed or --device",
+        help: "Request cancellation of running training jobs (optionally only --candidate N) and return immediately; not with --status, --all, --budget-seconds, --smoke, --train-seed, --device or --batch-size",
     },
 ];
 const EVALUATE_OPTS: &[OptSpec] = &[
@@ -340,6 +347,9 @@ pub struct TrainArgs {
     pub base_model_dir: Option<PathBuf>,
     /// `--device`: 学習の実行デバイス（既定 cpu。同一 seed で結果一致が要るテストは CPU で行う。REQ-41・#665）。
     pub device: Device,
+    /// `--batch-size`: qwen2_lora の学習 batch 件数（`1..=MAX_QWEN2_LORA_BATCH_SIZE`。省略時は学習ワーカーの
+    /// 既定 4。qwen2_lora 以外との組み合わせの検査は `train` 工程。REQ-41・REQ-39・#689）。
+    pub batch_size: Option<u32>,
 }
 /// `evaluate` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +459,8 @@ pub enum ArgsError {
     InvalidTrainSeed,
     /// `--device` が `cpu` / `gpu` のどちらでもない。
     InvalidDevice,
+    /// `--batch-size` が `1..=MAX_QWEN2_LORA_BATCH_SIZE` の整数でない。
+    InvalidBatchSize,
     /// `--budget-seconds` が `1..=MAX_SEARCH_BUDGET_SECONDS` の整数でない。
     InvalidBudgetSeconds,
     /// `train` に `--candidate` と `--all` の両方が指定された。
@@ -518,6 +530,9 @@ impl fmt::Display for ArgsError {
                 f.write_str("option --train-seed must be an integer in the range 0 to 4294967295")
             }
             ArgsError::InvalidDevice => f.write_str("option --device must be cpu or gpu"),
+            ArgsError::InvalidBatchSize => {
+                f.write_str("option --batch-size must be an integer in the range 1 to 64")
+            }
             ArgsError::InvalidBudgetSeconds => {
                 f.write_str("option --budget-seconds must be an integer in the range 1 to 921600")
             }
@@ -768,6 +783,18 @@ impl Values {
             },
         }
     }
+    fn batch_size(&mut self) -> Result<Option<u32>, ArgsError> {
+        self.take("--batch-size")
+            .map(|v| {
+                v.into_string()
+                    .map_err(|_| ArgsError::NonUtf8Argument)?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| (1..=MAX_QWEN2_LORA_BATCH_SIZE).contains(n))
+                    .ok_or(ArgsError::InvalidBatchSize)
+            })
+            .transpose()
+    }
     fn budget(&mut self) -> Result<SearchBudget, ArgsError> {
         match self.take("--budget-seconds") {
             None => Ok(SearchBudget::default()),
@@ -798,6 +825,7 @@ impl Values {
             "--train-seed",
             "--base-model-dir",
             "--device",
+            "--batch-size",
         ] {
             if self.0.iter().any(|(n, _)| *n == option) {
                 return Err(if status {
@@ -883,6 +911,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
                 train_seed: v.train_seed()?,
                 kinds,
                 base_model_dir: v.opt_path("--base-model-dir"),
+                batch_size: v.batch_size()?,
                 device: v.device()?,
             })
         }
@@ -1212,6 +1241,62 @@ mod tests {
         }
     }
 
+    /// REQ-41・REQ-39・REQ-33・#689: `--batch-size` は `1..=64` の整数だけ受理（0・65・非数値・重複は 64）。
+    /// 省略時は `None`（既定 4 は学習ワーカー側）。状態確認・キャンセルとの併用は拒否。
+    #[test]
+    fn req41_issue689_batch_size_option() {
+        let bs = |extra: &[&'static str]| {
+            let mut a = vec!["train", "--project-dir", "p", "--candidate", "0"];
+            a.extend_from_slice(extra);
+            match p(&a) {
+                Ok(Invocation::Run(Command::Train(t))) => Ok(t.batch_size),
+                Ok(other) => panic!("train expected: {other:?}"),
+                Err(e) => Err(e),
+            }
+        };
+        assert_eq!(bs(&[]), Ok(None));
+        assert_eq!(bs(&["--batch-size", "1"]), Ok(Some(1)));
+        assert_eq!(bs(&["--batch-size", "2"]), Ok(Some(2)));
+        assert_eq!(bs(&["--batch-size", "64"]), Ok(Some(64)));
+        for bad in ["0", "65", "-1", "two", "", "2.5"] {
+            let e = bs(&["--batch-size", bad]).unwrap_err();
+            assert_eq!(e, ArgsError::InvalidBatchSize, "{bad}");
+            assert_eq!(e.exit_code(), ExitCode::InvalidInput);
+        }
+        assert_eq!(
+            bs(&["--batch-size", "2", "--batch-size", "4"]),
+            Err(ArgsError::DuplicateOption {
+                option: "--batch-size"
+            })
+        );
+        assert_eq!(
+            p(&[
+                "train",
+                "--project-dir",
+                "p",
+                "--status",
+                "--batch-size",
+                "2"
+            ]),
+            Err(ArgsError::IncompatibleWithStatus {
+                option: "--batch-size"
+            })
+        );
+        assert_eq!(
+            p(&[
+                "train",
+                "--project-dir",
+                "p",
+                "--cancel",
+                "--batch-size",
+                "2"
+            ]),
+            Err(ArgsError::IncompatibleWithCancel {
+                option: "--batch-size"
+            })
+        );
+    }
+
     /// REQ-41・REQ-33・#628: `--base-model-dir` は `train` だけが 1 回受理し、空値・重複・状態確認・
     /// キャンセルとの併用は拒否する（`--kind qwen2_lora` との組み合わせは `train` 工程で検査する）。
     #[test]
@@ -1285,6 +1370,7 @@ mod tests {
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
                 base_model_dir: None,
+                batch_size: None,
                 device: Device::Cpu,
                 project_dir: "proj".into(),
                 op: TrainOp::Run(TrainTarget::Candidate(2)),
@@ -1297,6 +1383,7 @@ mod tests {
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
                 base_model_dir: None,
+                batch_size: None,
                 device: Device::Cpu,
                 project_dir: "proj".into(),
                 op: TrainOp::Run(TrainTarget::Candidate(0)),
@@ -1407,6 +1494,7 @@ mod tests {
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
                 base_model_dir: None,
+                batch_size: None,
                 device: Device::Cpu,
                 project_dir: "proj".into(),
                 op: budget(3600),

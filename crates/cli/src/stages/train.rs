@@ -126,6 +126,7 @@ use fandhe_edge_train::job_record::{
 use fandhe_edge_train::kind_resolution::{
     CommonTrainParams, EXPLICIT_ONLY_KINDS, resolve_with_explicit_kinds,
 };
+use fandhe_edge_train::limits::MAX_QWEN2_LORA_BATCH_SIZE;
 use fandhe_edge_train::limits::{MAX_REQUEST_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION};
 use fandhe_edge_train::process::{RunLimits, TrainRunEnd, WorkerCandidateRunner, WorkerLauncher};
 use fandhe_edge_train::request::{
@@ -155,8 +156,8 @@ use crate::args::TrainArgs;
 use crate::error_report::{ToErrorReport, train_outcome_error_report};
 use crate::project::{
     CANCEL_REQUEST_FILE, CANDIDATES_DIR, CreatedDir, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR,
-    Project, REQUEST_FILE, RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_DEVICE_FILE,
-    TRAIN_INPUT_FILE, TRAIN_SEED_FILE, fail, invalid, runtime,
+    Project, REQUEST_FILE, RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_BATCH_SIZE_FILE,
+    TRAIN_DEVICE_FILE, TRAIN_INPUT_FILE, TRAIN_SEED_FILE, fail, invalid, runtime,
 };
 
 /// 学習ワーカーのディレクトリ（`launch.py` と `.venv`）を指す環境変数。絶対パスのみ受理する。
@@ -271,6 +272,24 @@ const BASE_MODEL_KIND: &str = "qwen2_lora";
 
 /// 学習リクエストの `config.base_model_dir`（場所。`train` だけが入れ、後工程は保存値を写して照合する）。
 const BASE_MODEL_DIR_KEY: &str = "base_model_dir";
+
+/// 学習リクエストの `config.batch_size`（学習ワーカー契約の既存キー。`kind_defaults` の既定は 4）。
+const BATCH_SIZE_KEY: &str = "batch_size";
+
+/// `--batch-size` を qwen2_lora の候補の `config.batch_size` へ入れる（他の種類には入れない。指定と種類の
+/// 組み合わせの検査は呼び出し側。REQ-41・#689）。`select`・`evaluate`・`package` は [`recorded_batch_size`] の
+/// 値を同じ関数で入れて期待値を組むため、`request_matches_candidate` が厳密に照合する（同一性に関わるので
+/// `base_model_dir` のような写しの例外にしない）。
+pub fn apply_batch_size(candidate: &mut SearchCandidate, batch_size: Option<u32>) {
+    if let Some(n) = batch_size
+        && candidate.params.kind == BASE_MODEL_KIND
+    {
+        candidate
+            .params
+            .config
+            .insert(BATCH_SIZE_KEY.to_string(), n.into());
+    }
+}
 
 /// 定義の `base_model`（同一性と来歴）を学習リクエストの `config.base_model_*` へ写す（#628）。任意欄は
 /// 定義に無ければ入れない（学習ワーカーは来歴を `null` にする）。`select`・`evaluate`・`package` も同じ
@@ -428,6 +447,11 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Tr
     if args.smoke {
         apply_smoke_checked(&mut candidate)?;
     }
+    // `--batch-size` は qwen2_lora の候補にだけ意味を持つ。ほかの種類へ黙って捨てない（#689）。
+    if args.batch_size.is_some() && candidate.params.kind != BASE_MODEL_KIND {
+        return Err(invalid("option --batch-size requires --kind qwen2_lora").into());
+    }
+    apply_batch_size(&mut candidate, args.batch_size);
     // ベースモデルの場所と実ファイルの照合（#628）。候補ディレクトリの作成・学習ワーカーの起動より前に止める。
     let base_model_dir = checked_base_model_dir(
         args,
@@ -991,6 +1015,15 @@ fn prepare_candidate_dir(
     if request.device() == Device::Gpu {
         project.write_new(rel.join(TRAIN_DEVICE_FILE), b"gpu")?;
     }
+    // batch 件数も同様に request.json とは別に記録する（qwen2_lora で `--batch-size` を指定した候補だけ。#689）。
+    if request.kind() == BASE_MODEL_KIND
+        && let Some(n) = request
+            .config()
+            .get(BATCH_SIZE_KEY)
+            .and_then(|v| v.as_u64())
+    {
+        project.write_new(rel.join(TRAIN_BATCH_SIZE_FILE), n.to_string().as_bytes())?;
+    }
     Ok(job_dir)
 }
 
@@ -1107,6 +1140,11 @@ where
         resolve_candidates(&project, &definition, 0, seed, &args.kinds, args.device)?.len();
     // ベースモデルの照合は探索の開始前に 1 回（#628）。`--kind qwen2_lora` があれば候補に含まれる。
     let base_model_dir = checked_base_model_dir(args, &definition, cwd, true)?;
+    // `--all` では qwen2_lora の候補（`--kind qwen2_lora` で足した 1 件）にだけ適用する。c1・c3 には入れない。
+    // `--kind qwen2_lora` が無ければ適用先が無いため拒否する（#689）。
+    if args.batch_size.is_some() && !args.kinds.iter().any(|k| k == BASE_MODEL_KIND) {
+        return Err(invalid("option --batch-size requires --kind qwen2_lora").into());
+    }
     let mut candidates = Vec::with_capacity(n_candidates);
     for index in 0..n_candidates {
         let mut candidate =
@@ -1118,6 +1156,7 @@ where
             apply_smoke_checked(&mut candidate)?;
         }
         apply_base_model_dir(&mut candidate, base_model_dir.as_deref());
+        apply_batch_size(&mut candidate, args.batch_size);
         candidates.push(candidate);
     }
     // やり直しは新規（REQ-34）。既存の探索記録があれば何も作らずに止める。既存の候補ディレクトリは単発の
@@ -1497,6 +1536,30 @@ pub fn recorded_device(project: &Project, index: usize) -> Result<Device, ErrorR
     }
 }
 
+/// 候補 `index` の `--batch-size` の記録（`train_batch_size.txt`）を返す。記録が無い候補（指定しなかった候補・
+/// #689 以前の候補）は `None`（既定どおり）。`select`・`evaluate`・`package` が [`apply_batch_size`] で期待値へ
+/// 反映し、`request.json` の `config.batch_size` 単独の書き換えを [`request_matches_candidate`] で弾く
+/// （REQ-27・REQ-41・REQ-39・#689）。
+///
+/// # Errors
+/// 記録が正準形の `1..=MAX_QWEN2_LORA_BATCH_SIZE`（`u32::to_string` と完全一致。`+2`・`02`・末尾改行・空は不可）
+/// でなければ `invalid_input`（64。fail-closed）。読み込み前にサイズ上限（8 バイト）を確認する。
+pub fn recorded_batch_size(project: &Project, index: usize) -> Result<Option<u32>, ErrorReport> {
+    let Some(bytes) = project.read_optional(candidate_rel(index).join(TRAIN_BATCH_SIZE_FILE), 8)?
+    else {
+        return Ok(None);
+    };
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|t| {
+            t.parse::<u32>()
+                .ok()
+                .filter(|v| v.to_string() == t && (1..=MAX_QWEN2_LORA_BATCH_SIZE).contains(v))
+        })
+        .map(Some)
+        .ok_or_else(|| invalid("train batch size record is invalid"))
+}
+
 /// `split.json` を読んで解析する（検証はしない。`package` が記録済みの seed を取り出すのにも使う）。
 ///
 /// # Errors
@@ -1867,6 +1930,7 @@ mod all_tests {
         TrainArgs {
             kinds: vec!["qwen2_lora".to_string()],
             base_model_dir: Some(BASE_MODEL_DIR.into()),
+            batch_size: None,
             device: Device::Cpu,
             ..all_args()
         }
@@ -1876,6 +1940,7 @@ mod all_tests {
         TrainArgs {
             kinds: Vec::new(),
             base_model_dir: None,
+            batch_size: None,
             device: Device::Cpu,
             project_dir: "proj".into(),
             op: TrainOp::Run(TrainTarget::All {
@@ -2072,6 +2137,7 @@ mod all_tests {
             };
             let args = TrainArgs {
                 base_model_dir: (!kinds.is_empty()).then(|| BASE_MODEL_DIR.into()),
+                batch_size: None,
                 device: Device::Cpu,
                 kinds,
                 ..all_args()
@@ -2201,6 +2267,7 @@ mod all_tests {
         let smoke = TrainArgs {
             kinds: vec!["qwen2_lora".to_string()],
             base_model_dir: None,
+            batch_size: None,
             device: Device::Cpu,
             smoke: true,
             ..single
@@ -2574,6 +2641,7 @@ mod all_tests {
             (
                 TrainArgs {
                     base_model_dir: Some(BASE_MODEL_DIR.into()),
+                    batch_size: None,
                     device: Device::Cpu,
                     ..all_args()
                 },
@@ -2582,6 +2650,7 @@ mod all_tests {
             (
                 TrainArgs {
                     base_model_dir: Some("../bm".into()),
+                    batch_size: None,
                     device: Device::Cpu,
                     ..qwen2_all_args()
                 },
@@ -2590,6 +2659,7 @@ mod all_tests {
             (
                 TrainArgs {
                     base_model_dir: Some(outside.clone()),
+                    batch_size: None,
                     device: Device::Cpu,
                     ..qwen2_all_args()
                 },
@@ -2598,6 +2668,7 @@ mod all_tests {
             (
                 TrainArgs {
                     base_model_dir: Some("bm-link".into()),
+                    batch_size: None,
                     device: Device::Cpu,
                     ..qwen2_all_args()
                 },
@@ -2765,6 +2836,201 @@ mod all_tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// 実行時に見えた `(request, train_batch_size.txt の内容)` の列。
+    type SeenRequests = Vec<(TrainRequest, Option<String>)>;
+
+    /// `--batch-size` 付き（なし）の `train --all --kind qwen2_lora` を偽の実行器で走らせ、qwen2_lora の実行時に
+    /// 見えた `(request, 実行中の train_batch_size.txt)` を返す（c1 は成功、qwen2_lora は失敗扱い）。
+    fn run_qwen2_with_batch(case: &str, batch_size: Option<u32>) -> (PathBuf, SeenRequests) {
+        let cwd = inspected_workdir(case);
+        let seen: Rc<std::cell::RefCell<SeenRequests>> = Rc::default();
+        let captured = Rc::clone(&seen);
+        let candidates_dir = cwd.join("proj/candidates");
+        let make_job = move || -> Result<Box<JobFn<'static>>, ErrorReport> {
+            Ok(Box::new(
+                move |request: &TrainRequest, _: ConfinedPackage| {
+                    let n = if request.kind() == "qwen2_lora" { 2 } else { 0 };
+                    let record = std::fs::read_to_string(
+                        candidates_dir.join(format!("{n}/train_batch_size.txt")),
+                    )
+                    .ok();
+                    captured.borrow_mut().push((request.clone(), record));
+                    if request.kind() == "c1" {
+                        return Ok(fake_c1_success(request));
+                    }
+                    let stdout = br#"{"status":"error","code":"training_diverged","message":"x"}"#;
+                    Ok(TrainOutcome::from_worker_stdout(stdout, request).expect("failure"))
+                },
+            ))
+        };
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        let args = TrainArgs {
+            batch_size,
+            ..qwen2_all_args()
+        };
+        run_all_with(&args, SearchBudget::default(), &cwd, make_job, &clock).expect("train --all");
+        let seen = seen.borrow().clone();
+        (cwd, seen)
+    }
+
+    /// REQ-41・REQ-39・REQ-27・#689: `--batch-size 2` は qwen2_lora の request の `config.batch_size` と
+    /// `train_batch_size.txt` に入り（c1・c3 には入らない）、後工程と同じ期待値の組み方で一致する。記録を
+    /// 書き換えた（別の値・記録なし）期待値は不一致になる（証拠種別: テストハーネス）。
+    #[test]
+    fn req41_issue689_batch_size_is_recorded_and_checked() {
+        let (cwd, seen) = run_qwen2_with_batch("bs-2", Some(2));
+        let qwen = seen
+            .iter()
+            .find(|(r, _)| r.kind() == "qwen2_lora")
+            .expect("qwen2_lora ran");
+        assert_eq!(qwen.0.config().get("batch_size"), Some(&2.into()));
+        assert_eq!(qwen.1.as_deref(), Some("2"));
+        let c1 = seen.iter().find(|(r, _)| r.kind() == "c1").expect("c1 ran");
+        assert_eq!(c1.1, None);
+
+        let project = Project::open(&cwd, Path::new("proj")).expect("project");
+        let definition = project.load_definition().expect("definition");
+        let records = project.load_records(&definition).expect("records");
+        let (split, seed) = verified_split(&project, &records).expect("split");
+        let params_with = |batch: Option<u32>| {
+            let mut c = resolve_candidates(
+                &project,
+                &definition,
+                2,
+                seed,
+                &qwen2_all_args().kinds,
+                Device::Cpu,
+            )
+            .expect("candidates")
+            .swap_remove(2);
+            apply_batch_size(&mut c, batch);
+            c.params
+        };
+        let matches = |batch: Option<u32>| {
+            request_matches_candidate(
+                &qwen.0,
+                &params_with(batch),
+                Some(qwen.0.time_limit_seconds()),
+                &records,
+                &split,
+            )
+        };
+        assert!(matches(Some(2)));
+        assert!(!matches(Some(4)));
+        assert!(!matches(None));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-41・REQ-33・#689: `--batch-size` なしでは qwen2_lora の request に `batch_size` が入らず
+    /// （学習ワーカーの既定 4 に任せる）、`train_batch_size.txt` も作らない。記録が無い候補は期待値も
+    /// 既定のまま一致する（#689 以前の候補との互換）。
+    #[test]
+    fn req41_issue689_without_batch_size_request_and_record_are_unchanged() {
+        let (cwd, seen) = run_qwen2_with_batch("bs-none", None);
+        let qwen = seen
+            .iter()
+            .find(|(r, _)| r.kind() == "qwen2_lora")
+            .expect("qwen2_lora ran");
+        assert_eq!(qwen.0.config().get("batch_size"), None);
+        assert_eq!(qwen.1, None);
+        let project = Project::open(&cwd, Path::new("proj")).expect("project");
+        assert_eq!(recorded_batch_size(&project, 2), Ok(None));
+        let definition = project.load_definition().expect("definition");
+        let records = project.load_records(&definition).expect("records");
+        let (split, seed) = verified_split(&project, &records).expect("split");
+        let mut c = resolve_candidates(
+            &project,
+            &definition,
+            2,
+            seed,
+            &qwen2_all_args().kinds,
+            Device::Cpu,
+        )
+        .expect("candidates")
+        .swap_remove(2);
+        apply_batch_size(&mut c, recorded_batch_size(&project, 2).expect("record"));
+        assert!(request_matches_candidate(
+            &qwen.0,
+            &c.params,
+            Some(qwen.0.time_limit_seconds()),
+            &records,
+            &split
+        ));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-41・REQ-39・#689: qwen2_lora 以外の候補への `--batch-size`（単発の c1、`--kind qwen2_lora` の無い
+    /// `--all`）は学習ワーカーの起動と候補ディレクトリの作成より前に `invalid_input`（64）で止まる。
+    #[test]
+    fn req41_issue689_batch_size_requires_qwen2_lora() {
+        let cwd = inspected_workdir("bs-reject");
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        let single = TrainArgs {
+            op: TrainOp::Run(TrainTarget::Candidate(0)),
+            batch_size: Some(2),
+            ..all_args()
+        };
+        let e = run(&single, 0, &cwd).expect_err("c1 with --batch-size");
+        assert_eq!(
+            train_error_pair(&e),
+            (
+                ExitCode::InvalidInput,
+                "option --batch-size requires --kind qwen2_lora"
+            )
+        );
+        let all = TrainArgs {
+            batch_size: Some(2),
+            ..all_args()
+        };
+        let e = run_all_with(
+            &all,
+            SearchBudget::default(),
+            &cwd,
+            || -> Result<Box<JobFn<'static>>, ErrorReport> { panic!("must not start jobs") },
+            &clock,
+        )
+        .expect_err("--all without qwen2_lora");
+        assert_eq!(
+            train_error_pair(&e),
+            (
+                ExitCode::InvalidInput,
+                "option --batch-size requires --kind qwen2_lora"
+            )
+        );
+        assert!(!cwd.join("proj/candidates").exists());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-39・REQ-41・#689: `train_batch_size.txt` は正準形の `1..=64` だけ受理し、それ以外（先頭 0・符号・
+    /// 改行・範囲外・空・サイズ超過）は `invalid_input`（64）で止まる。
+    #[test]
+    fn req39_issue689_recorded_batch_size_is_strict() {
+        let cwd = inspected_workdir("bs-record");
+        let project = Project::open(&cwd, Path::new("proj")).expect("project");
+        let dir = cwd.join("proj/candidates/0");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("train_batch_size.txt");
+        assert_eq!(recorded_batch_size(&project, 0), Ok(None));
+        for (text, want) in [("1", 1), ("2", 2), ("64", 64)] {
+            std::fs::write(&file, text).expect("write");
+            assert_eq!(recorded_batch_size(&project, 0), Ok(Some(want)));
+        }
+        for bad in ["", "0", "65", "02", "+2", "2\n", "-1", "two"] {
+            std::fs::write(&file, bad).expect("write");
+            let e = recorded_batch_size(&project, 0).expect_err(bad);
+            assert_eq!(e.code, ExitCode::InvalidInput, "{bad:?}");
+        }
+        // 8 バイトを超える記録は読み込み前の上限で 20（`train_device.txt` と同じ扱い）。
+        std::fs::write(&file, "123456789").expect("write");
+        let e = recorded_batch_size(&project, 0).expect_err("too large");
+        assert_eq!(e.code, ExitCode::LimitExceeded);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     fn train_error_pair(error: &TrainError) -> (ExitCode, &str) {
         match error {
             TrainError::Report(report) => error_pair(report),
@@ -2806,6 +3072,7 @@ mod status_tests {
         let args = TrainArgs {
             kinds: Vec::new(),
             base_model_dir: None,
+            batch_size: None,
             device: Device::Cpu,
             project_dir: "proj".into(),
             op: TrainOp::Status(candidate),
@@ -3387,6 +3654,7 @@ mod status_tests {
         let args = TrainArgs {
             kinds: Vec::new(),
             base_model_dir: None,
+            batch_size: None,
             device: Device::Cpu,
             project_dir: "proj".into(),
             op: TrainOp::Cancel(candidate),

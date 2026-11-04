@@ -60,8 +60,8 @@ use super::candidate_artifact::{
 };
 use super::infer::{is_tokenizer_qwen2, kind_version_allowed, load_backend};
 use super::train::{
-    allotted_time_limit, effective_train_seed, load_trained, recorded_device,
-    request_matches_candidate, resolve_candidates, verified_split,
+    allotted_time_limit, apply_batch_size, effective_train_seed, load_trained, recorded_batch_size,
+    recorded_device, request_matches_candidate, resolve_candidates, verified_split,
 };
 
 /// `select` を実行する。
@@ -223,7 +223,9 @@ pub fn compute_selection_with_exclusions(
             let mut all =
                 resolve_candidates(project, definition, i, seed, &explicit_kinds, device)?;
             if i < all.len() {
-                Ok(all.swap_remove(i))
+                let mut candidate = all.swap_remove(i);
+                apply_batch_size(&mut candidate, recorded_batch_size(project, i)?);
+                Ok(candidate)
             } else {
                 Err(runtime("candidate is not available"))
             }

@@ -167,9 +167,9 @@ use super::infer::is_tokenizer_qwen2;
 use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
-    allotted_time_limit, candidate_rel, effective_train_seed, load_trained, recorded_device,
-    request_is_smoke_trained, request_matches_candidate, resolve_candidates, train_rows,
-    verified_split,
+    allotted_time_limit, apply_batch_size, candidate_rel, effective_train_seed, load_trained,
+    recorded_batch_size, recorded_device, request_is_smoke_trained, request_matches_candidate,
+    resolve_candidates, train_rows, verified_split,
 };
 
 /// `package` の結果（終了コードの決定と、stdout へ載せる計測値。#340）。
@@ -222,7 +222,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     let records = inspect_bytes(&train_bytes, &definition)?;
     let (split, split_seed) = verified_split(&project, &records)?;
     let seed = effective_train_seed(&project, selection.candidate_index, split_seed)?;
-    let candidates = resolve_candidates(
+    let mut candidates = resolve_candidates(
         &project,
         &definition,
         selection.candidate_index,
@@ -231,9 +231,13 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
         recorded_device(&project, selection.candidate_index)?,
     )?;
     let candidate = candidates
-        .get(selection.candidate_index)
+        .get_mut(selection.candidate_index)
         .filter(|c| c.candidate_id == selection.candidate_id)
         .ok_or_else(|| invalid("selection record does not match the candidate"))?;
+    apply_batch_size(
+        candidate,
+        recorded_batch_size(&project, selection.candidate_index)?,
+    );
     let (request, outcome) = load_trained(&project, selection.candidate_index)?
         .ok_or_else(|| invalid("selected candidate is not trained"))?;
     let allotted =

@@ -243,7 +243,7 @@ pub struct TrainRequestParams {
     pub out_dir: String,
     /// 省略時は [`MAX_TRAIN_WALL_SECONDS`]（`contract.py` の既定値と同じ）。
     pub time_limit_seconds: Option<u32>,
-    /// 省略時は [`max_train_rss_bytes_for_kind`]（`contract.py` の既定値と同じ。qwen2_lora のみ 12 GiB、他は 8 GiB）。
+    /// 省略時は [`max_train_rss_bytes_for_kind`]（`contract.py` の既定値と同じ。qwen2_lora のみ 24 GiB、他は 8 GiB）。
     pub rss_limit_bytes: Option<u64>,
 }
 
@@ -535,7 +535,7 @@ impl TrainRequest {
         if !(1..=MAX_TRAIN_WALL_SECONDS).contains(&time_limit_seconds) {
             return Err(TrainRequestError::InvalidTimeLimitSeconds);
         }
-        // kind ごとの既定・上限（qwen2_lora のみ 12 GiB。#665・REQ-39）
+        // kind ごとの既定・上限（qwen2_lora のみ 24 GiB。#665・#689・REQ-39）
         let max_rss = max_train_rss_bytes_for_kind(&params.kind);
         let rss_limit_bytes = params.rss_limit_bytes.unwrap_or(max_rss);
         if !(1..=max_rss).contains(&rss_limit_bytes) {
@@ -878,8 +878,8 @@ mod tests {
         assert_eq!(req.rss_limit_bytes(), crate::limits::MAX_TRAIN_RSS_BYTES);
     }
 
-    /// REQ-39・#665: `rss_limit_bytes` の上限と既定は kind 依存。qwen2_lora は 12 GiB 可・
-    /// 12 GiB + 1 拒否・省略時 12 GiB、他 kind は 8 GiB 可・8 GiB + 1 拒否。
+    /// REQ-39・#665: `rss_limit_bytes` の上限と既定は kind 依存。qwen2_lora は 24 GiB 可・
+    /// 24 GiB + 1 拒否・省略時 24 GiB、他 kind は 8 GiB 可・8 GiB + 1 拒否。
     #[test]
     fn req39_rss_limit_is_kind_dependent() {
         let with = |kind: &str, rss: Option<u64>| {
@@ -890,17 +890,17 @@ mod tests {
         };
         let gib = 1u64 << 30;
         assert_eq!(
-            with("qwen2_lora", Some(12 * gib))
+            with("qwen2_lora", Some(24 * gib))
                 .unwrap()
                 .rss_limit_bytes(),
-            12 * gib
+            24 * gib
         );
         assert_eq!(
             with("qwen2_lora", None).unwrap().rss_limit_bytes(),
-            12 * gib
+            24 * gib
         );
         assert!(matches!(
-            with("qwen2_lora", Some(12 * gib + 1)),
+            with("qwen2_lora", Some(24 * gib + 1)),
             Err(TrainRequestError::InvalidRssLimitBytes)
         ));
         assert_eq!(
