@@ -316,11 +316,14 @@ pub fn cumsum(x: &Tensor<f32>, axis: &Tensor<i64>) -> Result<Tensor<f32>, OpErro
         .copied()
         .ok_or(OpError::InvalidAttribute)?;
     let inner = element_count(x.shape().get(ax + 1..).ok_or(OpError::InvalidAttribute)?)?;
+    // 空テンソルは要素数検証を通るが、軸の長さは巨大になりうる（例: [0, 2^62, 4]）。ブロック長の積は
+    // 要素数で抑えられないので checked で求める（REQ-39。乗算のあふれと chunks_mut(0) の panic を防ぐ）。
+    let block_len = len.checked_mul(inner).ok_or(OpError::LimitExceeded)?;
     let mut out = x.data().to_vec();
-    if len == 0 || inner == 0 {
+    if block_len == 0 || out.is_empty() {
         return Tensor::new(x.shape().to_vec(), out);
     }
-    for block in out.chunks_mut(len * inner) {
+    for block in out.chunks_mut(block_len) {
         for i in 1..len {
             for j in 0..inner {
                 let prev = block
@@ -924,6 +927,19 @@ mod tests {
         );
         assert!(cumsum(&x, &sc(2)).is_err());
         assert!(cumsum(&x, &v(&[0, 1])).is_err());
+    }
+
+    /// REQ-39: 空テンソルで軸の長さが巨大な形状（[0, 2^62, 4]）でも、ブロック長の乗算があふれて panic
+    /// せずに `LimitExceeded` を返す。軸の長さとブロック長が収まる空テンソルは空のまま返す。
+    #[test]
+    fn req39_cumsum_block_length_overflow_is_rejected_without_panic() {
+        let sc = |a: i64| Tensor::new(vec![], vec![a]).unwrap();
+        let huge = Tensor::<f32>::new(vec![0, 1usize << 62, 4], vec![]).unwrap();
+        assert_eq!(cumsum(&huge, &sc(1)).err(), Some(OpError::LimitExceeded));
+        let empty = Tensor::<f32>::new(vec![0, 3, 4], vec![]).unwrap();
+        let out = cumsum(&empty, &sc(1)).unwrap();
+        assert_eq!(out.shape(), [0, 3, 4]);
+        assert!(out.data().is_empty());
     }
 
     #[test]
