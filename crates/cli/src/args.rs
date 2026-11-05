@@ -155,7 +155,7 @@ const SELECT_OPTS: &[OptSpec] = &[
         "--kind",
         "KIND",
         false,
-        "Explicit-only kind to add as a candidate after the default candidates (repeatable; e.g. qwen2_lora)",
+        "Explicit-only kind to add as a candidate after the default candidates (repeatable: qwen2_lora = candidate 2, autoregressive = candidate 3)",
     ),
 ];
 const TRAIN_OPTS: &[OptSpec] = &[
@@ -164,7 +164,7 @@ const TRAIN_OPTS: &[OptSpec] = &[
         "--kind",
         "KIND",
         false,
-        "Explicit-only kind to add as a candidate after the default candidates (repeatable; e.g. qwen2_lora)",
+        "Explicit-only kind to add as a candidate after the default candidates (repeatable: qwen2_lora = candidate 2, autoregressive = candidate 3)",
     ),
     opt(
         "--candidate",

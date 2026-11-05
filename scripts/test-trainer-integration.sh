@@ -26,6 +26,7 @@ specs=(
   fandhe-edge-cli:sandbox_pipeline_real_trainer:req38_real_pipeline_completes_under_monitor_with_zero_tool_denials
   fandhe-edge-cli:sandbox_pipeline_real_trainer:req38_real_pipeline_with_evaluation_data_completes_under_monitor_with_zero_tool_denials
   fandhe-edge-cli:pipeline_real_trainer_qwen2:req41_issue628_real_trainer_qwen2_lora_trains_via_cli
+  fandhe-edge-cli:pipeline_real_trainer_autoregressive:req19b_issue697_real_trainer_autoregressive_trains_via_cli
 )
 
 out="$(mktemp)"

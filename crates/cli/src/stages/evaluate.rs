@@ -159,7 +159,7 @@ use fandhe_edge_runtime::onnx::MAX_MODEL_FILE_BYTES;
 use fandhe_edge_runtime::pipeline::{
     BackendError, InferError, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_SCORES,
 };
-use fandhe_edge_train::request::{Device, TrainRequest};
+use fandhe_edge_train::request::TrainRequest;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::stage_files::SelectionRecord;
 
@@ -189,8 +189,8 @@ use super::reproducibility::{OwnRun, SeedRuns, check_run_count, load_seed_runs};
 use super::select::compute_selection;
 use super::train::{
     allotted_time_limit, apply_batch_size, candidate_rel, effective_train_seed, load_trained,
-    recorded_batch_size, recorded_device, request_is_smoke_trained, request_matches_candidate,
-    resolve_candidates, train_rows, verified_split,
+    numbers_of, position_of, recorded_batch_size, recorded_device, request_is_smoke_trained,
+    request_matches_candidate, resolve_candidate, train_rows, verified_split,
 };
 
 /// `evaluate` の成功結果（stdout の JSON 1 つへ写す）。
@@ -236,21 +236,12 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
 
     let mut prepared_target: Option<PreparedCandidate> = None;
     let mut entries: Vec<RegisteredConfig> = Vec::new();
-    let n_candidates = resolve_candidates(
-        &project,
-        &definition,
-        args.candidate,
-        seed,
-        &explicit_kinds,
-        Device::Cpu,
-    )?
-    .len();
-    if args.candidate >= n_candidates {
-        return Err(invalid("candidate index is out of range"));
-    }
+    // 候補番号は種類ごとに固定で欠番がありうる。未定義の番号は拒否する（#697）。
+    let numbers = numbers_of(&explicit_kinds)?;
+    position_of(&explicit_kinds, args.candidate)?;
     // 対象の候補を先に検証し（固有の message を返す）、続いて全候補を事前登録用に検証する。
-    for index in
-        std::iter::once(args.candidate).chain((0..n_candidates).filter(|i| *i != args.candidate))
+    for index in std::iter::once(args.candidate)
+        .chain(numbers.iter().copied().filter(|i| *i != args.candidate))
     {
         let is_target = index == args.candidate;
         let Some(prepared) = prepare_candidate(
@@ -505,7 +496,7 @@ fn prepare_candidate(
     explicit_kinds: &[String],
 ) -> Result<Option<PreparedCandidate>, ErrorReport> {
     let seed = effective_train_seed(project, index, seed)?;
-    let mut candidates = resolve_candidates(
+    let mut candidate = resolve_candidate(
         project,
         definition,
         index,
@@ -513,9 +504,7 @@ fn prepare_candidate(
         explicit_kinds,
         recorded_device(project, index)?,
     )?;
-    let candidate = candidates
-        .get_mut(index)
-        .ok_or_else(|| invalid("candidate index is out of range"))?;
+    let candidate = &mut candidate;
     apply_batch_size(candidate, recorded_batch_size(project, index)?);
     let loaded = load_trained(project, index)?;
     let Some((request, TrainOutcome::Ok(success))) = loaded else {
@@ -525,7 +514,7 @@ fn prepare_candidate(
             Ok(None)
         };
     };
-    let allotted = allotted_time_limit(project, index, &candidate.candidate_id)?;
+    let allotted = allotted_time_limit(project, explicit_kinds, index, &candidate.candidate_id)?;
     if !request_matches_candidate(&request, &candidate.params, allotted, records, split) {
         return Err(invalid("train request does not match the candidate"));
     }
