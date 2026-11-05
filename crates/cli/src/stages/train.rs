@@ -124,7 +124,7 @@ use fandhe_edge_train::job_record::{
     JobDirOps, JobRecordError, JobStatusReport, read_job_status_in, unix_now,
 };
 use fandhe_edge_train::kind_resolution::{
-    CommonTrainParams, EXPLICIT_ONLY_KINDS, resolve_with_explicit_kinds,
+    CommonTrainParams, EXPLICIT_ONLY_KINDS, candidate_numbers, resolve_with_explicit_kinds,
 };
 use fandhe_edge_train::limits::MAX_QWEN2_LORA_BATCH_SIZE;
 use fandhe_edge_train::limits::{MAX_REQUEST_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION};
@@ -202,6 +202,50 @@ pub(crate) fn train_rows<'a>(
 #[must_use]
 pub fn candidate_rel(index: usize) -> PathBuf {
     Path::new(CANDIDATES_DIR).join(index.to_string())
+}
+
+/// 探索の位置ごとの候補番号（番号は種類ごとに固定で欠番がありうる。REQ-19b・#697）。
+///
+/// # Errors
+/// 未知の `--kind` は `invalid_input`。
+pub fn numbers_of(explicit_kinds: &[String]) -> Result<Vec<usize>, ErrorReport> {
+    candidate_numbers(explicit_kinds).map_err(|e| {
+        ErrorReport::new(
+            e.exit_code(),
+            format!("kind resolution failed: {}", e.reason_code()),
+        )
+    })
+}
+
+/// 候補番号 `number` の探索の位置。未定義の番号（欠番・範囲外）は `invalid_input`。
+///
+/// # Errors
+/// 番号が候補集合に無い場合。
+pub fn position_of(explicit_kinds: &[String], number: usize) -> Result<usize, ErrorReport> {
+    numbers_of(explicit_kinds)?
+        .iter()
+        .position(|n| *n == number)
+        .ok_or_else(|| invalid("candidate index is out of range"))
+}
+
+/// 候補番号 `number` の候補を 1 件解決する（番号で引く唯一の入口。`root` は `candidates/<number>`）。
+///
+/// # Errors
+/// 未定義の番号は `invalid_input`、ほかは [`resolve_candidates`] に同じ。
+pub fn resolve_candidate(
+    project: &Project,
+    definition: &Definition,
+    number: usize,
+    seed: u32,
+    explicit_kinds: &[String],
+    device: Device,
+) -> Result<SearchCandidate, ErrorReport> {
+    let position = position_of(explicit_kinds, number)?;
+    let mut all = resolve_candidates(project, definition, number, seed, explicit_kinds, device)?;
+    if position >= all.len() {
+        return Err(runtime("candidate resolution is inconsistent"));
+    }
+    Ok(all.swap_remove(position))
 }
 
 /// 既定候補の一覧を解決する（`root` は候補ディレクトリの絶対パス。文字列としてのみ使う）。
@@ -438,12 +482,8 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Tr
     // [`effective_train_seed`] でそれを正とする（`request.json` の seed 改ざんは従来どおり照合で弾く）。
     let seed = args.train_seed.unwrap_or(split_seed);
 
-    let mut candidates =
-        resolve_candidates(&project, &definition, index, seed, &args.kinds, args.device)?;
-    if index >= candidates.len() {
-        return Err(invalid("candidate index is out of range").into());
-    }
-    let mut candidate = candidates.swap_remove(index);
+    let mut candidate =
+        resolve_candidate(&project, &definition, index, seed, &args.kinds, args.device)?;
     if args.smoke {
         apply_smoke_checked(&mut candidate)?;
     }
@@ -1033,7 +1073,7 @@ fn prepare_candidate_dir(
 fn apply_smoke_checked(candidate: &mut SearchCandidate) -> Result<(), ErrorReport> {
     if EXPLICIT_ONLY_KINDS
         .iter()
-        .any(|(k, _)| *k == candidate.params.kind)
+        .any(|(k, _, _)| *k == candidate.params.kind)
     {
         return Err(invalid(
             "smoke training is not supported for explicit-only kinds",
@@ -1136,8 +1176,7 @@ where
     let seed = args.train_seed.unwrap_or(split_seed);
 
     // 候補 N の `root` は `candidates/<N>`。単発の `train --candidate N` と同じ解決を候補ごとに行う。
-    let n_candidates =
-        resolve_candidates(&project, &definition, 0, seed, &args.kinds, args.device)?.len();
+    let numbers = numbers_of(&args.kinds)?;
     // ベースモデルの照合は探索の開始前に 1 回（#628）。`--kind qwen2_lora` があれば候補に含まれる。
     let base_model_dir = checked_base_model_dir(args, &definition, cwd, true)?;
     // `--all` では qwen2_lora の候補（`--kind qwen2_lora` で足した 1 件）にだけ適用する。c1・c3 には入れない。
@@ -1145,13 +1184,16 @@ where
     if args.batch_size.is_some() && !args.kinds.iter().any(|k| k == BASE_MODEL_KIND) {
         return Err(invalid("option --batch-size requires --kind qwen2_lora").into());
     }
-    let mut candidates = Vec::with_capacity(n_candidates);
-    for index in 0..n_candidates {
-        let mut candidate =
-            resolve_candidates(&project, &definition, index, seed, &args.kinds, args.device)?
-                .into_iter()
-                .nth(index)
-                .ok_or_else(|| runtime("candidate resolution is inconsistent"))?;
+    let mut candidates = Vec::with_capacity(numbers.len());
+    for &number in &numbers {
+        let mut candidate = resolve_candidate(
+            &project,
+            &definition,
+            number,
+            seed,
+            &args.kinds,
+            args.device,
+        )?;
         if args.smoke {
             apply_smoke_checked(&mut candidate)?;
         }
@@ -1166,8 +1208,8 @@ where
         return Err(invalid("search record already exists").into());
     }
     let mut stale = Vec::new();
-    for index in 0..n_candidates {
-        let rel = candidate_rel(index);
+    for &number in &numbers {
+        let rel = candidate_rel(number);
         if project.exists(&rel)? {
             let held = project.track_existing_dir(&rel)?;
             ensure_restartable(&held)?;
@@ -1206,6 +1248,7 @@ where
         created: std::iter::repeat_with(|| None).take(roots.len()).collect(),
         outcomes: vec![None; roots.len()],
         roots,
+        numbers: numbers.clone(),
         job,
     };
     let searched = run_search(
@@ -1235,7 +1278,10 @@ where
                             AllRunError::Process(_, Some(restart))
                             | AllRunError::Cancelled(Some(restart)),
                         ),
-                } => Some((*index, *restart, candidate_job_status(&project, *index))),
+                } => {
+                    let number = numbers.get(*index).copied().unwrap_or(*index);
+                    Some((number, *restart, candidate_job_status(&project, number)))
+                }
                 _ => None,
             };
             let report = runner.clean_up(search_error_report(error));
@@ -1248,13 +1294,14 @@ where
     if let Err(report) = runner.publish(&record) {
         return Err(runner.clean_up(report).into());
     }
-    all_outcome(&record, &runner.outcomes).map_err(Into::into)
+    all_outcome(&record, &runner.outcomes, &numbers).map_err(Into::into)
 }
 
 /// 探索結果から `train --all` の終了コードと stdout を決める（モジュール doc「`--all`」）。
 fn all_outcome(
     record: &SearchRecord,
     outcomes: &[Option<TrainOutcome>],
+    numbers: &[usize],
 ) -> Result<TrainAllReport, ErrorReport> {
     let is_evaluated =
         |r: &CandidateSearchResult| matches!(r, CandidateSearchResult::Evaluated { .. });
@@ -1282,7 +1329,7 @@ fn all_outcome(
         .iter()
         .enumerate()
         .map(|(index, entry)| TrainAllCandidate {
-            candidate: index,
+            candidate: numbers.get(index).copied().unwrap_or(index),
             kind: entry.candidate_id.clone(),
             result: (&entry.result).into(),
             budget_reached: entry.budget_reached().map(Into::into),
@@ -1346,6 +1393,8 @@ struct CandidateDirRunner<'p, 'j> {
     /// この呼び出しで作った `candidates/`（最初の候補の学習ジョブの直前に作る。失敗時の後始末用）。
     parent: Option<CreatedDir>,
     roots: Vec<String>,
+    /// 位置ごとの候補番号（`candidates/<番号>` に書く。欠番がありうる。#697）。
+    numbers: Vec<usize>,
     train_jsonl: &'p [u8],
     train_seed_override: Option<u32>,
     /// 候補ごとに作ったディレクトリ（後始末用）。
@@ -1364,7 +1413,7 @@ impl CandidateRunner for CandidateDirRunner<'_, '_> {
             .iter()
             .position(|root| root == request.root())
             .ok_or_else(|| AllRunError::Report(runtime("unexpected candidate request")))?;
-        let rel = candidate_rel(index);
+        let rel = candidate_rel(self.numbers.get(index).copied().unwrap_or(index));
         if self.parent.is_none()
             && !self
                 .project
@@ -1425,8 +1474,11 @@ impl CandidateDirRunner<'_, '_> {
                     .ok_or_else(|| runtime("evaluated candidate has no train result"))?;
                 let result_json = outcome_json_vec(outcome)
                     .map_err(|_| runtime("cannot serialize train result"))?;
-                self.project
-                    .write_new(candidate_rel(index).join(RESULT_FILE), &result_json)?;
+                self.project.write_new(
+                    candidate_rel(self.numbers.get(index).copied().unwrap_or(index))
+                        .join(RESULT_FILE),
+                    &result_json,
+                )?;
             } else if let Some(created) = self.created.get_mut(index).and_then(Option::take) {
                 cleaned &= self.project.remove_created_dir(&created);
             }
@@ -1582,6 +1634,7 @@ pub fn read_split_record(project: &Project) -> Result<SplitRecord, ErrorReport> 
 /// 読み込みの失敗は [`Project::read_optional`] と同じ写像（上限超過は 20、I/O 失敗は 70）。
 pub fn allotted_time_limit(
     project: &Project,
+    explicit_kinds: &[String],
     index: usize,
     candidate_id: &str,
 ) -> Result<Option<u32>, ErrorReport> {
@@ -1589,7 +1642,9 @@ pub fn allotted_time_limit(
     else {
         return Ok(None);
     };
-    allotted_time_limit_seconds(&bytes, index, candidate_id)
+    // 探索記録は位置順。候補番号（欠番あり）を位置へ直して引く（#697）。
+    let position = position_of(explicit_kinds, index)?;
+    allotted_time_limit_seconds(&bytes, position, candidate_id)
         .map(Some)
         .map_err(|_| invalid("search record is invalid"))
 }

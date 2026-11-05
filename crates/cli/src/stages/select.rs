@@ -53,15 +53,16 @@ use crate::project::{
     DEFINITION_FILE, Project, SEARCH_RECORD_FILE, SELECTION_EXCLUSIONS_FILE, SELECTION_FILE, fail,
     invalid, runtime,
 };
-use fandhe_edge_train::kind_resolution::normalize_explicit_kinds;
+use fandhe_edge_train::kind_resolution::{EXPLICIT_ONLY_KINDS, normalize_explicit_kinds};
 
 use super::candidate_artifact::{
     CandidateArtifact, check_meta_consistency, load_candidate_artifact, measured_members,
 };
 use super::infer::{is_tokenizer_qwen2, kind_version_allowed, load_backend};
 use super::train::{
-    allotted_time_limit, apply_batch_size, effective_train_seed, load_trained, recorded_batch_size,
-    recorded_device, request_matches_candidate, resolve_candidates, verified_split,
+    allotted_time_limit, apply_batch_size, effective_train_seed, load_trained, numbers_of,
+    recorded_batch_size, recorded_device, request_matches_candidate, resolve_candidate,
+    verified_split,
 };
 
 /// `select` を実行する。
@@ -171,24 +172,22 @@ pub fn compute_selection_with_exclusions(
     let mut excluded = Vec::new();
     // 候補 N ごとに `train` と同じ関数で `root`・`out_dir` を組み立てた既定候補を用意する
     // （保存済みリクエストの `root`・`out_dir` の照合に使う。REQ-39）。
-    let candidate_count = resolve_candidates(
-        project,
-        definition,
-        0,
-        split_seed,
-        &explicit_kinds,
-        Device::Cpu,
-    )?
-    .len();
+    let numbers = numbers_of(&explicit_kinds)?;
+    let candidate_count = numbers.len();
     // 探索時より少ない候補集合の再構成を拒否する。`--kind` の指定漏れで、失敗・時間切れ候補を含む
     // 事前登録した族より小さい family_size が Holm 補正へ渡るのを防ぐ（REQ-25・fail-closed）。
-    if super::train::candidate_rel(candidate_count)
-        .to_str()
-        .is_some_and(|rel| project.exists(rel).unwrap_or(true))
-    {
-        return Err(invalid(
-            "candidate set differs from the trained set; pass the same --kind as train",
-        ));
+    // 番号は種類ごとに固定で欠番がありうるため、「番号の集合に無い `candidates/<N>` が存在するか」で見る
+    // （欠番の番号のディレクトリがあれば拒否。#697）。
+    let known_max = numbers.iter().max().copied().unwrap_or(0);
+    for stray in (0..=known_max + EXPLICIT_ONLY_KINDS.len() + 1).filter(|n| !numbers.contains(n)) {
+        if super::train::candidate_rel(stray)
+            .to_str()
+            .is_some_and(|rel| project.exists(rel).unwrap_or(true))
+        {
+            return Err(invalid(
+                "candidate set differs from the trained set; pass the same --kind as train",
+            ));
+        }
     }
     // 探索記録がある場合は、記録の候補 ID 列と再構成した候補集合が一致することを要求する。
     // 失敗・時間切れ候補のディレクトリは片付けられるため、ディレクトリの有無だけでは族の縮小を
@@ -198,16 +197,14 @@ pub fn compute_selection_with_exclusions(
     {
         let recorded = fandhe_edge_train::stage_files::search_record_candidate_ids(&bytes)
             .map_err(|_| invalid("search record is invalid"))?;
-        let rebuilt = (0..candidate_count)
-            .map(|i| {
+        let rebuilt = numbers
+            .iter()
+            .map(|&i| {
                 let seed = effective_train_seed(project, i, split_seed)?;
-                let mut all =
-                    resolve_candidates(project, definition, i, seed, &explicit_kinds, Device::Cpu)?;
-                if i < all.len() {
-                    Ok(all.swap_remove(i).candidate_id)
-                } else {
-                    Err(runtime("candidate is not available"))
-                }
+                Ok(
+                    resolve_candidate(project, definition, i, seed, &explicit_kinds, Device::Cpu)?
+                        .candidate_id,
+                )
             })
             .collect::<Result<Vec<_>, ErrorReport>>()?;
         if recorded != rebuilt {
@@ -216,22 +213,18 @@ pub fn compute_selection_with_exclusions(
             ));
         }
     }
-    let candidates = (0..candidate_count)
-        .map(|i| {
+    let candidates = numbers
+        .iter()
+        .map(|&i| {
             let seed = effective_train_seed(project, i, split_seed)?;
             let device = recorded_device(project, i)?;
-            let mut all =
-                resolve_candidates(project, definition, i, seed, &explicit_kinds, device)?;
-            if i < all.len() {
-                let mut candidate = all.swap_remove(i);
-                apply_batch_size(&mut candidate, recorded_batch_size(project, i)?);
-                Ok(candidate)
-            } else {
-                Err(runtime("candidate is not available"))
-            }
+            let mut candidate =
+                resolve_candidate(project, definition, i, seed, &explicit_kinds, device)?;
+            apply_batch_size(&mut candidate, recorded_batch_size(project, i)?);
+            Ok((i, candidate))
         })
         .collect::<Result<Vec<_>, ErrorReport>>()?;
-    for (index, candidate) in candidates.iter().enumerate() {
+    for (index, candidate) in candidates.iter().map(|(i, c)| (*i, c)) {
         let Some((request, outcome)) = load_trained(project, index)? else {
             continue;
         };
@@ -240,7 +233,8 @@ pub fn compute_selection_with_exclusions(
         };
         // 保存済みのリクエストが既定候補 N の種類・構成と一致すること（別の種類の学習結果を
         // 候補 N として採点しない。記録の差し替え対策。REQ-27）。
-        let allotted = allotted_time_limit(project, index, &candidate.candidate_id)?;
+        let allotted =
+            allotted_time_limit(project, &explicit_kinds, index, &candidate.candidate_id)?;
         if !request_matches_candidate(&request, &candidate.params, allotted, &records, &split) {
             return Err(invalid("train request does not match the candidate"));
         }

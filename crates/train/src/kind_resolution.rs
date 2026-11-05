@@ -383,15 +383,32 @@ pub fn resolve_kind_candidates(
 }
 
 /// 利用者が明示したときだけ候補に入れる種類（kind 省略時の既定候補には入れない。
-/// REQ-41・TASK-41.10・TASK-41.10-1）と、その `kind_version`。
+/// REQ-41・TASK-41.10・TASK-41.10-1）と、その `kind_version`・固定の候補番号。
 ///
-/// 候補の番号は「既定候補 → 指定された明示指定専用の種類（この定数の宣言順）」で付く。
-/// CLI の `train`・`select`・`evaluate`・`package` が同じ関数で候補を再構成するため、
-/// 番号は選定記録の `explicit_kinds` と本定数から一意に決まる。
-// ponytail: 種類が 1 つの間だけ「指定すれば常に最後尾」で番号が安定する。2 種類以上に
-// なると一部だけの指定で番号がずれるため、足すときは位置と候補番号の対応表を持たせる
-// （定数の長さが 1 であることはテストで固定している）。
-pub const EXPLICIT_ONLY_KINDS: [(&str, u32); 1] = [("qwen2_lora", 1)];
+/// 候補番号は種類ごとに固定（qwen2_lora=2・autoregressive=3。REQ-19b・#697）。一部だけ指定すると
+/// 欠番ができる（autoregressive だけなら 0・1・3）。番号の決め方はこの定数 1 か所で、
+/// CLI の `train`・`select`・`evaluate`・`package` は [`candidate_numbers`] で探索の位置ごとの番号を引く。
+/// 番号は既定候補の数以上で、種類・番号とも重複させない（テストで固定）。
+pub const EXPLICIT_ONLY_KINDS: [(&str, u32, usize); 2] =
+    [("qwen2_lora", 1, 2), ("autoregressive", 1, 3)];
+
+/// 探索の位置ごとの候補番号（既定候補 0..n、続けて指定した種類の固定番号を [`EXPLICIT_ONLY_KINDS`] の宣言順）。
+/// `explicit_kinds` は選定記録の正規形でなくてもよい（内部で [`normalize_explicit_kinds`] を通す）。
+/// 位置 i の候補の番号は戻り値の `[i]`。指定が空なら `0..既定候補数`。
+///
+/// # Errors
+/// [`normalize_explicit_kinds`] と [`default_candidates`] に同じ。
+pub fn candidate_numbers(explicit_kinds: &[String]) -> Result<Vec<usize>, KindResolutionError> {
+    let explicit = normalize_explicit_kinds(explicit_kinds)?;
+    let mut numbers: Vec<usize> = (0..default_candidates()?.len()).collect();
+    numbers.extend(
+        EXPLICIT_ONLY_KINDS
+            .iter()
+            .filter(|(k, _, _)| explicit.iter().any(|e| e == k))
+            .map(|(_, _, n)| *n),
+    );
+    Ok(numbers)
+}
 
 /// 明示指定専用の種類の名前を検証し、重複を除いて [`EXPLICIT_ONLY_KINDS`] の宣言順に並べる
 /// （選定記録の `explicit_kinds` に入れる正規形。空なら空）。
@@ -401,14 +418,14 @@ pub const EXPLICIT_ONLY_KINDS: [(&str, u32); 1] = [("qwen2_lora", 1)];
 pub fn normalize_explicit_kinds(names: &[String]) -> Result<Vec<String>, KindResolutionError> {
     if names
         .iter()
-        .any(|n| !EXPLICIT_ONLY_KINDS.iter().any(|(k, _)| k == n))
+        .any(|n| !EXPLICIT_ONLY_KINDS.iter().any(|(k, _, _)| k == n))
     {
         return Err(KindResolutionError::UnsupportedExplicitKind);
     }
     Ok(EXPLICIT_ONLY_KINDS
         .iter()
-        .filter(|(k, _)| names.iter().any(|n| n == k))
-        .map(|(k, _)| (*k).to_string())
+        .filter(|(k, _, _)| names.iter().any(|n| n == k))
+        .map(|(k, _, _)| (*k).to_string())
         .collect())
 }
 
@@ -430,9 +447,9 @@ pub fn resolve_with_explicit_kinds(
     if explicit.is_empty() {
         return Ok(resolution);
     }
-    for (kind, version) in EXPLICIT_ONLY_KINDS
+    for (kind, version, _) in EXPLICIT_ONLY_KINDS
         .iter()
-        .filter(|(k, _)| explicit.iter().any(|e| e == k))
+        .filter(|(k, _, _)| explicit.iter().any(|e| e == k))
     {
         let out_dir = suffixed_out_dir(&out_dir_base, kind)?;
         let params = build_params(&common, (*kind).to_string(), *version, Map::new(), out_dir)?;
@@ -658,7 +675,7 @@ mod tests {
     #[test]
     fn req41_explicit_only_kind_is_not_in_default_candidates() {
         let r = resolve_kind_candidates(None, common()).expect("default resolves");
-        for (k, _) in EXPLICIT_ONLY_KINDS {
+        for (k, _, _) in EXPLICIT_ONLY_KINDS {
             assert!(r.candidates().iter().all(|c| c.candidate_id != k), "{k}");
         }
     }
@@ -682,6 +699,17 @@ mod tests {
         assert_eq!(none.candidates().len(), n);
     }
 
+    /// REQ-19b・REQ-41・#697: 位置ごとの候補番号は種類ごとに固定（欠番あり）。
+    #[test]
+    fn req19b_candidate_numbers_are_fixed_per_kind() {
+        let nums = |v: &[&str]| candidate_numbers(&names(v)).expect("ok");
+        assert_eq!(nums(&[]), vec![0, 1]);
+        assert_eq!(nums(&["qwen2_lora"]), vec![0, 1, 2]);
+        assert_eq!(nums(&["autoregressive"]), vec![0, 1, 3]);
+        assert_eq!(nums(&["autoregressive", "qwen2_lora"]), vec![0, 1, 2, 3]);
+        assert!(candidate_numbers(&names(&["c1"])).is_err());
+    }
+
     /// REQ-41・TASK-41.10-1: 一覧に無い名前は fail-closed で拒否する。
     #[test]
     fn req41_explicit_kinds_reject_unknown_and_default_names() {
@@ -699,16 +727,21 @@ mod tests {
         );
     }
 
-    /// REQ-41・TASK-41.10-1: 定数は既定候補と重ならず、既定値を解決でき、長さ 1 に固定する。
+    /// REQ-41・TASK-41.10-1: 定数は既定候補と重ならず、既定値を解決でき、種類・番号が重複せず、
+    /// 番号は既定候補の数以上（#697）。
     #[test]
     fn req41_explicit_only_kinds_are_disjoint_and_resolvable() {
-        assert_eq!(
-            EXPLICIT_ONLY_KINDS.len(),
-            1,
-            "番号付けの上限（ponytail コメント）"
-        );
+        let n_default = default_candidates()
+            .expect("bundled fixture is valid")
+            .len();
+        for (i, (k, _, n)) in EXPLICIT_ONLY_KINDS.iter().enumerate() {
+            assert!(*n >= n_default, "{k}");
+            for (k2, _, n2) in &EXPLICIT_ONLY_KINDS[i + 1..] {
+                assert!(k != k2 && n != n2);
+            }
+        }
         let defaults = default_candidates().expect("bundled fixture is valid");
-        for (k, _) in EXPLICIT_ONLY_KINDS {
+        for (k, _, _) in EXPLICIT_ONLY_KINDS {
             assert!(defaults.iter().all(|(d, _)| d != k));
             assert!(kind_defaults::defaults_for_kind(k).is_some());
         }

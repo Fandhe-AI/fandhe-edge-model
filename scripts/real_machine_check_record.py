@@ -221,7 +221,7 @@ REFERENCE_CAPACITY_BYTES = 40_000_000
 REFERENCE_P95_US = 250_000
 # K（追加学習の種類のパッケージ測定。REQ-41・TASK-41.11-1・#441）の定数。
 # 追加学習の種類（crates/train の `EXPLICIT_ONLY_KINDS` と対。pytest で照合する）
-ADDITIONAL_KINDS = frozenset({"qwen2_lora"})
+ADDITIONAL_KINDS = frozenset({"qwen2_lora", "autoregressive"})
 # RSS の目標（REQ-39 の暫定上限 2 GiB。crates/guard の RSS 上限と対）。超過は警告で、失敗にしない
 RSS_TARGET_BYTES = 2 * 1024 * 1024 * 1024
 # `/usr/bin/time -l` の real の分解能（0.01 秒）

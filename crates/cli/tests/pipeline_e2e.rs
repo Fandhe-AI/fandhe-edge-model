@@ -46,6 +46,9 @@ mod suite {
     const C1_CONFIG: &str = r#"{"ngram_min":1,"ngram_max":4,"min_df":2,"max_features":200000,"C":1.0,"epochs":30,"batch_size":64,"lr":0.5}"#;
     const C3_CONFIG: &str = r#"{"lr":0.001,"weight_decay":0.0001,"epochs":40,"batch_size":64,"emb":64,"filters":128,"widths":[3,5,7],"dropout":0.3}"#;
 
+    /// `autoregressive` の既定設定（`kind_defaults.json` と同じ具体値。REQ-19b・#697）。
+    const AR_CONFIG: &str = r#"{"layers":2,"dims":128,"heads":4,"dropout":0.1,"lr":0.0005,"warmup_steps":100,"weight_decay":0.0001,"batch_size":32,"epochs":40}"#;
+
     fn definition_text() -> String {
         let options: Vec<String> = LABELS
             .iter()
@@ -6543,6 +6546,164 @@ mod suite {
         assert!(env.project_file("selection_record.json").is_file());
     }
 
+    // ---- autoregressive の 7 工程と候補番号の固定（REQ-19b・REQ-33・#697） ----
+
+    /// REQ-19b・REQ-33・#697: `--kind autoregressive` の候補は番号 3 に固定され（2 は欠番）、評価データありで
+    /// 7 工程が exit 0 で完走する（`fixtures/onnx_parity/ar.onnx`。証拠種別: テストハーネス）。
+    pub fn autoregressive_runs_all_seven_stages() {
+        let env = Env::new("ar-full", true);
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        assert_eq!(
+            env.ok(&[
+                "train",
+                "--project-dir",
+                "proj",
+                "--candidate",
+                "3",
+                "--kind",
+                "autoregressive"
+            ]),
+            "{\"step\":\"train\",\"status\":\"ok\",\"candidate\":3,\"kind\":\"autoregressive\"}\n"
+        );
+        assert!(env.project_file("candidates/3/result.json").is_file());
+        assert!(!env.project_file("candidates/2").exists());
+        assert_eq!(
+            env.ok(&[
+                "select",
+                "--project-dir",
+                "proj",
+                "--kind",
+                "autoregressive"
+            ]),
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":3,\"kind\":\"autoregressive\",\"significance\":null}\n"
+        );
+        let record = std::fs::read_to_string(env.project_file("selection_record.json")).expect("r");
+        assert!(record.contains("\"candidate_index\":3"), "{record}");
+        assert!(
+            record.contains("\"explicit_kinds\":[\"autoregressive\"]"),
+            "{record}"
+        );
+        let out = env.ok(&["evaluate", "--project-dir", "proj", "--candidate", "3"]);
+        assert!(
+            out.starts_with("{\"step\":\"evaluate\",\"status\":\"ok\",\"candidate\":3,\"kind\":\"autoregressive\","),
+            "{out}"
+        );
+        let package = env.ok(&PACKAGE);
+        assert!(
+            package.starts_with("{\"step\":\"package\",\"status\":\"ok\""),
+            "{package}"
+        );
+        let text = env.ok(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--text",
+            "alpha sample 1",
+        ]);
+        assert!(
+            text.starts_with("{\"id\":\"input\",\"status\":\"ok\""),
+            "{text}"
+        );
+    }
+
+    /// REQ-19b・REQ-21・#697: 欠番（autoregressive だけのときの 2）・範囲外・`--kind` なしの 3 は、
+    /// `train`・`evaluate` とも `invalid_input`（64）。副作用（候補ディレクトリ）を残さない。
+    pub fn autoregressive_undefined_candidate_numbers_are_rejected() {
+        let env = Env::new("ar-gap", true);
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        for (candidate, kind) in [("2", true), ("4", true), ("3", false)] {
+            let mut args = vec!["train", "--project-dir", "proj", "--candidate", candidate];
+            if kind {
+                args.extend(["--kind", "autoregressive"]);
+            }
+            let out = env.fails(&args, 64, "invalid_input");
+            assert_eq!(
+                out,
+                "{\"code\":\"invalid_input\",\"message\":\"candidate index is out of range\"}\n"
+            );
+            assert!(!env.project_file("candidates").exists());
+        }
+        env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            "3",
+            "--kind",
+            "autoregressive",
+        ]);
+        env.ok(&[
+            "select",
+            "--project-dir",
+            "proj",
+            "--kind",
+            "autoregressive",
+        ]);
+        for candidate in ["2", "4"] {
+            env.fails(
+                &[
+                    "evaluate",
+                    "--project-dir",
+                    "proj",
+                    "--candidate",
+                    candidate,
+                ],
+                64,
+                "invalid_input",
+            );
+        }
+        assert!(!env.project_file("final_test_ledger").exists());
+    }
+
+    /// REQ-19b・REQ-18・REQ-25・#697: `train --all --kind autoregressive` は候補 0・1・3 を学習し、出力の
+    /// `candidate` と保存先 `candidates/3` が固定番号になる。`select` は欠番を含む集合で選び（c3=1）、
+    /// 欠番 2 のディレクトリがあれば拒否する。
+    pub fn autoregressive_train_all_and_select_use_fixed_numbers() {
+        let env = Env::new("ar-all", true);
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        let out = env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--all",
+            "--kind",
+            "autoregressive",
+        ]);
+        assert!(
+            out.contains("{\"candidate\":3,\"kind\":\"autoregressive\",\"result\":\"evaluated\""),
+            "{out}"
+        );
+        assert!(out.contains("{\"candidate\":1,\"kind\":\"c3\""), "{out}");
+        assert!(env.project_file("candidates/3/result.json").is_file());
+        assert!(!env.project_file("candidates/2").exists());
+        std::fs::create_dir(env.project_file("candidates/2")).expect("stray");
+        env.fails(
+            &[
+                "select",
+                "--project-dir",
+                "proj",
+                "--kind",
+                "autoregressive",
+            ],
+            64,
+            "invalid_input",
+        );
+        std::fs::remove_dir(env.project_file("candidates/2")).expect("rm");
+        assert_eq!(
+            env.ok(&[
+                "select",
+                "--project-dir",
+                "proj",
+                "--kind",
+                "autoregressive"
+            ]),
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\",\"significance\":null}\n"
+        );
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -6613,7 +6774,11 @@ mod suite {
         }
         let onnx_src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/onnx_parity")
-            .join(format!("{}.onnx", request.kind()));
+            .join(if request.kind() == "autoregressive" {
+                "ar.onnx".to_string()
+            } else {
+                format!("{}.onnx", request.kind())
+            });
         let onnx = std::fs::read(&onnx_src).expect("fixture onnx");
         std::fs::write(format!("{out_dir}/model.onnx"), &onnx).expect("write onnx");
         let sha = Sha256Digest::of_bytes(&onnx).to_hex();
@@ -6624,10 +6789,10 @@ mod suite {
             .map(|l| format!("\"{l}\""))
             .collect();
         let labels = labels.join(",");
-        let default_config = if request.kind() == "c1" {
-            C1_CONFIG
-        } else {
-            C3_CONFIG
+        let default_config = match request.kind() {
+            "c1" => C1_CONFIG,
+            "autoregressive" => AR_CONFIG,
+            _ => C3_CONFIG,
         };
         // 結果の `config` は「既定値を要求の設定で上書きしたもの」。`train --smoke` は `epochs` を 1 にする。
         let config = if request.config().get("epochs").is_some_and(|e| e == 1) {
@@ -6730,6 +6895,18 @@ fn main() -> std::process::ExitCode {
         (
             "qwen2_lora_select_matches_identity_but_not_location",
             suite::qwen2_lora_select_matches_identity_but_not_location,
+        ),
+        (
+            "autoregressive_runs_all_seven_stages",
+            suite::autoregressive_runs_all_seven_stages,
+        ),
+        (
+            "autoregressive_undefined_candidate_numbers_are_rejected",
+            suite::autoregressive_undefined_candidate_numbers_are_rejected,
+        ),
+        (
+            "autoregressive_train_all_and_select_use_fixed_numbers",
+            suite::autoregressive_train_all_and_select_use_fixed_numbers,
         ),
         (
             "full_pipeline_completes_without_evaluation_data",

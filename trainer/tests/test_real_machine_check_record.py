@@ -5604,7 +5604,9 @@ def test_item_k_is_not_a_default_item_and_additional_kinds_match_rust() -> None:
     """REQ-41: K は既定に入れない。追加学習の種類は Rust の `EXPLICIT_ONLY_KINDS` と一致する。"""
     assert "K" not in mod.DEFAULT_ITEMS
     src = (REPO / "crates" / "train" / "src" / "kind_resolution.rs").read_text("utf-8")
-    m = re.search(r"pub const EXPLICIT_ONLY_KINDS: \[\(&str, u32\); \d+\] = \[(.*?)\];", src, re.S)
+    m = re.search(
+        r"pub const EXPLICIT_ONLY_KINDS: \[\(&str, u32, usize\); \d+\]\s*=\s*\[(.*?)\];", src, re.S
+    )
     assert m is not None, "EXPLICIT_ONLY_KINDS が見つからない"
     assert set(re.findall(r'\("([a-z0-9_]+)",', m.group(1))) == set(mod.ADDITIONAL_KINDS)
     assert mod.ADDITIONAL_KINDS <= mod.KIND_VOCAB
