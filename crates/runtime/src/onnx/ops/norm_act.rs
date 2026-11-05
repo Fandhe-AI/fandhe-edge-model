@@ -5,7 +5,7 @@
 //! `docs/design/qwen2-scoring-onnx-ops.md` 3 節で担当 #418 とされた 5 演算
 //! （ReduceMean・ReduceSum・Sigmoid・Softmax・LogSoftmax）だけを実装する。
 //! RMSNorm の残り（Mul・Add・Sqrt・Reciprocal）と SiLU の Mul は #416 の担当。
-//! GELU・LayerNorm・Erf は一覧に無い（Qwen2 は RMSNorm と silu のみ）ため実装しない。
+//! Relu・Erf は autoregressive（REQ-19b）の位置 id の下限と GELU 用に追加した（#420。Qwen2 の一覧外）。
 //!
 //! # 契約
 //!
@@ -107,6 +107,47 @@ pub fn sigmoid(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
             e / (1.0 + e)
         }
     })
+}
+
+/// Relu（FLOAT）。NaN は伝播する（`max(0, NaN)` ではなく NaN のまま。後段の Softmax 系が拒否する）。
+pub fn relu(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
+    map1(x, 1, |v| if v < 0.0 { 0.0 } else { v })
+}
+
+/// Erf（FLOAT）。f64 で計算してから f32 へ丸める（誤差は f32 の丸め以下。autoregressive の GELU
+/// `x*(1+erf(x/√2))/2` 用。REQ-19b・REQ-32・#420）。NaN は伝播し、±inf は ±1。
+pub fn erf(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
+    // 級数・連分数とも `exp` や 80 回の反復を含むので重み 8
+    map1(x, 8, |v| erf_f64(f64::from(v)) as f32)
+}
+
+/// erf の f64 実装。|x|<3 は Maclaurin 級数（項の最大は x=3 で約 e^9 倍で、桁落ちは 1e-12 以下）、
+/// 3 以上は erfc の連分数（後ろ向き評価）から 1 - erfc。|x|>=6 は erfc<1e-16 なので ±1。
+fn erf_f64(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    let a = x.abs();
+    let r = if a >= 6.0 {
+        1.0
+    } else if a < 3.0 {
+        // erf(x) = 2/√π Σ (-1)^n x^(2n+1) / (n! (2n+1))
+        let mut term = a; // (-1)^n x^(2n+1) / n!
+        let mut sum = a;
+        for n in 1..80u32 {
+            term *= -a * a / f64::from(n);
+            sum += term / f64::from(2 * n + 1);
+        }
+        sum * std::f64::consts::FRAC_2_SQRT_PI
+    } else {
+        // erfc(x) = exp(-x²)/√π / (x + (1/2)/(x + 1/(x + (3/2)/(x + ...))))
+        let mut t = a;
+        for n in (1..=60u32).rev() {
+            t = a + f64::from(n) / 2.0 / t;
+        }
+        1.0 - (-a * a).exp() / (std::f64::consts::PI.sqrt() * t)
+    };
+    r.copysign(x)
 }
 
 /// 行ごとに非有限を拒否し max を求め、`f(row, max, out)` で行を変換して連結する。
@@ -351,6 +392,46 @@ mod tests {
                 .map(|v| v.to_bits())
                 .collect();
             assert_eq!(got, want);
+        }
+    }
+
+    // ---- autoregressive 用の演算（REQ-19b・#420） ----
+
+    #[test]
+    fn req19b_relu_clamps_negative_and_keeps_nan() {
+        let x = Tensor::new(vec![4], vec![-1.5f32, 0.0, 2.5, f32::NAN]).unwrap();
+        let r = relu(&x).unwrap();
+        assert_eq!(&r.data()[..3], [0.0, 0.0, 2.5]);
+        assert!(r.data()[3].is_nan());
+    }
+
+    /// 参照値は高精度の erf（f64 で 1e-15 程度まで既知）。級数側（|x|<3）と連分数側（3 以上）の両方を含む。
+    /// 各ケースに許容差を渡す。
+    #[test]
+    fn req19b_erf_matches_reference_values() {
+        let tol = 1e-12;
+        let cases: [(f64, f64, f64); 9] = [
+            (0.0, 0.0, tol),
+            (0.5, 0.520_499_877_813_046_5, tol),
+            (1.0, 0.842_700_792_949_714_9, tol),
+            (2.0, 0.995_322_265_018_952_7, tol),
+            (2.9, 0.999_958_902_121_900_5, tol),
+            (3.0, 0.999_977_909_503_001_4, tol),
+            (4.0, 0.999_999_984_582_742_1, tol),
+            (6.0, 1.0, tol),
+            (-1.0, -0.842_700_792_949_714_9, tol),
+        ];
+        for (x, want, tol) in cases {
+            let got = erf_f64(x);
+            assert!((got - want).abs() < tol, "erf({x}) = {got}, want {want}");
+        }
+        assert!(erf_f64(f64::NAN).is_nan());
+        assert_eq!(erf_f64(f64::INFINITY), 1.0);
+        // f32 版は f32 の丸め（約 6e-8）以内
+        let x = Tensor::new(vec![2], vec![1.0f32, -1.0]).unwrap();
+        let r = erf(&x).unwrap();
+        for (got, want) in r.data().iter().zip([0.842_700_8f32, -0.842_700_8]) {
+            assert!((got - want).abs() < 1e-7, "{got} vs {want}");
         }
     }
 }

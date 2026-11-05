@@ -271,6 +271,116 @@ pub fn unsqueeze<T>(x: Tensor<T>, axes: &Tensor<i64>) -> Result<Tensor<T>, OpErr
     Tensor::new(shape, x.into_data())
 }
 
+/// Squeeze（opset 13。`axes` は入力）。指定軸の次元が 1 であること。重複・範囲外・1 以外の次元は拒否する。
+/// 空の `axes`（全軸の 1 を削る形）は本実装が扱わず拒否する。autoregressive の `l_vec` → スカラー用
+/// （REQ-19b・#420）。
+pub fn squeeze<T>(x: Tensor<T>, axes: &Tensor<i64>) -> Result<Tensor<T>, OpError> {
+    let rank = x.shape().len();
+    if axes.shape().len() != 1 || axes.data().is_empty() {
+        return Err(OpError::InvalidAttribute);
+    }
+    let mut drop = vec![false; rank];
+    for &a in axes.data() {
+        let a = normalize_axis(a, rank)?;
+        let d = drop.get_mut(a).ok_or(OpError::InvalidAttribute)?;
+        if std::mem::replace(d, true) {
+            return Err(OpError::InvalidAttribute);
+        }
+    }
+    let mut shape = Vec::with_capacity(rank);
+    for (&d, &dropped) in x.shape().iter().zip(&drop) {
+        if !dropped {
+            shape.push(d);
+        } else if d != 1 {
+            return Err(OpError::ShapeMismatch);
+        }
+    }
+    Tensor::new(shape, x.into_data())
+}
+
+/// CumSum（FLOAT。`axis` はスカラー入力。exclusive=0・reverse=0 固定）。軸方向に添字の昇順で f32 加算する
+/// （REQ-28。スレッド数に依存しない）。autoregressive の位置 id（有効キーの累積数）用（REQ-19b・#420）。
+pub fn cumsum(x: &Tensor<f32>, axis: &Tensor<i64>) -> Result<Tensor<f32>, OpError> {
+    if axis.data().len() != 1 || axis.shape().len() > 1 {
+        return Err(OpError::InvalidAttribute);
+    }
+    let a = axis
+        .data()
+        .first()
+        .copied()
+        .ok_or(OpError::InvalidAttribute)?;
+    let ax = normalize_axis(a, x.shape().len())?;
+    let len = x
+        .shape()
+        .get(ax)
+        .copied()
+        .ok_or(OpError::InvalidAttribute)?;
+    let inner = element_count(x.shape().get(ax + 1..).ok_or(OpError::InvalidAttribute)?)?;
+    let mut out = x.data().to_vec();
+    if len == 0 || inner == 0 {
+        return Tensor::new(x.shape().to_vec(), out);
+    }
+    for block in out.chunks_mut(len * inner) {
+        for i in 1..len {
+            for j in 0..inner {
+                let prev = block
+                    .get((i - 1) * inner + j)
+                    .copied()
+                    .ok_or(OpError::ShapeMismatch)?;
+                *block.get_mut(i * inner + j).ok_or(OpError::ShapeMismatch)? += prev;
+            }
+        }
+    }
+    Tensor::new(x.shape().to_vec(), out)
+}
+
+/// OneHot の depth の上限（REQ-39）。autoregressive の語彙サイズ
+/// （`trainer/.../kinds/autoregressive.py` の `VOCAB_SIZE`=259。バイト 256 + `PAD`・`SEP`・`EOS`）。
+/// 1 ノードが作る `indices × depth` の確保を語彙の桁に抑える。
+pub const MAX_ONEHOT_DEPTH: usize = 259;
+
+/// OneHot（axis=-1 固定。`depth` はスカラー入力、`values`=[off, on] は [0, 1] のみ）。出力は FLOAT
+/// `indices.shape ++ [depth]`。負の index は depth を足して数え、それでも範囲外の index は全 0
+/// （ONNX の規定）。autoregressive の選択肢トークンの対数確率抽出用（REQ-19b・#420）。
+pub fn one_hot(
+    indices: &Tensor<i64>,
+    depth: &Tensor<i64>,
+    values: &Tensor<f32>,
+) -> Result<Tensor<f32>, OpError> {
+    if depth.data().len() != 1 || depth.shape().len() > 1 {
+        return Err(OpError::InvalidAttribute);
+    }
+    let d = depth
+        .data()
+        .first()
+        .copied()
+        .ok_or(OpError::InvalidAttribute)?;
+    let d = usize::try_from(d).map_err(|_| OpError::InvalidAttribute)?;
+    if d == 0 || d > MAX_ONEHOT_DEPTH {
+        return Err(OpError::LimitExceeded);
+    }
+    if values.data() != [0.0, 1.0] {
+        return Err(OpError::InvalidAttribute);
+    }
+    let mut shape = indices.shape().to_vec();
+    shape.push(d);
+    if shape.len() > MAX_RANK {
+        return Err(OpError::ShapeMismatch);
+    }
+    let n = element_count(&shape)?;
+    let mut out = vec![0.0f32; n];
+    let di = i64::try_from(d).map_err(|_| OpError::LimitExceeded)?;
+    for (row, &i) in out.chunks_mut(d).zip(indices.data()) {
+        let i = if i < 0 { i.saturating_add(di) } else { i };
+        if let Ok(i) = usize::try_from(i)
+            && let Some(cell) = row.get_mut(i)
+        {
+            *cell = 1.0;
+        }
+    }
+    Tensor::new(shape, out)
+}
+
 /// Concat。rank は全入力で同じで、axis 以外の次元は一致すること。
 pub fn concat<T: Copy>(inputs: &[&Tensor<T>], axis: i64) -> Result<Tensor<T>, OpError> {
     if inputs.len() > MAX_CONCAT_INPUTS {
@@ -777,5 +887,65 @@ mod tests {
             let gb: Vec<u32> = got.data().iter().map(|v| v.to_bits()).collect();
             assert_eq!(gb, want, "{shape:?} {strides:?}");
         }
+    }
+
+    // ---- autoregressive 用の演算（REQ-19b・#420） ----
+
+    #[test]
+    fn req19b_squeeze_drops_unit_axes_only() {
+        let x = t(&[1, 3, 1], vec![1i64, 2, 3]);
+        assert_eq!(squeeze(x.clone(), &v(&[0])).unwrap().shape(), [3, 1]);
+        assert_eq!(squeeze(x.clone(), &v(&[-1, 0])).unwrap().shape(), [3]);
+        assert!(squeeze(x.clone(), &v(&[1])).is_err()); // 次元が 1 でない
+        assert!(squeeze(x.clone(), &v(&[0, 0])).is_err()); // 重複
+        assert!(squeeze(x.clone(), &v(&[3])).is_err()); // 範囲外
+        assert!(squeeze(x, &v(&[])).is_err()); // 空 axes は扱わない
+        let one = t(&[1], vec![5i64]);
+        let s = squeeze(one, &v(&[0])).unwrap();
+        assert!(s.shape().is_empty());
+        assert_eq!(s.data(), [5]);
+    }
+
+    #[test]
+    fn req19b_cumsum_runs_along_axis_in_order() {
+        let x = t(&[2, 3], vec![1.0f32, 1.0, 0.0, 0.0, 1.0, 1.0]);
+        let sc = |a: i64| Tensor::new(vec![], vec![a]).unwrap();
+        assert_eq!(
+            cumsum(&x, &sc(1)).unwrap().data(),
+            [1.0, 2.0, 2.0, 0.0, 1.0, 2.0]
+        );
+        assert_eq!(
+            cumsum(&x, &sc(-1)).unwrap().data(),
+            [1.0, 2.0, 2.0, 0.0, 1.0, 2.0]
+        );
+        assert_eq!(
+            cumsum(&x, &sc(0)).unwrap().data(),
+            [1.0, 1.0, 0.0, 1.0, 2.0, 1.0]
+        );
+        assert!(cumsum(&x, &sc(2)).is_err());
+        assert!(cumsum(&x, &v(&[0, 1])).is_err());
+    }
+
+    #[test]
+    fn req19b_one_hot_axis_last_with_wrap_and_out_of_range() {
+        let idx = t(&[2, 2], vec![0i64, 2, -1, 5]);
+        let depth = Tensor::new(vec![], vec![3i64]).unwrap();
+        let vals = t(&[2], vec![0.0f32, 1.0]);
+        let r = one_hot(&idx, &depth, &vals).unwrap();
+        assert_eq!(r.shape(), [2, 2, 3]);
+        // 0 → 先頭、2 → 末尾、-1 → depth を足して末尾、5 → 範囲外で全 0
+        assert_eq!(
+            r.data(),
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+        );
+        // values が [0,1] 以外・depth が 0 以下または上限超は拒否
+        assert!(one_hot(&idx, &depth, &t(&[2], vec![0.0f32, 2.0])).is_err());
+        let d0 = Tensor::new(vec![], vec![0i64]).unwrap();
+        assert!(one_hot(&idx, &d0, &vals).is_err());
+        // 語彙サイズ 259 は通り、260 は拒否する
+        let ok = Tensor::new(vec![], vec![259i64]).unwrap();
+        assert_eq!(one_hot(&idx, &ok, &vals).unwrap().shape(), [2, 2, 259]);
+        let big = Tensor::new(vec![], vec![260i64]).unwrap();
+        assert_eq!(one_hot(&idx, &big, &vals), Err(OpError::LimitExceeded));
     }
 }

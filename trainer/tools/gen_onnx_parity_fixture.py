@@ -1,12 +1,14 @@
 """ONNX 一致確認用 fixture（`fixtures/onnx_parity/`）の生成器（REQ-32・TASK-32.1-2・#113）。
 
-役割: 極小設定で C1・C3 を CPU・固定 seed で学習し、書き出した ONNX と「MLX 内推論の
+役割: 極小設定で C1・C3・autoregressive を CPU・固定 seed で学習し、書き出した ONNX と「MLX 内推論の
 予測ラベル・確率」を `cases.json` に記録する。Rust 推論ランタイム（`crates/runtime`）の
 結合テスト（`tests/onnx_parity.rs`）が、学習依存の無い ONNX 推論の予測ラベルとこの記録の
 全件一致を確かめる（証拠種別: テストハーネス。PoC-14 実測の踏襲）。
 
-- 出力先は `--out` で受け、`c1.onnx`・`c3.onnx`・`cases.json` の 3 つだけを書く。既存ファイルの
-  上書きは `--overwrite` を要求する
+- 出力先は `--out` で受け、`c1.onnx`・`c3.onnx`・`ar.onnx`・`cases.json` の 4 つだけを書く。
+  既存ファイルの上書きは `--overwrite` を要求する
+- `--only autoregressive` は既存の `cases.json` を読み、c1・c3 の項目と ONNX を変えずに
+  autoregressive の項目と `ar.onnx` だけを足す・置き換える（REQ-19b・TASK-41.7-6・#420）
 - 合成データのみ（外部データ・LLM 生成物・実データは使わない）。通信なし（REQ-38）
 - 僅差（上位 2 つの確率差が `NEAR_TIE_MARGIN` 未満）のケースは、f32 の演算順序差で argmax が
   割れうるため記録から除外し、除外件数を記録する
@@ -39,6 +41,7 @@ from fandhe_edge_trainer import budget as budget_mod
 from fandhe_edge_trainer import guard
 from fandhe_edge_trainer.contract import TrainExample, TrainRequest
 from fandhe_edge_trainer.encoding import encode_bytes
+from fandhe_edge_trainer.kinds import autoregressive as ar_mod
 from fandhe_edge_trainer.kinds import c1 as c1_mod
 from fandhe_edge_trainer.kinds import c3 as c3_mod
 
@@ -67,6 +70,18 @@ C3_CONFIG = {
     "filters": 8,
     "widths": [3, 5, 7],
     "dropout": 0.0,
+}
+# autoregressive は CPU で数分以内・数十〜数百 KB に収まる極小設定（REQ-19b・#420）。
+AR_CONFIG = {
+    "layers": 1,
+    "dims": 16,
+    "heads": 2,
+    "dropout": 0.0,
+    "lr": 5e-3,
+    "warmup_steps": 10,
+    "weight_decay": 1e-4,
+    "batch_size": 16,
+    "epochs": 30,
 }
 
 _WORDS = {
@@ -162,13 +177,31 @@ def _mlx_probs_c3(trained: Any, texts: list[str]) -> np.ndarray:
     return _softmax_rows(trained.model(mx.array(ids_arr), mask))
 
 
+def _mlx_probs_ar(trained: Any, texts: list[str]) -> np.ndarray:
+    """対応づけ (b) の事後確率（選択肢間 softmax。ONNX 側 `probs` と同じ定義）。"""
+    ids_batch = [encode_bytes(t, trained.max_bytes) for t in texts]
+    choices = [trained.choice_ids_by_label[label] for label in trained.label_order]
+    loglik = ar_mod._score_choices_mlx(trained.model, ids_batch, choices)
+    rows = [ar_mod.choice_posteriors(r) for r in loglik]
+    if any(r is None for r in rows):
+        raise SystemExit("autoregressive: non-finite choice scores")
+    return np.array(rows, dtype=np.float32)
+
+
 def _build_kind(
-    name: str, kind: Any, mlx_probs: Any, config: dict[str, Any], out_dir: Path, work: Path
+    name: str,
+    kind: Any,
+    mlx_probs: Any,
+    config: dict[str, Any],
+    out_dir: Path,
+    work: Path,
+    onnx_name: str | None = None,
 ) -> dict[str, Any]:
     rng = random.Random(SEED)  # noqa: S311  合成データ用の決定的乱数（暗号用途ではない）
     examples = _train_examples(rng)
     request = _make_request(work / name, kind=name, config=config)
-    onnx_path = out_dir / f"{name}.onnx"
+    onnx_file = onnx_name or f"{name}.onnx"
+    onnx_path = out_dir / onnx_file
     try:
         budget = budget_mod.ResourceBudget(
             wall_seconds=float(request.time_limit_seconds),
@@ -217,7 +250,7 @@ def _build_kind(
     if len(seen) < 2:
         raise SystemExit(f"{name}: predictions are not diverse: {sorted(seen)}")
     return {
-        "onnx": f"{name}.onnx",
+        "onnx": onnx_file,
         "onnx_sha256": hashlib.sha256(onnx_bytes).hexdigest(),
         "max_bytes": MAX_BYTES,
         "label_order": LABEL_ORDER,
@@ -231,15 +264,23 @@ def _build_kind(
 
 
 def main() -> None:
-    """引数を解釈し、C1・C3 の fixture を生成する。"""
+    """引数を解釈し、C1・C3・autoregressive の fixture を生成する。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, help="出力先ディレクトリ（存在すること）")
+    parser.add_argument(
+        "--only",
+        choices=["autoregressive"],
+        help="既存 cases.json の c1・c3 を残し、指定 kind だけを足す・置き換える",
+    )
     parser.add_argument("--overwrite", action="store_true", help="既存ファイルの上書きを許可する")
     args = parser.parse_args()
     out_dir = Path(args.out).resolve()
     if not out_dir.is_dir():
         raise SystemExit(f"output directory does not exist: {out_dir}")
-    targets = [out_dir / n for n in ("c1.onnx", "c3.onnx", "cases.json")]
+    names = (
+        ("ar.onnx", "cases.json") if args.only else ("c1.onnx", "c3.onnx", "ar.onnx", "cases.json")
+    )
+    targets = [out_dir / n for n in names]
     if not args.overwrite and any(t.exists() for t in targets):
         raise SystemExit("output files already exist; pass --overwrite to replace them")
 
@@ -250,24 +291,44 @@ def main() -> None:
         staging = Path(tmp) / "staging"
         work.mkdir()
         staging.mkdir()
-        kinds = {
-            "c1": _build_kind("c1", c1_mod.C1Kind(), _mlx_probs_c1, C1_CONFIG, staging, work),
-            "c3": _build_kind("c3", c3_mod.C3Kind(), _mlx_probs_c3, C3_CONFIG, staging, work),
-        }
-        _write_cases(staging, kinds)
-        _install_all(staging, out_dir, Path(tmp) / "backup")
+        ar_entry = _build_kind(
+            "autoregressive",
+            ar_mod.AutoregressiveKind(),
+            _mlx_probs_ar,
+            AR_CONFIG,
+            staging,
+            work,
+            onnx_name="ar.onnx",
+        )
+        ar_entry["generated_on"] = f"{platform.system()} {platform.machine()}"
+        ar_entry["versions"] = _versions()
+        if args.only:
+            doc = json.loads((out_dir / "cases.json").read_text(encoding="utf-8"))
+            doc["kinds"]["autoregressive"] = ar_entry
+            kinds = doc["kinds"]
+            (staging / "cases.json").write_text(
+                json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            kinds = {
+                "c1": _build_kind("c1", c1_mod.C1Kind(), _mlx_probs_c1, C1_CONFIG, staging, work),
+                "c3": _build_kind("c3", c3_mod.C3Kind(), _mlx_probs_c3, C3_CONFIG, staging, work),
+                "autoregressive": ar_entry,
+            }
+            _write_cases(staging, kinds)
+        _install_all(staging, out_dir, Path(tmp) / "backup", names)
     for k, v in kinds.items():
         sys.stdout.write(f"{k}: cases={len(v['cases'])} excluded={v['excluded_near_tie']}\n")
 
 
-def _install_all(staging: Path, out_dir: Path, backup: Path) -> None:
-    """staging の 3 ファイルを out_dir へ置き換える。途中で失敗したら旧ファイルへ戻す。
+def _install_all(staging: Path, out_dir: Path, backup: Path, names: tuple[str, ...]) -> None:
+    """staging の names のファイルを out_dir へ置き換える。途中で失敗したら旧ファイルへ戻す。
 
-    `os.replace` は 1 ファイルずつ原子的だが 3 ファイル全体では原子的でないため、置き換え前に
+    `os.replace` は 1 ファイルずつ原子的だが 複数ファイル全体では原子的でないため、置き換え前に
     既存ファイルを backup へ退避し、失敗時は退避分を戻して
     新規に置いた分を消す（新旧の混在を残さない）。
     """
-    names = ("c1.onnx", "c3.onnx", "cases.json")
     backup.mkdir()
     saved: list[str] = []
     placed: list[str] = []
@@ -288,22 +349,26 @@ def _install_all(staging: Path, out_dir: Path, backup: Path) -> None:
         raise
 
 
+def _versions() -> dict[str, str]:
+    return {
+        "mlx": getattr(mx, "__version__", "unknown"),
+        "onnx": onnx.__version__,
+        "numpy": np.__version__,
+    }
+
+
 def _write_cases(dest: Path, kinds: dict[str, Any]) -> None:
     """`cases.json` を dest へ書く（出力先への置き換えは呼び出し側が全検証後に行う）。"""
     doc = {
         "_meta": {
             "description": (
-                "MLX-side predictions for C1/C3 ONNX parity (REQ-32, TASK-32.1-2). "
+                "MLX-side predictions for C1/C3/autoregressive ONNX parity (REQ-32, TASK-32.1-2). "
                 "Generated by trainer/tools/gen_onnx_parity_fixture.py on CPU with fixed seeds; "
                 "see PROVENANCE.md. Do not relax values to make a test pass."
             ),
             "evidence": "test harness",
             "generated_on": f"{platform.system()} {platform.machine()}",
-            "versions": {
-                "mlx": getattr(mx, "__version__", "unknown"),
-                "onnx": onnx.__version__,
-                "numpy": np.__version__,
-            },
+            "versions": _versions(),
         },
         "kinds": kinds,
     }

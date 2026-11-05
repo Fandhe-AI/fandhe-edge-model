@@ -100,6 +100,38 @@ pub fn cast_i64_to_f32(x: &Tensor<i64>) -> Result<Tensor<f32>, OpError> {
     )
 }
 
+/// Div（FLOAT・多方向ブロードキャスト）。0 除算は IEEE どおり inf・NaN（拒否せず伝播させる）。
+/// autoregressive の LayerNorm（`(x-mean)/sqrt(var+eps)`）が使う（REQ-19b・REQ-32・#420）。
+pub fn div(a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
+    broadcast_map2(a, b, |x, y| Ok(x / y))
+}
+
+/// Cast（`to=FLOAT`）。入力は BOOL（true=1.0・false=0.0）。マスクの 0/1 化に使う（REQ-19b・#420）。
+pub fn cast_bool_to_f32(x: &Tensor<bool>) -> Result<Tensor<f32>, OpError> {
+    Tensor::new(
+        x.shape().to_vec(),
+        x.data()
+            .iter()
+            .map(|&b| if b { 1.0 } else { 0.0 })
+            .collect(),
+    )
+}
+
+/// Cast（`to=INT64`）。入力は FLOAT で、ONNX と同じく 0 方向へ切り捨てる。非有限と i64 に収まらない値は
+/// 拒否する（`as` の飽和・NaN→0 に頼らない。REQ-39）。位置 id（0 以上の整数値）の変換に使う。
+pub fn cast_f32_to_i64(x: &Tensor<f32>) -> Result<Tensor<i64>, OpError> {
+    // f32 が i64 の範囲内に収まる境界（2^63 は表現できる最小の範囲外の値）
+    const LIMIT: f32 = 9.223_372e18;
+    let mut out = Vec::with_capacity(x.data().len());
+    for &v in x.data() {
+        if !v.is_finite() || v.abs() >= LIMIT {
+            return Err(OpError::InvalidAttribute);
+        }
+        out.push(v as i64);
+    }
+    Tensor::new(x.shape().to_vec(), out)
+}
+
 /// 末尾 2 次元 `[a, b]` を取り出す。
 fn last_two(s: &[usize]) -> Result<(usize, usize), OpError> {
     match s {
@@ -1389,6 +1421,30 @@ mod tests {
                 })
             });
             assert_eq!(r, Err(OpError::ShapeMismatch));
+        }
+    }
+
+    // ---- autoregressive 用の演算（REQ-19b・#420） ----
+
+    #[test]
+    fn req19b_div_broadcasts_and_propagates_ieee() {
+        let a = Tensor::new(vec![2, 2], vec![1.0f32, 2.0, 3.0, 0.0]).unwrap();
+        let b = Tensor::new(vec![2], vec![2.0f32, 0.0]).unwrap();
+        let r = div(&a, &b).unwrap();
+        assert_eq!(r.shape(), [2, 2]);
+        assert_eq!(&r.data()[..3], [0.5, f32::INFINITY, 1.5]);
+        assert!(r.data()[3].is_nan());
+    }
+
+    #[test]
+    fn req19b_cast_bool_to_f32_and_f32_to_i64() {
+        let b = Tensor::new(vec![3], vec![true, false, true]).unwrap();
+        assert_eq!(cast_bool_to_f32(&b).unwrap().data(), [1.0, 0.0, 1.0]);
+        let f = Tensor::new(vec![4], vec![2.9f32, -2.9, 0.0, 3.0]).unwrap();
+        assert_eq!(cast_f32_to_i64(&f).unwrap().data(), [2, -2, 0, 3]);
+        for bad in [f32::NAN, f32::INFINITY, 1.0e19, -1.0e19] {
+            let t = Tensor::new(vec![1], vec![bad]).unwrap();
+            assert_eq!(cast_f32_to_i64(&t), Err(OpError::InvalidAttribute));
         }
     }
 }

@@ -157,6 +157,13 @@ fn req32_c3_labels_match_mlx() {
     check_kind(ModelKind::C3);
 }
 
+/// REQ-19b・REQ-32・REQ-28 正常系: autoregressive の書き出し ONNX（#420）を推論ランタイムで読み、
+/// MLX 内推論と予測ラベルが全件一致する。1 件ずつとバッチ・評価器用関数の一致も `check_kind` が確認する。
+#[test]
+fn req32_autoregressive_labels_match_mlx() {
+    check_kind(ModelKind::Autoregressive);
+}
+
 /// 宣言の有無で予測が変わらないこと（REQ-41・TASK-41.3-2・#403）。
 ///
 /// `cases.json` の entry から `artifact.json` を組み（宣言なし／`byte`）、CLI の `build_pipeline` と
