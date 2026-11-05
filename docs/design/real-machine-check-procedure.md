@@ -413,12 +413,12 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 
 ### 4-L. 7B（Qwen2.5-7B-Instruct）の `train` の実機確認（REQ-41・REQ-39・REQ-30・#689）
 
-7B の学習が製品の `train` で完走するかの確認。**スクリプトの項目ではなく、人が手で実行して記録する**（`--items` には無い）。結果は未実施で、実機で測るまで書かない。
+7B の学習が製品の `train` で完走するかの確認。**スクリプトの項目ではなく、人が手で実行して記録する**（`--items` には無い）。
 
 - **前提**: 低電力モードオフ（`pmset -g | grep lowpowermode` が 0）。定義ファイルに 7B の `base_model` を書いた `inspect` 済みプロジェクトと、7B のベースモデルのディレクトリ（cwd 配下）を用意する。学習中は他の重い処理を動かさない。学習 RSS の上限は `qwen2_lora` のみ 24 GiB（他の kind は 8 GiB のまま）
 - **実行**: `/usr/bin/time -l fandhe-edge train --project-dir PROJ --kind qwen2_lora --candidate 2 --base-model-dir DIR --device gpu --batch-size 2`（候補番号 2 は `qwen2_lora`。既定候補の後ろ）。batch 4 は 32 GB 機で swap 超過のため使わない
 - **記録する値**: ① 進捗行（stderr の `qwen2_lora: step ...`）の最大 `rss_bytes` ② `time -l` の `maximum resident set size` ③ 所要時間（`real`。ジョブ全体の壁時計上限 3600 秒に収まるか）④ 実行前後の swap 使用量の増分（`sysctl vm.swapusage`）⑤ 終了コードと `train` の stdout の `status`。GPU の学習は同一 seed でも完全再現しない（`train_device.txt` の `gpu`）
-- **未確定（実機で確かめる）**: 書き出しピーク（PoC の実測 24.44 GB）に対する余裕は約 1.3 GB（5%）で、GPU 学習後の同一プロセスでの書き出しピークは未測定。学習ジョブ全体が 3600 秒に収まるかも未測定（学習 458〜529 秒・書き出し 113 秒の個別の実測のみ）
+- **結果（2026-11-05・実機・低電力モードオフ・Apple M5・32 GiB・main `c2def02`）**: 終了コード 0・`status` `ok`。① 18.37 GB（上限 24 GiB 内）② 9.43 GB ③ 1101 秒（3600 秒内）④ +2.46 GB（1031 MB → 3494 MB）。② は MLX の確保量を含まないため ① より小さい。書き出しのピークは単独では測っていないが、上限で止まらずに書き出しまで終わった。続く評価工程は 1213 秒（上限 1500 秒）・正解率 81.5%（#692）
 - **証拠種別**: 人が実機（Apple M5・32 GiB 等）で測った値は「実機」と明記して記録する。偽ワーカーのテストは「テストハーネス」で、本項の代わりにならない
 
 ## 5. 判定の読み方
