@@ -217,6 +217,14 @@ pub fn numbers_of(explicit_kinds: &[String]) -> Result<Vec<usize>, ErrorReport> 
     })
 }
 
+/// 探索の位置 `index` の候補番号。位置への黙ったフォールバックはしない（不整合は 70）。
+fn number_at(numbers: &[usize], index: usize) -> Result<usize, ErrorReport> {
+    numbers
+        .get(index)
+        .copied()
+        .ok_or_else(|| runtime("candidate resolution is inconsistent"))
+}
+
 /// 候補番号 `number` の探索の位置。未定義の番号（欠番・範囲外）は `invalid_input`。
 ///
 /// # Errors
@@ -1279,7 +1287,7 @@ where
                             | AllRunError::Cancelled(Some(restart)),
                         ),
                 } => {
-                    let number = numbers.get(*index).copied().unwrap_or(*index);
+                    let number = number_at(&numbers, *index)?;
                     Some((number, *restart, candidate_job_status(&project, number)))
                 }
                 _ => None,
@@ -1328,13 +1336,15 @@ fn all_outcome(
         .candidates
         .iter()
         .enumerate()
-        .map(|(index, entry)| TrainAllCandidate {
-            candidate: numbers.get(index).copied().unwrap_or(index),
-            kind: entry.candidate_id.clone(),
-            result: (&entry.result).into(),
-            budget_reached: entry.budget_reached().map(Into::into),
+        .map(|(index, entry)| {
+            Ok(TrainAllCandidate {
+                candidate: number_at(numbers, index)?,
+                kind: entry.candidate_id.clone(),
+                result: (&entry.result).into(),
+                budget_reached: entry.budget_reached().map(Into::into),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, ErrorReport>>()?;
     Ok(TrainAllReport::new(
         record.budget_seconds,
         record.budget_reached,
@@ -1413,7 +1423,7 @@ impl CandidateRunner for CandidateDirRunner<'_, '_> {
             .iter()
             .position(|root| root == request.root())
             .ok_or_else(|| AllRunError::Report(runtime("unexpected candidate request")))?;
-        let rel = candidate_rel(self.numbers.get(index).copied().unwrap_or(index));
+        let rel = candidate_rel(number_at(&self.numbers, index).map_err(AllRunError::Report)?);
         if self.parent.is_none()
             && !self
                 .project
@@ -1475,8 +1485,7 @@ impl CandidateDirRunner<'_, '_> {
                 let result_json = outcome_json_vec(outcome)
                     .map_err(|_| runtime("cannot serialize train result"))?;
                 self.project.write_new(
-                    candidate_rel(self.numbers.get(index).copied().unwrap_or(index))
-                        .join(RESULT_FILE),
+                    candidate_rel(number_at(&self.numbers, index)?).join(RESULT_FILE),
                     &result_json,
                 )?;
             } else if let Some(created) = self.created.get_mut(index).and_then(Option::take) {
@@ -2328,6 +2337,19 @@ mod all_tests {
             ..single
         };
         let e = run(&smoke, 2, &cwd).expect_err("smoke is rejected");
+        assert_eq!(
+            train_error_pair(&e),
+            (
+                ExitCode::InvalidInput,
+                "smoke training is not supported for explicit-only kinds"
+            )
+        );
+        let ar_smoke = TrainArgs {
+            kinds: vec!["autoregressive".to_string()],
+            op: TrainOp::Run(TrainTarget::Candidate(3)),
+            ..smoke
+        };
+        let e = run(&ar_smoke, 3, &cwd).expect_err("autoregressive smoke is rejected");
         assert_eq!(
             train_error_pair(&e),
             (

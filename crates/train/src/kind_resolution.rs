@@ -392,6 +392,19 @@ pub fn resolve_kind_candidates(
 pub const EXPLICIT_ONLY_KINDS: [(&str, u32, usize); 2] =
     [("qwen2_lora", 1, 2), ("autoregressive", 1, 3)];
 
+/// 固定番号の最大値（既定候補の数 − 1 と [`EXPLICIT_ONLY_KINDS`] の番号の最大の大きい方）。
+/// 未学習の `candidates/<N>` を探す走査の上限に使い、番号に飛びを置いても見逃さない（fail-closed）。
+///
+/// # Errors
+/// [`default_candidates`] に同じ。
+pub fn max_candidate_number() -> Result<usize, KindResolutionError> {
+    let defaults = default_candidates()?.len().saturating_sub(1);
+    Ok(EXPLICIT_ONLY_KINDS
+        .iter()
+        .map(|(_, _, n)| *n)
+        .fold(defaults, usize::max))
+}
+
 /// 探索の位置ごとの候補番号（既定候補 0..n、続けて指定した種類の固定番号を [`EXPLICIT_ONLY_KINDS`] の宣言順）。
 /// `explicit_kinds` は選定記録の正規形でなくてもよい（内部で [`normalize_explicit_kinds`] を通す）。
 /// 位置 i の候補の番号は戻り値の `[i]`。指定が空なら `0..既定候補数`。
@@ -708,6 +721,15 @@ mod tests {
         assert_eq!(nums(&["autoregressive"]), vec![0, 1, 3]);
         assert_eq!(nums(&["autoregressive", "qwen2_lora"]), vec![0, 1, 2, 3]);
         assert!(candidate_numbers(&names(&["c1"])).is_err());
+    }
+
+    /// REQ-19b・#697: 走査上限は既定候補数−1 と明示指定専用の番号の最大の大きい方（現状は 3）。
+    #[test]
+    fn req19b_max_candidate_number_covers_all_fixed_numbers() {
+        let max = max_candidate_number().expect("ok");
+        assert_eq!(max, 3);
+        assert!(EXPLICIT_ONLY_KINDS.iter().all(|(_, _, n)| *n <= max));
+        assert!(max >= default_candidates().expect("ok").len() - 1);
     }
 
     /// REQ-41・TASK-41.10-1: 一覧に無い名前は fail-closed で拒否する。

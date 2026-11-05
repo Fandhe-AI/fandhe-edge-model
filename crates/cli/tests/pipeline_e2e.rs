@@ -6704,6 +6704,50 @@ mod suite {
         );
     }
 
+    /// REQ-19b・REQ-18・#697: 両方の明示指定専用の種類を指定すると `train --all` は候補 0・1・2・3 を固定番号で学習する。
+    pub fn autoregressive_with_qwen2_lora_uses_numbers_0_to_3() {
+        let env = qwen2_inspected("ar-both", true);
+        let kinds = ["--kind", "qwen2_lora", "--kind", "autoregressive"];
+        let mut train = vec![
+            "train",
+            "--project-dir",
+            "proj",
+            "--all",
+            "--base-model-dir",
+            BASE_MODEL_DIR,
+        ];
+        train.extend(kinds);
+        let out = env.ok(&train);
+        for n in 0..4 {
+            assert!(out.contains(&format!("{{\"candidate\":{n},")), "{out}");
+            assert!(
+                env.project_file(&format!("candidates/{n}/result.json"))
+                    .is_file()
+            );
+        }
+        // select・evaluate は通さない: 偽ワーカーの c1・c3・ar の ONNX は 3 クラス、qwen2_lora の固定資産は 8 クラスで、
+        // 混在プロジェクトでは `select` の `load_backend` が出力クラス数の不一致で止まる（固定番号の select・evaluate は
+        // 単独指定のテストで確認済み）。
+    }
+
+    /// REQ-19b・REQ-25・#697: autoregressive で学習した後に `--kind` なしで select すると、
+    /// 集合外の `candidates/3` を stray として 64 で拒否する。
+    pub fn autoregressive_select_without_kind_rejects_stray_candidate_3() {
+        let env = Env::new("ar-stray", true);
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--all",
+            "--kind",
+            "autoregressive",
+        ]);
+        assert!(env.project_file("candidates/3").is_dir());
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -6907,6 +6951,14 @@ fn main() -> std::process::ExitCode {
         (
             "autoregressive_train_all_and_select_use_fixed_numbers",
             suite::autoregressive_train_all_and_select_use_fixed_numbers,
+        ),
+        (
+            "autoregressive_with_qwen2_lora_uses_numbers_0_to_3",
+            suite::autoregressive_with_qwen2_lora_uses_numbers_0_to_3,
+        ),
+        (
+            "autoregressive_select_without_kind_rejects_stray_candidate_3",
+            suite::autoregressive_select_without_kind_rejects_stray_candidate_3,
         ),
         (
             "full_pipeline_completes_without_evaluation_data",

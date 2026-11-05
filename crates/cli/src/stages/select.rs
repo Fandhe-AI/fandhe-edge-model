@@ -53,7 +53,7 @@ use crate::project::{
     DEFINITION_FILE, Project, SEARCH_RECORD_FILE, SELECTION_EXCLUSIONS_FILE, SELECTION_FILE, fail,
     invalid, runtime,
 };
-use fandhe_edge_train::kind_resolution::{EXPLICIT_ONLY_KINDS, normalize_explicit_kinds};
+use fandhe_edge_train::kind_resolution::{max_candidate_number, normalize_explicit_kinds};
 
 use super::candidate_artifact::{
     CandidateArtifact, check_meta_consistency, load_candidate_artifact, measured_members,
@@ -179,7 +179,15 @@ pub fn compute_selection_with_exclusions(
     // 番号は種類ごとに固定で欠番がありうるため、「番号の集合に無い `candidates/<N>` が存在するか」で見る
     // （欠番の番号のディレクトリがあれば拒否。#697）。
     let known_max = numbers.iter().max().copied().unwrap_or(0);
-    for stray in (0..=known_max + EXPLICIT_ONLY_KINDS.len() + 1).filter(|n| !numbers.contains(n)) {
+    let scan_max = max_candidate_number()
+        .map_err(|e| {
+            ErrorReport::new(
+                e.exit_code(),
+                format!("kind resolution failed: {}", e.reason_code()),
+            )
+        })?
+        .max(known_max);
+    for stray in (0..=scan_max).filter(|n| !numbers.contains(n)) {
         if super::train::candidate_rel(stray)
             .to_str()
             .is_some_and(|rel| project.exists(rel).unwrap_or(true))
