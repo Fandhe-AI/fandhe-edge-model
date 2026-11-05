@@ -1,4 +1,5 @@
-//! 注意機構まわりの演算（Range・Greater・Where・Sin・Cos。REQ-41・REQ-32・TASK-41.7-5・#419）。
+//! 注意機構まわりの演算（Range・Greater・Where・Sin・Cos。REQ-41・REQ-32・TASK-41.7-5・#419）と、
+//! autoregressive 用の Less・GreaterOrEqual・Equal・And・Where の INT64 版（REQ-19b・#420）。
 //!
 //! # 役割
 //!
@@ -78,6 +79,38 @@ pub fn where_f32(
     // 確保の前に出力形状を照合する（REQ-39）。
     broadcast_shape(&broadcast_shape(cond.shape(), x.shape())?, y.shape())?;
     // ponytail: 中間に (cond, x) の列を 1 つ確保する。遅ければ 3 入力のストライドループにする（#421 で計測）。
+    let pairs = broadcast_map2(cond, x, |c, v| Ok((c, v)))?;
+    broadcast_map2(&pairs, y, |(c, v), w| Ok(if c { v } else { w }))
+}
+
+/// Less（INT64 → BOOL、多方向ブロードキャスト）。autoregressive の `ids` 値域ガード用（REQ-19b・#420）。
+pub fn less_i64(a: &Tensor<i64>, b: &Tensor<i64>) -> Result<Tensor<bool>, OpError> {
+    broadcast_map2(a, b, |x, y| Ok(x < y))
+}
+
+/// GreaterOrEqual（INT64 → BOOL、多方向ブロードキャスト）。`ids` 値域ガード用（REQ-19b・#420）。
+pub fn greater_equal_i64(a: &Tensor<i64>, b: &Tensor<i64>) -> Result<Tensor<bool>, OpError> {
+    broadcast_map2(a, b, |x, y| Ok(x >= y))
+}
+
+/// Equal（INT64 → BOOL、多方向ブロードキャスト）。対角行列の作成用（REQ-19b・#420）。
+pub fn equal_i64(a: &Tensor<i64>, b: &Tensor<i64>) -> Result<Tensor<bool>, OpError> {
+    broadcast_map2(a, b, |x, y| Ok(x == y))
+}
+
+/// And（BOOL、多方向ブロードキャスト）。`ids` 値域ガード用（REQ-19b・#420）。
+pub fn and_bool(a: &Tensor<bool>, b: &Tensor<bool>) -> Result<Tensor<bool>, OpError> {
+    broadcast_map2(a, b, |x, y| Ok(x && y))
+}
+
+/// Where（cond は BOOL、値は INT64）。範囲外の `ids` を必ず範囲外になる値へ置き換えるガード用
+/// （REQ-19b・REQ-39・#420）。[`where_f32`] と同じ形状規則。
+pub fn where_i64(
+    cond: &Tensor<bool>,
+    x: &Tensor<i64>,
+    y: &Tensor<i64>,
+) -> Result<Tensor<i64>, OpError> {
+    broadcast_shape(&broadcast_shape(cond.shape(), x.shape())?, y.shape())?;
     let pairs = broadcast_map2(cond, x, |c, v| Ok((c, v)))?;
     broadcast_map2(&pairs, y, |(c, v), w| Ok(if c { v } else { w }))
 }
@@ -248,5 +281,33 @@ mod tests {
         );
         let third = 1.0f32 / 3.0;
         assert_eq!(&p.data()[6..], &[third, third, third]);
+    }
+
+    // ---- autoregressive 用の演算（REQ-19b・#420） ----
+
+    #[test]
+    fn req19b_integer_comparisons_broadcast_to_bool() {
+        let a = Tensor::new(vec![3], vec![-1i64, 0, 258]).unwrap();
+        let zero = Tensor::new(vec![], vec![0i64]).unwrap();
+        let lim = Tensor::new(vec![], vec![257i64]).unwrap();
+        let ge = greater_equal_i64(&a, &zero).unwrap();
+        let lt = less_i64(&a, &lim).unwrap();
+        assert_eq!(ge.data(), [false, true, true]);
+        assert_eq!(lt.data(), [true, true, false]);
+        assert_eq!(and_bool(&ge, &lt).unwrap().data(), [false, true, false]);
+        let row = Tensor::new(vec![2, 1], vec![0i64, 1]).unwrap();
+        let col = Tensor::new(vec![1, 2], vec![0i64, 1]).unwrap();
+        let eq = equal_i64(&row, &col).unwrap();
+        assert_eq!(eq.shape(), [2, 2]);
+        assert_eq!(eq.data(), [true, false, false, true]);
+    }
+
+    /// 範囲外の ids を必ず範囲外になる値（語彙サイズ）へ置き換えるガードの Where（REQ-39）。
+    #[test]
+    fn req19b_where_i64_replaces_out_of_range_with_scalar() {
+        let c = Tensor::new(vec![3], vec![false, true, false]).unwrap();
+        let x = Tensor::new(vec![3], vec![-1i64, 7, 258]).unwrap();
+        let y = Tensor::new(vec![], vec![259i64]).unwrap();
+        assert_eq!(where_i64(&c, &x, &y).unwrap().data(), [259, 7, 259]);
     }
 }

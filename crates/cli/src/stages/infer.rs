@@ -94,6 +94,7 @@ const ALLOWED_KIND_VERSIONS: &[(ModelKind, &[u32])] = &[
     (ModelKind::C1, &[1]),
     (ModelKind::C3, &[1]),
     (ModelKind::Qwen2Lora, &[1]),
+    (ModelKind::Autoregressive, &[1]),
 ];
 
 /// `kind_version` が許可リストにあるか。
@@ -693,6 +694,26 @@ pub(crate) fn build_pipeline(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// REQ-39・#420: 推論の許可リストは guard の既定集合（fixture `kind_versions.json` と一致を
+    /// `crates/train/tests/guard_kind_version_allowlist_sync.rs` が固定）と同じ `(kind, 版)` の集合。
+    /// 種類を学習側へ足したのに推論側で拒否し続ける（またはその逆）ずれを検出する。
+    #[test]
+    fn req39_allowed_kind_versions_match_guard_allowlist() {
+        let mut cli: Vec<(&str, u32)> = ALLOWED_KIND_VERSIONS
+            .iter()
+            .flat_map(|(k, vs)| vs.iter().map(move |v| (k.as_str(), *v)))
+            .collect();
+        let mut guard: Vec<(&str, u32)> =
+            fandhe_edge_guard::kind_version::KindVersionAllowlist::supported()
+                .iter()
+                .collect();
+        cli.sort_unstable();
+        guard.sort_unstable();
+        assert_eq!(cli, guard);
+        assert!(kind_version_allowed(ModelKind::Autoregressive, 1));
+        assert!(!kind_version_allowed(ModelKind::Autoregressive, 2));
+    }
 
     /// テスト用の作業ディレクトリ（cwd 相当）。
     fn workdir(name: &str) -> std::path::PathBuf {

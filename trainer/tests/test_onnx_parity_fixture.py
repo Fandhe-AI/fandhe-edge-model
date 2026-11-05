@@ -26,7 +26,7 @@ def _doc() -> dict:
     return json.loads((_DIR / "cases.json").read_text(encoding="utf-8"))
 
 
-@pytest.mark.parametrize("kind", ["c1", "c3"])
+@pytest.mark.parametrize("kind", ["c1", "c3", "autoregressive"])
 def test_fixture_sha256_matches_cases(kind: str) -> None:
     """REQ-32: cases.json 記載の sha256 がコミット済み ONNX と一致する。"""
     entry = _doc()["kinds"][kind]
@@ -34,7 +34,7 @@ def test_fixture_sha256_matches_cases(kind: str) -> None:
     assert digest == entry["onnx_sha256"]
 
 
-@pytest.mark.parametrize("kind", ["c1", "c3"])
+@pytest.mark.parametrize("kind", ["c1", "c3", "autoregressive"])
 def test_reference_evaluator_matches_recorded_mlx_labels(kind: str) -> None:
     """REQ-32: ReferenceEvaluator の 1 件ずつの推論が、記録済み MLX ラベルと全件一致する。"""
     entry = _doc()["kinds"][kind]

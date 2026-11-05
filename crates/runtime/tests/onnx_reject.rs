@@ -12,7 +12,8 @@ mod proto_builder;
 
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_runtime::onnx::{
-    MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES, ModelKind, OnnxBackend, load_pipeline,
+    AR_MODEL_LIMITS, MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES, ModelKind, OnnxBackend,
+    load_pipeline,
 };
 use proto_builder::{Val, edit_attr, edit_graph, edit_initializer, edit_model, set_op_type};
 use std::fs;
@@ -57,15 +58,19 @@ fn req39_kind_mismatch_rejected() {
     );
 }
 
-/// REQ-39: 未対応の `kind`（autoregressive を含む）は `unsupported_kind`。
+/// REQ-39: 未対応の `kind` は `unsupported_kind`（autoregressive は #420 で対応済み）。
 #[test]
 fn req39_unsupported_kind_rejected() {
-    for k in ["autoregressive", "", "C1", "pickle"] {
+    for k in ["", "C1", "pickle", "Autoregressive"] {
         let e = ModelKind::parse(k).expect_err("must reject");
         assert_eq!(e.code(), "unsupported_kind", "{k}");
     }
     assert_eq!(ModelKind::parse("c1").ok(), Some(ModelKind::C1));
     assert_eq!(ModelKind::parse("c3").ok(), Some(ModelKind::C3));
+    assert_eq!(
+        ModelKind::parse("autoregressive").ok(),
+        Some(ModelKind::Autoregressive)
+    );
 }
 
 /// REQ-39: sha256 が期待値と一致しなければ `integrity_mismatch`。一致すれば読み込める。
@@ -355,4 +360,187 @@ fn req39_weight_byte_flip_detected_by_sha256() {
         .expect_err("must reject");
     let _ = fs::remove_file(&path);
     assert_eq!(err.code(), "integrity_mismatch");
+}
+
+// ---- autoregressive（REQ-19b・#420）: 許可リスト方式の実行器による拒否 ----
+
+use proto_builder::{encode, parse, sub};
+
+/// `ar.onnx` で `op` の n 番目のノードの添字。
+fn ar_node(bytes: &[u8], op: &str, nth: usize) -> usize {
+    let g = sub(&parse(bytes), 7, 0);
+    let count = g.iter().filter(|(n, _)| *n == 1).count();
+    (0..count)
+        .filter(|&i| proto_builder::string_field(&sub(&g, 1, i), 4).as_deref() == Some(op))
+        .nth(nth)
+        .expect("node not found")
+}
+
+/// ノードへ INT 属性（name・i・type=INT）を足す。
+fn add_int_attr(bytes: &[u8], node: usize, name: &str, v: u64) -> Vec<u8> {
+    edit_graph(bytes, |g| {
+        proto_builder::edit_sub(g, 1, node, |n| {
+            let attr = vec![
+                (1, Val::Len(name.as_bytes().to_vec())),
+                (3, Val::Varint(v)),
+                (20, Val::Varint(2)),
+            ];
+            n.push((5, Val::Len(encode(&attr))));
+        })
+    })
+}
+
+/// 正常な autoregressive は読め、別の kind としては読めない。
+#[test]
+fn req19b_autoregressive_baseline_loads_and_kind_mismatch_rejected() {
+    let ar = model_bytes("ar.onnx");
+    assert_eq!(code(&ar, ModelKind::Autoregressive), "ok");
+    assert_eq!(code(&ar, ModelKind::C1), "unsupported_graph");
+    assert_eq!(code(&ar, ModelKind::C3), "unsupported_graph");
+    assert_eq!(
+        code(&model_bytes("c3.onnx"), ModelKind::Autoregressive),
+        "unsupported_graph"
+    );
+}
+
+/// REQ-39: 許可しない属性・未知の op・不正な軸は読み込み時に拒否する（fail-closed）。
+#[test]
+fn req39_autoregressive_unlisted_attributes_rejected() {
+    let good = model_bytes("ar.onnx");
+    let cum = ar_node(&good, "CumSum", 0);
+    assert_eq!(
+        code(
+            &add_int_attr(&good, cum, "exclusive", 1),
+            ModelKind::Autoregressive
+        ),
+        "unsupported_graph"
+    );
+    assert_eq!(
+        code(
+            &add_int_attr(&good, cum, "reverse", 1),
+            ModelKind::Autoregressive
+        ),
+        "unsupported_graph"
+    );
+    // 許可していない属性名
+    assert_eq!(
+        code(
+            &add_int_attr(&good, cum, "axis", 0),
+            ModelKind::Autoregressive
+        ),
+        "unsupported_graph"
+    );
+    // 未知の op
+    assert_eq!(
+        code(
+            &set_op_type(&good, cum, "Cumsum"),
+            ModelKind::Autoregressive
+        ),
+        "unsupported_graph"
+    );
+    // OneHot の axis=-1 以外
+    let oh = ar_node(&good, "OneHot", 0);
+    let axis0 = edit_attr(&good, oh, "axis", |a| {
+        let i = a.iter().position(|(n, _)| *n == 3).expect("i");
+        a[i].1 = Val::Varint(0);
+    });
+    assert_eq!(code(&axis0, ModelKind::Autoregressive), "unsupported_graph");
+    // Cast の to が FLOAT・INT64 以外（DOUBLE=11）
+    let cast = ar_node(&good, "Cast", 0);
+    let to_double = edit_attr(&good, cast, "to", |a| {
+        let i = a.iter().position(|(n, _)| *n == 3).expect("i");
+        a[i].1 = Val::Varint(11);
+    });
+    assert_eq!(
+        code(&to_double, ModelKind::Autoregressive),
+        "unsupported_graph"
+    );
+    // 最終 Softmax の axis は 1 か -1 だけ（0 は拒否）
+    let last_sm = ar_node(&good, "Softmax", 1);
+    let sm0 = edit_attr(&good, last_sm, "axis", |a| {
+        let i = a.iter().position(|(n, _)| *n == 3).expect("i");
+        a[i].1 = Val::Varint(0);
+    });
+    assert_eq!(code(&sm0, ModelKind::Autoregressive), "unsupported_graph");
+}
+
+/// REQ-39: 注意の Softmax を axis=1 に変えると読み込みは通るが、4 次元入力なので実行時に拒否する
+/// （2 次元入力のときだけ -1 と同じとして受ける）。元のグラフは同じ入力で成功する。
+#[test]
+fn req39_autoregressive_softmax_axis1_on_wrong_rank_fails_at_run() {
+    let good = model_bytes("ar.onnx");
+    let attn = ar_node(&good, "Softmax", 0);
+    let bad = edit_attr(&good, attn, "axis", |a| {
+        let i = a.iter().position(|(n, _)| *n == 3).expect("i");
+        a[i].1 = Val::Varint(1);
+    });
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let infer = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        fs::write(&path, bytes).expect("write");
+        let sha = Sha256Digest::of_bytes(bytes);
+        let p = load_pipeline(ModelKind::Autoregressive, 48, &path, &sha);
+        let _ = fs::remove_file(&path);
+        p.expect("loads").infer_one("alpha")
+    };
+    assert!(infer("onnx_reject_ar_softmax_good.onnx", &good).is_ok());
+    let err = infer("onnx_reject_ar_softmax_axis1.onnx", &bad).expect_err("must fail");
+    assert_eq!(err.code(), "backend_failed");
+}
+
+/// REQ-39: 語彙外のトークン（値域外）と空・長すぎる系列は、C3 と同じく入口で拒否される。
+#[test]
+fn req39_autoregressive_input_ids_are_bounded() {
+    use fandhe_edge_runtime::pipeline::ScoringBackend;
+    let b =
+        OnnxBackend::from_bytes(&model_bytes("ar.onnx"), ModelKind::Autoregressive).expect("load");
+    assert_eq!(b.n_classes(), 3);
+    // 値域外のトークン（257 以上・負）は backend 単体でも拒否する
+    for bad in [257i64, -1] {
+        let ids = fandhe_edge_runtime::pipeline::TokenIds::new(vec![1, bad]);
+        assert!(b.scores(&ids).is_err(), "id {bad}");
+    }
+    // 空と長すぎる系列（MAX_MAX_BYTES 超）
+    for len in [0usize, MAX_MAX_BYTES + 1] {
+        let ids = fandhe_edge_runtime::pipeline::TokenIds::new(vec![1; len]);
+        assert!(b.scores(&ids).is_err(), "len {len}");
+    }
+}
+
+/// REQ-39: OneHot の depth は語彙サイズ（`VOCAB_SIZE`=259）まで。260 は読み込みで拒否する。
+#[test]
+fn req39_autoregressive_onehot_depth_bounded_at_load() {
+    let good = model_bytes("ar.onnx");
+    let depth = |d: i64| {
+        edit_initializer(&good, "vocab_depth", |t| {
+            let i = t.iter().position(|(n, _)| *n == 9).expect("raw");
+            t[i].1 = Val::Len(d.to_le_bytes().to_vec());
+        })
+    };
+    // 259 は元の値（Where のガードにも使われる）。260 は OneHot の上限超
+    assert_eq!(code(&depth(259), ModelKind::Autoregressive), "ok");
+    assert_eq!(
+        code(&depth(260), ModelKind::Autoregressive),
+        "unsupported_graph"
+    );
+}
+
+/// `AR_MODEL_LIMITS` の根拠の式（ノード 57+51L+20、initializer 21+24L+5。L=層数）が、層数 1 の
+/// fixture `ar.onnx` の実数と一致する。層数は `cases.json` の生成設定から読む。
+#[test]
+fn req19b_autoregressive_limits_formula_matches_fixture() {
+    let cases: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fixture_dir().join("cases.json")).expect("cases"))
+            .expect("json");
+    let layers = cases["kinds"]["autoregressive"]["config"]["layers"]
+        .as_u64()
+        .expect("layers") as usize;
+    let g = sub(&parse(&model_bytes("ar.onnx")), 7, 0);
+    let count = |f: u32| g.iter().filter(|(n, _)| *n == f).count();
+    assert_eq!(count(1), 57 + 51 * layers + 20, "nodes");
+    assert_eq!(count(5), 21 + 24 * layers + 5, "initializers");
+    // 層数の上限 MAX_AR_LAYERS=32 でも AR_MODEL_LIMITS に収まる
+    let l = 32;
+    assert!(57 + 51 * l + 20 <= AR_MODEL_LIMITS.max_nodes);
+    assert!(21 + 24 * l + 5 <= AR_MODEL_LIMITS.max_initializers);
 }

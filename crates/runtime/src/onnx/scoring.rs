@@ -1,4 +1,5 @@
-//! `qwen2_lora` の採点グラフの実行器（REQ-41・REQ-32・REQ-28・REQ-39・TASK-41.6-5・#434）。
+//! `qwen2_lora`・`autoregressive` の採点グラフの実行器（REQ-41・REQ-19b・REQ-32・REQ-28・REQ-39・
+//! TASK-41.6-5・#434・#420）。
 //!
 //! # 役割と呼び出し文脈
 //!
@@ -6,6 +7,8 @@
 //! （`ids: INT64 [1,T]` → `probs: FLOAT [1,K]`）を、#416〜#419 の演算カーネル
 //! （[`super::ops`]）だけで実行する。[`super::OnnxBackend`] の `Inner::Scoring` から呼ばれる。
 //! 前処理（chat template の id 列）は [`crate::preprocess::TokenizerPreprocessor`]。
+//! `autoregressive`（`kinds/autoregressive.py::_export_ar_onnx`。重みは内蔵）も同じ実行器で読み、
+//! 前処理は C3 と同じ `ByteEncodingPreprocessor`。選択肢の展開はグラフ内で行うので入力は常に `ids [1,T]`。
 //!
 //! # 汎用 ONNX ランタイムではない
 //!
@@ -24,20 +27,23 @@
 //! - 最後の Softmax（グラフ出力 `probs`）だけ f64（C1・C3 と同じ）
 
 use super::ops::arith::{
-    add, add_i64, bf16_to_f32, cast_bf16_to_f32, cast_i64_to_f32, gemm_temp_bytes, gemm_trans_b,
-    matmul, mul, reciprocal, sqrt, sub,
+    add, add_i64, bf16_to_f32, cast_bf16_to_f32, cast_bool_to_f32, cast_f32_to_i64,
+    cast_i64_to_f32, div, gemm_temp_bytes, gemm_trans_b, matmul, mul, reciprocal, sqrt, sub,
 };
-use super::ops::mask_rope::{cos, greater_i64, range_i64, sin, where_f32};
+use super::ops::mask_rope::{
+    and_bool, cos, equal_i64, greater_equal_i64, greater_i64, less_i64, range_i64, sin, where_f32,
+    where_i64,
+};
 use super::ops::norm_act::{
-    log_softmax_last_axis, reduce_mean_last_axis, reduce_sum, sigmoid, softmax_last_axis,
-    softmax_last_axis_f64,
+    erf, log_softmax_last_axis, reduce_mean_last_axis, reduce_sum, relu, sigmoid,
+    softmax_last_axis, softmax_last_axis_f64,
 };
 use super::ops::shape::{
-    concat, expand, gather_axis0, gather_elements_last_axis, normalize_axis, reshape, shape, slice,
-    split, transpose, unsqueeze,
+    MAX_ONEHOT_DEPTH, concat, cumsum, expand, gather_axis0, gather_elements_last_axis,
+    normalize_axis, one_hot, reshape, shape, slice, split, squeeze, transpose, unsqueeze,
 };
 use super::ops::{OpError, Tensor};
-use super::proto::{DT_FLOAT, Dim, GraphProto, NodeProto, TensorData};
+use super::proto::{DT_FLOAT, DT_INT64, Dim, GraphProto, NodeProto, TensorData};
 use super::{OnnxLoadError, check_graph_io, check_n_classes};
 use crate::pipeline::{BackendError, MAX_INFER_TOKEN_IDS};
 use std::borrow::Cow;
@@ -74,25 +80,50 @@ enum Op {
     Sigmoid,
     Sin,
     Cos,
-    Cast,
+    /// `to_i64` が偽なら `to=FLOAT`（入力は BFLOAT16・INT64・BOOL）、真なら `to=INT64`（入力は FLOAT）。
+    Cast {
+        to_i64: bool,
+    },
+    Div,
+    Erf,
+    Relu,
+    Less,
+    GreaterOrEqual,
+    Equal,
+    And,
+    Squeeze,
+    CumSum,
+    OneHot,
     MatMul,
     Gemm,
     Shape,
     Gather,
-    GatherElements { axis: i64 },
+    GatherElements {
+        axis: i64,
+    },
     Reshape,
     Unsqueeze,
     Expand,
-    Transpose { perm: Vec<i64> },
-    Concat { axis: i64 },
+    Transpose {
+        perm: Vec<i64>,
+    },
+    Concat {
+        axis: i64,
+    },
     Slice,
-    Split { axis: i64 },
+    Split {
+        axis: i64,
+    },
     Range,
     Greater,
     Where,
     ReduceMean,
     ReduceSum,
-    Softmax { f64_out: bool },
+    /// `axis1` は `axis=1` 属性（入力が 2 次元のときだけ -1 と同じ。autoregressive の最終 Softmax）。
+    Softmax {
+        f64_out: bool,
+        axis1: bool,
+    },
     LogSoftmax,
 }
 
@@ -176,6 +207,16 @@ fn compile_node(n: &NodeProto) -> Result<Op, OnnxLoadError> {
         "Add" => (Op::Add, 2..=2, 1, &[]),
         "Sub" => (Op::Sub, 2..=2, 1, &[]),
         "Mul" => (Op::Mul, 2..=2, 1, &[]),
+        "Div" => (Op::Div, 2..=2, 1, &[]),
+        "Erf" => (Op::Erf, 1..=1, 1, &[]),
+        "Relu" => (Op::Relu, 1..=1, 1, &[]),
+        "Less" => (Op::Less, 2..=2, 1, &[]),
+        "GreaterOrEqual" => (Op::GreaterOrEqual, 2..=2, 1, &[]),
+        "Equal" => (Op::Equal, 2..=2, 1, &[]),
+        "And" => (Op::And, 2..=2, 1, &[]),
+        "Squeeze" => (Op::Squeeze, 2..=2, 1, &[]),
+        "CumSum" => (Op::CumSum, 2..=2, 1, &["exclusive", "reverse"]),
+        "OneHot" => (Op::OneHot, 3..=3, 1, &["axis"]),
         "Sqrt" => (Op::Sqrt, 1..=1, 1, &[]),
         "Reciprocal" => (Op::Reciprocal, 1..=1, 1, &[]),
         "Sigmoid" => (Op::Sigmoid, 1..=1, 1, &[]),
@@ -191,7 +232,14 @@ fn compile_node(n: &NodeProto) -> Result<Op, OnnxLoadError> {
         "Greater" => (Op::Greater, 2..=2, 1, &[]),
         "Where" => (Op::Where, 3..=3, 1, &[]),
         "ReduceSum" => (Op::ReduceSum, 2..=2, 1, &["keepdims"]),
-        "Cast" => (Op::Cast, 1..=1, 1, &["to"]),
+        "Cast" => (
+            Op::Cast {
+                to_i64: req_int(n, "to")? == DT_INT64,
+            },
+            1..=1,
+            1,
+            &["to"],
+        ),
         "Gemm" => (Op::Gemm, 2..=3, 1, &["transA", "transB", "alpha", "beta"]),
         "Gather" => (Op::Gather, 2..=2, 1, &["axis"]),
         "GatherElements" => (
@@ -236,6 +284,7 @@ fn compile_node(n: &NodeProto) -> Result<Op, OnnxLoadError> {
         "Softmax" => (
             Op::Softmax {
                 f64_out: n.outputs.first().is_some_and(|o| o == OUTPUT),
+                axis1: n.attr("axis").and_then(|a| a.int()) == Some(1),
             },
             1..=1,
             1,
@@ -247,8 +296,19 @@ fn compile_node(n: &NodeProto) -> Result<Op, OnnxLoadError> {
     arity(n, ins, outs)?;
     attrs_within(n, allowed)?;
     match &op {
-        Op::Cast => {
-            if req_int(n, "to")? != DT_FLOAT {
+        // 受けるのは to=FLOAT と to=INT64 だけ（他の to は拒否）
+        Op::Cast { to_i64 } => {
+            if !*to_i64 && req_int(n, "to")? != DT_FLOAT {
+                return bad();
+            }
+        }
+        // 既定（exclusive=0・reverse=0）以外の累積は実装しない
+        Op::CumSum => {
+            int_default(n, "exclusive", 0)?;
+            int_default(n, "reverse", 0)?;
+        }
+        Op::OneHot => {
+            if req_int(n, "axis")? != -1 {
                 return bad();
             }
         }
@@ -270,7 +330,10 @@ fn compile_node(n: &NodeProto) -> Result<Op, OnnxLoadError> {
             }
         }
         Op::ReduceSum if req_int(n, "keepdims")? != 0 => return bad(),
-        Op::Softmax { .. } | Op::LogSoftmax if req_int(n, "axis")? != -1 => return bad(),
+        Op::Softmax { axis1, .. } if req_int(n, "axis")? != if *axis1 { 1 } else { -1 } => {
+            return bad();
+        }
+        Op::LogSoftmax if req_int(n, "axis")? != -1 => return bad(),
         _ => {}
     }
     Ok(op)
@@ -329,6 +392,21 @@ impl ScoringModel {
         let mut steps = Vec::with_capacity(graph.nodes.len());
         for n in &graph.nodes {
             let op = compile_node(n)?;
+            // OneHot の depth は定数（initializer）で、語彙サイズの上限以下であること（確保量を読み込み時に有界にする）
+            if matches!(op, Op::OneHot) {
+                let depth = n
+                    .inputs
+                    .get(1)
+                    .and_then(|i| slots.get(i.as_str()))
+                    .and_then(|&s| base.get(s))
+                    .and_then(|v| v.as_deref());
+                match depth {
+                    Some(Value::I64(t))
+                        if matches!(t.data(), [d] if usize::try_from(*d)
+                            .is_ok_and(|d| (1..=MAX_ONEHOT_DEPTH).contains(&d))) => {}
+                    _ => return bad(),
+                }
+            }
             // 入力は定義済み（トポロジカル順）であること
             let ins = n
                 .inputs
@@ -356,7 +434,7 @@ impl ScoringModel {
             .ok_or(OnnxLoadError::UnsupportedGraph)?;
         // probs は Softmax が作る（f64 出力の指定を持つこと）
         let produced_by_softmax = steps.iter().any(|s| {
-            matches!(s.op, Op::Softmax { f64_out: true }) && s.outs.first() == Some(&out_slot)
+            matches!(s.op, Op::Softmax { f64_out: true, .. }) && s.outs.first() == Some(&out_slot)
         });
         if !produced_by_softmax {
             return bad();
@@ -416,7 +494,12 @@ impl ScoringModel {
         }
         let out = f.vals.get(self.out_slot).and_then(|v| v.as_deref());
         match out {
-            Some(Value::F64(t)) if t.shape() == [1, self.n_classes] => Ok(t.data().to_vec()),
+            // 出口でも非有限を拒否する（Div の 0 除算などが確率に漏れないように。既存の kind と同じ Failed）
+            Some(Value::F64(t))
+                if t.shape() == [1, self.n_classes] && t.data().iter().all(|p| p.is_finite()) =>
+            {
+                Ok(t.data().to_vec())
+            }
             _ => Err(BackendError::Failed),
         }
     }
@@ -619,7 +702,7 @@ fn alloc_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
         .filter(|(i, _)| match op {
             Op::Gemm => *i != 1,
             Op::Gather => *i != 0,
-            Op::Shape | Op::Cast | Op::Reshape | Op::Unsqueeze => false,
+            Op::Shape | Op::Cast { .. } | Op::Reshape | Op::Unsqueeze | Op::Squeeze => false,
             _ => true,
         })
         .fold(0usize, |acc, (_, x)| match x.as_ref() {
@@ -627,13 +710,24 @@ fn alloc_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
             _ => acc,
         });
     let (n, size) = match op {
-        Op::Add | Op::Sub | Op::Mul => {
+        Op::Add | Op::Sub | Op::Mul | Op::Div => {
             let size = a.iter().map(|x| elem_bytes(x)).max().unwrap_or(4);
             (bcast(&all_shapes()), size)
         }
-        Op::Sqrt | Op::Reciprocal | Op::Sigmoid | Op::Sin | Op::Cos => (numel(v(0)?), 4),
+        Op::Sqrt | Op::Reciprocal | Op::Sigmoid | Op::Sin | Op::Cos | Op::Erf | Op::Relu => {
+            (numel(v(0)?), 4)
+        }
+        // 位置 id の累積。入力を複製してから加算する
+        Op::CumSum => (numel(v(0)?), 4),
+        // 出力は indices.shape ++ [depth]。depth は読めなければ上界を作れない
+        Op::OneHot => {
+            let depth = i64v(v(1)?).ok()?.data().first().copied()?;
+            let depth = usize::try_from(depth).ok()?;
+            (numel(v(0)?).saturating_mul(depth), 4)
+        }
         // bf16 → 遅延 f32 は共有バッファの Arc を渡すだけで確保しない
-        Op::Cast => match v(0)? {
+        Op::Cast { to_i64: true } => (numel(v(0)?), 8),
+        Op::Cast { to_i64: false } => match v(0)? {
             Value::RawBf16(_) => (0, 4),
             x => (numel(x), 4),
         },
@@ -670,7 +764,7 @@ fn alloc_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
         }
         Op::GatherElements { .. } => (numel(v(1)?), 4),
         // 唯一の持ち主ならデータを移すだけ。共有中は own() が全体を複製する
-        Op::Reshape | Op::Unsqueeze => {
+        Op::Reshape | Op::Unsqueeze | Op::Squeeze => {
             let x = a.first()?;
             let n = if Arc::strong_count(x) > 1 {
                 numel(x)
@@ -689,7 +783,11 @@ fn alloc_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
             (bcast(&[shape_of(v(0)?), &dims]), elem_bytes(v(0)?))
         }
         Op::Transpose { .. } | Op::Slice => (numel(v(0)?), elem_bytes(v(0)?)),
-        Op::Concat { .. } => (a.iter().fold(0usize, |s, x| s.saturating_add(numel(x))), 4),
+        // 要素サイズは入力の dtype の最大（i64 は 8。遅延 bf16 は f32 へ展開されるので 4）
+        Op::Concat { .. } => (
+            a.iter().fold(0usize, |s, x| s.saturating_add(numel(x))),
+            a.iter().map(|x| elem_bytes(x)).max().unwrap_or(4),
+        ),
         // 出力の合計は (axis 以外の軸の積) × Σ split
         Op::Split { axis } => {
             let x = shape_of(v(0)?);
@@ -718,12 +816,19 @@ fn alloc_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
             };
             (usize::try_from(n).unwrap_or(usize::MAX), 8)
         }
-        Op::Greater => (bcast(&all_shapes()), 1),
-        // where_f32 は (cond, x) の組の列を中間に 1 つ確保する
+        Op::Greater | Op::Less | Op::GreaterOrEqual | Op::Equal | Op::And => {
+            (bcast(&all_shapes()), 1)
+        }
+        // where_f32・where_i64 は (cond, x) の組の列を中間に 1 つ確保する
         Op::Where => {
-            let pairs = bcast(&[shape_of(v(0)?), shape_of(v(1)?)])
-                .saturating_mul(std::mem::size_of::<(bool, f32)>());
-            let out = bcast(&all_shapes()).saturating_mul(4);
+            let i64_values = matches!(v(1)?, Value::I64(_));
+            let pair = if i64_values {
+                std::mem::size_of::<(bool, i64)>()
+            } else {
+                std::mem::size_of::<(bool, f32)>()
+            };
+            let pairs = bcast(&[shape_of(v(0)?), shape_of(v(1)?)]).saturating_mul(pair);
+            let out = bcast(&all_shapes()).saturating_mul(if i64_values { 8 } else { 4 });
             return Some(out.saturating_add(pairs).saturating_add(expanded));
         }
         // keepdims=1 で最後の軸が 1 になる
@@ -749,7 +854,7 @@ fn alloc_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
             (kept, 4)
         }
         // softmax_f64 が行ごとに exp と確率の 2 本（各 f64 × 最後の軸）を一時に持つ
-        Op::Softmax { f64_out: true } => {
+        Op::Softmax { f64_out: true, .. } => {
             let x = shape_of(v(0)?);
             let tmp = x.last().copied().unwrap_or(0).saturating_mul(16);
             return Some(
@@ -759,7 +864,7 @@ fn alloc_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
                     .saturating_add(expanded),
             );
         }
-        Op::Softmax { f64_out: false } | Op::LogSoftmax => (numel(v(0)?), 4),
+        Op::Softmax { f64_out: false, .. } | Op::LogSoftmax => (numel(v(0)?), 4),
     };
     Some(n.saturating_mul(size).saturating_add(expanded))
 }
@@ -775,7 +880,7 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
         return Err(BackendError::Failed);
     }
     // 所有権を要る形状演算は、入力を唯一の持ち主にしてからデータをコピーせず渡す
-    if matches!(step.op, Op::Reshape | Op::Unsqueeze) {
+    if matches!(step.op, Op::Reshape | Op::Unsqueeze | Op::Squeeze) {
         let mut it = a.into_iter();
         let (x, s) = (it.next(), it.next());
         let (x, s) = (
@@ -783,10 +888,10 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
             s.ok_or(BackendError::Failed)?,
         );
         let s = i64v(&s)?;
-        return Ok(vec![if matches!(step.op, Op::Reshape) {
-            same_type!(x, t => reshape(t, s))
-        } else {
-            same_type!(x, t => unsqueeze(t, s))
+        return Ok(vec![match step.op {
+            Op::Reshape => same_type!(x, t => reshape(t, s)),
+            Op::Squeeze => same_type!(x, t => squeeze(t, s)),
+            _ => same_type!(x, t => unsqueeze(t, s)),
         }]);
     }
     let arg = |i: usize| -> Result<&Value, BackendError> {
@@ -811,11 +916,41 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
         Op::Sigmoid => one(Value::F32(op(sigmoid(f32v(arg(0)?)?.as_ref()))?)),
         Op::Sin => one(Value::F32(op(sin(f32v(arg(0)?)?.as_ref()))?)),
         Op::Cos => one(Value::F32(op(cos(f32v(arg(0)?)?.as_ref()))?)),
-        Op::Cast => match arg(0)? {
-            Value::RawBf16(t) => one(Value::LazyF32(t.clone())),
-            Value::I64(t) => one(Value::F32(op(cast_i64_to_f32(t))?)),
+        Op::Cast { to_i64: true } => match arg(0)? {
+            Value::F32(t) => one(Value::I64(op(cast_f32_to_i64(t))?)),
             _ => Err(BackendError::Failed),
         },
+        Op::Cast { to_i64: false } => match arg(0)? {
+            Value::RawBf16(t) => one(Value::LazyF32(t.clone())),
+            Value::I64(t) => one(Value::F32(op(cast_i64_to_f32(t))?)),
+            Value::Bool(t) => one(Value::F32(op(cast_bool_to_f32(t))?)),
+            _ => Err(BackendError::Failed),
+        },
+        Op::Div => one(Value::F32(op(div(
+            f32v(arg(0)?)?.as_ref(),
+            f32v(arg(1)?)?.as_ref(),
+        ))?)),
+        Op::Erf => one(Value::F32(op(erf(f32v(arg(0)?)?.as_ref()))?)),
+        Op::Relu => one(Value::F32(op(relu(f32v(arg(0)?)?.as_ref()))?)),
+        Op::Less => one(Value::Bool(op(less_i64(i64v(arg(0)?)?, i64v(arg(1)?)?))?)),
+        Op::GreaterOrEqual => one(Value::Bool(op(greater_equal_i64(
+            i64v(arg(0)?)?,
+            i64v(arg(1)?)?,
+        ))?)),
+        Op::Equal => one(Value::Bool(op(equal_i64(i64v(arg(0)?)?, i64v(arg(1)?)?))?)),
+        Op::And => match (arg(0)?, arg(1)?) {
+            (Value::Bool(x), Value::Bool(y)) => one(Value::Bool(op(and_bool(x, y))?)),
+            _ => Err(BackendError::Failed),
+        },
+        Op::CumSum => one(Value::F32(op(cumsum(
+            f32v(arg(0)?)?.as_ref(),
+            i64v(arg(1)?)?,
+        ))?)),
+        Op::OneHot => one(Value::F32(op(one_hot(
+            i64v(arg(0)?)?,
+            i64v(arg(1)?)?,
+            f32v(arg(2)?)?.as_ref(),
+        ))?)),
         Op::MatMul => one(Value::F32(op(matmul(
             f32v(arg(0)?)?.as_ref(),
             f32v(arg(1)?)?.as_ref(),
@@ -866,12 +1001,19 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
                 i64v(arg(1)?)?,
             ))?))
         }
-        Op::Reshape | Op::Unsqueeze => Err(BackendError::Failed),
+        Op::Reshape | Op::Unsqueeze | Op::Squeeze => Err(BackendError::Failed),
         Op::Expand => {
             let s = i64v(arg(1)?)?;
             one(same_type!(arg(0)?, t => expand(t, s)))
         }
         Op::Transpose { perm } => one(same_type!(arg(0)?, t => transpose(t, perm))),
+        Op::Concat { axis } if matches!(arg(0)?, Value::I64(_)) => {
+            let mut ts: Vec<&Tensor<i64>> = Vec::with_capacity(a.len());
+            for v in &a {
+                ts.push(i64v(v)?);
+            }
+            one(Value::I64(op(concat(&ts, *axis))?))
+        }
         Op::Concat { axis } => {
             let mut ts: Vec<Cow<'_, Tensor<f32>>> = Vec::with_capacity(a.len());
             for v in &a {
@@ -901,8 +1043,11 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
             i64v(arg(0)?)?,
             i64v(arg(1)?)?,
         ))?)),
-        Op::Where => match arg(0)? {
-            Value::Bool(c) => one(Value::F32(op(where_f32(
+        Op::Where => match (arg(0)?, arg(1)?) {
+            (Value::Bool(c), Value::I64(x)) => {
+                one(Value::I64(op(where_i64(c, x, i64v(arg(2)?)?))?))
+            }
+            (Value::Bool(c), _) => one(Value::F32(op(where_f32(
                 c,
                 f32v(arg(1)?)?.as_ref(),
                 f32v(arg(2)?)?.as_ref(),
@@ -916,10 +1061,14 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
             f32v(arg(0)?)?.as_ref(),
             i64v(arg(1)?)?,
         ))?)),
-        Op::Softmax { f64_out: true } => one(Value::F64(op(softmax_last_axis_f64(
+        // axis=1 は 2 次元入力のときだけ最後の軸と同じ。他の rank は軸が異なるので拒否する
+        Op::Softmax { axis1: true, .. } if shape_of(arg(0)?).len() != 2 => {
+            Err(BackendError::Failed)
+        }
+        Op::Softmax { f64_out: true, .. } => one(Value::F64(op(softmax_last_axis_f64(
             f32v(arg(0)?)?.as_ref(),
         ))?)),
-        Op::Softmax { f64_out: false } => {
+        Op::Softmax { f64_out: false, .. } => {
             one(Value::F32(op(softmax_last_axis(f32v(arg(0)?)?.as_ref()))?))
         }
         Op::LogSoftmax => one(Value::F32(op(log_softmax_last_axis(
@@ -1089,14 +1238,20 @@ mod tests {
             Some(3 * 4 + 3 * 8)
         );
         assert_eq!(
-            alloc_bound(&Op::Softmax { f64_out: true }, &[x]),
+            alloc_bound(
+                &Op::Softmax {
+                    f64_out: true,
+                    axis1: false
+                },
+                &[x]
+            ),
             Some(3 * 8 + 3 * 16)
         );
         // bf16 → 遅延 f32 の Cast は確保しない
         let w = Arc::new(Value::RawBf16(Arc::new(
             Tensor::new(vec![2], vec![0u16; 2]).unwrap(),
         )));
-        assert_eq!(alloc_bound(&Op::Cast, &[w]), Some(0));
+        assert_eq!(alloc_bound(&Op::Cast { to_i64: false }, &[w]), Some(0));
     }
 
     /// 値表に残る動的スロットの合計バイト数（`live` が一致すべき実保持量）。
@@ -1121,10 +1276,17 @@ mod tests {
         };
         let m = ScoringModel {
             steps: vec![
-                st(Op::Cast, vec![0], 1),
-                st(Op::Cast, vec![0], 2),
+                st(Op::Cast { to_i64: false }, vec![0], 1),
+                st(Op::Cast { to_i64: false }, vec![0], 2),
                 st(Op::Add, vec![1, 2], 3),
-                st(Op::Softmax { f64_out: true }, vec![3], 4),
+                st(
+                    Op::Softmax {
+                        f64_out: true,
+                        axis1: false,
+                    },
+                    vec![3],
+                    4,
+                ),
             ],
             n_slots: 5,
             base: vec![None; 5],
@@ -1144,5 +1306,132 @@ mod tests {
         assert_eq!(f.live, 3 * 8);
         let p = m.scores(&[1, 1, 1]).unwrap();
         assert!(p.iter().all(|&v| (v - 1.0 / 3.0).abs() < 1e-9));
+    }
+
+    // ---- autoregressive（REQ-19b・#420）の許可リスト照合 ----
+
+    fn int_attr(name: &str, v: i64) -> super::super::proto::AttrProto {
+        super::super::proto::AttrProto {
+            name: name.into(),
+            ty: 2,
+            i: Some(v),
+            ..Default::default()
+        }
+    }
+
+    fn node(
+        op: &str,
+        n_in: usize,
+        out: &str,
+        attrs: Vec<super::super::proto::AttrProto>,
+    ) -> NodeProto {
+        NodeProto {
+            inputs: (0..n_in).map(|i| format!("in{i}")).collect(),
+            outputs: vec![out.into()],
+            op_type: op.into(),
+            attrs,
+            ..Default::default()
+        }
+    }
+
+    /// REQ-19b: 出力名 `probs` の Softmax だけが f64 出力で、注意の Softmax（別名）は f32。
+    /// 最終 Softmax の `axis=1` は受け、他の軸（0 や 2）と注意側の `axis=1` 以外の不一致は拒否する。
+    #[test]
+    fn req19b_softmax_f64_only_for_graph_output_and_axis_rules() {
+        let sm = |out: &str, axis: i64| {
+            compile_node(&node("Softmax", 1, out, vec![int_attr("axis", axis)]))
+        };
+        assert!(matches!(
+            sm("probs", 1),
+            Ok(Op::Softmax {
+                f64_out: true,
+                axis1: true
+            })
+        ));
+        assert!(matches!(
+            sm("probs", -1),
+            Ok(Op::Softmax {
+                f64_out: true,
+                axis1: false
+            })
+        ));
+        assert!(matches!(
+            sm("layer0_attn", -1),
+            Ok(Op::Softmax {
+                f64_out: false,
+                axis1: false
+            })
+        ));
+        for axis in [0, 2, -2] {
+            assert!(sm("probs", axis).is_err(), "axis {axis}");
+        }
+    }
+
+    /// REQ-19b・REQ-39: CumSum は既定の exclusive=0・reverse=0 だけ、Cast は FLOAT・INT64 だけ、
+    /// OneHot は axis=-1 だけを受ける。未知の属性は拒否する。
+    #[test]
+    fn req39_ar_ops_reject_unlisted_attributes() {
+        let cum = |attrs| compile_node(&node("CumSum", 2, "y", attrs));
+        assert!(cum(vec![]).is_ok());
+        assert!(cum(vec![int_attr("exclusive", 0), int_attr("reverse", 0)]).is_ok());
+        assert!(cum(vec![int_attr("exclusive", 1)]).is_err());
+        assert!(cum(vec![int_attr("reverse", 1)]).is_err());
+        assert!(cum(vec![int_attr("axis", 0)]).is_err());
+        let cast = |to| compile_node(&node("Cast", 1, "y", vec![int_attr("to", to)]));
+        assert!(matches!(cast(1), Ok(Op::Cast { to_i64: false })));
+        assert!(matches!(cast(7), Ok(Op::Cast { to_i64: true })));
+        for to in [0, 9, 10, 11] {
+            assert!(cast(to).is_err(), "to {to}");
+        }
+        let oh = |axis| compile_node(&node("OneHot", 3, "y", vec![int_attr("axis", axis)]));
+        assert!(oh(-1).is_ok());
+        assert!(oh(0).is_err());
+        assert!(compile_node(&node("OneHot", 3, "y", vec![])).is_err());
+        // 未知の op は拒否
+        assert!(compile_node(&node("Cumsum", 2, "y", vec![])).is_err());
+    }
+
+    /// Concat の見積もりは入力 dtype の要素サイズを使う（i64 は 8 バイト。REQ-39・#420）。
+    #[test]
+    fn req39_concat_bound_uses_input_element_size() {
+        let a = i64s(vec![2], vec![1, 2]);
+        let b = i64s(vec![3], vec![3, 4, 5]);
+        let op = Op::Concat { axis: 0 };
+        assert_eq!(alloc_bound(&op, &[a, b]), Some(5 * 8));
+        let f = Arc::new(f32s(4));
+        assert_eq!(alloc_bound(&op, &[f.clone(), f]), Some(8 * 4));
+    }
+
+    /// Div の 0 除算で非有限になった値は確率として出さない（`Failed`。C1・C3 と同じ扱い）。
+    #[test]
+    fn req39_non_finite_scores_are_rejected() {
+        let st = |op, ins: Vec<usize>, out| Step {
+            op,
+            ins,
+            outs: vec![out],
+        };
+        // slot0=ids、slot1=0.0 の initializer。ids → Cast → Div(x, 0) → Softmax(f64)
+        let zero = Arc::new(Value::F32(Tensor::new(vec![], vec![0.0f32]).unwrap()));
+        let m = ScoringModel {
+            steps: vec![
+                st(Op::Cast { to_i64: false }, vec![0], 2),
+                st(Op::Div, vec![2, 1], 3),
+                st(
+                    Op::Softmax {
+                        f64_out: true,
+                        axis1: false,
+                    },
+                    vec![3],
+                    4,
+                ),
+            ],
+            n_slots: 5,
+            base: vec![None, Some(zero), None, None, None],
+            uses: vec![1, 1, 1, 1, 0],
+            ids_slot: 0,
+            out_slot: 4,
+            n_classes: 3,
+        };
+        assert_eq!(m.scores(&[1, 2, 3]), Err(BackendError::Failed));
     }
 }

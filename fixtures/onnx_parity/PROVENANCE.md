@@ -10,6 +10,7 @@ TASK-32.1-2（#113）の結合テスト用 fixture。Rust 推論ランタイム�
 | -------- | ---- |
 | `c1.onnx` | 極小設定で学習した C1（バイト n-gram TF-IDF + ロジスティック回帰）の書き出し |
 | `c3.onnx` | 極小設定で学習した C3（バイト CNN）の書き出し |
+| `ar.onnx` | 極小設定で学習した autoregressive（バイト単位の小型自己回帰 decoder。対応づけ (b)。REQ-19b・TASK-41.7-6・#420）の書き出し |
 | `cases.json` | kind ごとの `max_bytes`・`label_order`・`onnx_sha256`・生成設定・各ケースの MLX 内推論の予測ラベル・確率・上位 2 つの確率差 |
 
 ## 出典とライセンス
@@ -41,3 +42,13 @@ uv run --locked --directory trainer python tools/gen_onnx_parity_fixture.py --ou
 - **再学習してバイト一致を確かめるテストは置かない**。python-ci は macOS arm64、開発機は Linux x86_64 で、
   MLX CPU の浮動小数の結果が一致する保証がないため。コミット済みファイルの自己整合性
   （`trainer/tests/test_onnx_parity_fixture.py`）と、Rust 側の全件一致のみを検査する
+
+## autoregressive（`ar.onnx`。REQ-19b・TASK-41.7-6・#420）
+
+- 追加手順（c1・c3 の項目と ONNX は変えない）:
+  `UV_NO_CONFIG=1 uv run --offline --locked --directory trainer python tools/gen_onnx_parity_fixture.py --out ../fixtures/onnx_parity --only autoregressive --overwrite`
+- 生成環境: macOS arm64・CPU（`device="cpu"`）。versions は `cases.json` の `kinds.autoregressive.versions`
+- seed 20260929・`max_bytes` 48・3 ラベル（alpha・beta・gamma）・合成データは C1・C3 と同じ
+- 設定: `layers=1`・`dims=16`・`heads=2`・`dropout=0`・`lr=5e-3`・`warmup_steps=10`・`batch_size=16`・`epochs=30`
+- `mlx_probs` は `_score_choices_mlx` の対数尤度合計を選択肢間 softmax にしたもの（`probs` 出力と同じ定義）
+- 生成器の検査は C1・C3 と同じ（ReferenceEvaluator との確率差 1e-5 以内・予測ラベル 2 種類以上）。僅差の除外は 0 件

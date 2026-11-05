@@ -10,6 +10,1667 @@
     }
   },
   "kinds": {
+    "autoregressive": {
+      "cases": [
+        {
+          "input": "  hello   world  ",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.1381773219909519e-05,
+            0.9999886155128479,
+            1.7399626184300132e-09
+          ],
+          "name": "vector_basic_trim_and_compress",
+          "top2_margin": 0.9999772310256958
+        },
+        {
+          "input": "a\tb\nc",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            2.126984327333048e-06,
+            0.9999978542327881,
+            4.0363492104233956e-08
+          ],
+          "name": "vector_tabs_and_newlines",
+          "top2_margin": 0.9999957084655762
+        },
+        {
+          "input": "Ａ１",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            6.631370524701197e-06,
+            0.9999914169311523,
+            1.960889449037495e-06
+          ],
+          "name": "vector_fullwidth_alnum_nfkc",
+          "top2_margin": 0.9999848008155823
+        },
+        {
+          "input": "",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            5.963594594504684e-05,
+            0.9999174475669861,
+            2.290158772666473e-05
+          ],
+          "name": "vector_empty_input",
+          "top2_margin": 0.9998577833175659
+        },
+        {
+          "input": "ab",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.4289822280406952,
+            0.5686362981796265,
+            0.0023814465384930372
+          ],
+          "name": "vector_ascii_basic",
+          "top2_margin": 0.13965407013893127
+        },
+        {
+          "input": "あ",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9925646185874939,
+            0.00476355105638504,
+            0.002671851310878992
+          ],
+          "name": "vector_multibyte_japanese",
+          "top2_margin": 0.9878010749816895
+        },
+        {
+          "input": "aaaaaaaaaaaaaaaaaaaa",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9962369203567505,
+            0.0037630980368703604,
+            2.2225228601957525e-10
+          ],
+          "name": "vector_truncate_long_ascii",
+          "top2_margin": 0.992473840713501
+        },
+        {
+          "input": "Ａ",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.018261868506669998,
+            0.9634546637535095,
+            0.01828349567949772
+          ],
+          "name": "vector_normalize_before_encode",
+          "top2_margin": 0.9451711773872375
+        },
+        {
+          "input": "a\u001cb",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9458246827125549,
+            0.054139602929353714,
+            3.572549030650407e-05
+          ],
+          "name": "vector_info_separator_1c",
+          "top2_margin": 0.8916850686073303
+        },
+        {
+          "input": "a\u001db",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9458246827125549,
+            0.054139602929353714,
+            3.572549030650407e-05
+          ],
+          "name": "vector_info_separator_1d",
+          "top2_margin": 0.8916850686073303
+        },
+        {
+          "input": "a\u001eb",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9458246827125549,
+            0.054139602929353714,
+            3.572549030650407e-05
+          ],
+          "name": "vector_info_separator_1e",
+          "top2_margin": 0.8916850686073303
+        },
+        {
+          "input": "a\u001fb",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9458246827125549,
+            0.054139602929353714,
+            3.572549030650407e-05
+          ],
+          "name": "vector_info_separator_1f",
+          "top2_margin": 0.8916850686073303
+        },
+        {
+          "input": "ab",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9458246827125549,
+            0.054139602929353714,
+            3.572549030650407e-05
+          ],
+          "name": "vector_next_line_0085",
+          "top2_margin": 0.8916850686073303
+        },
+        {
+          "input": "a b",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9458246827125549,
+            0.054139602929353714,
+            3.572549030650407e-05
+          ],
+          "name": "vector_line_separator_2028",
+          "top2_margin": 0.8916850686073303
+        },
+        {
+          "input": "a b",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9458246827125549,
+            0.054139602929353714,
+            3.572549030650407e-05
+          ],
+          "name": "vector_ogham_space_1680",
+          "top2_margin": 0.8916850686073303
+        },
+        {
+          "input": "a b",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9458246827125549,
+            0.054139602929353714,
+            3.572549030650407e-05
+          ],
+          "name": "vector_nbsp_00a0",
+          "top2_margin": 0.8916850686073303
+        },
+        {
+          "input": "a　b",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9458246231079102,
+            0.054139625281095505,
+            3.57255048584193e-05
+          ],
+          "name": "vector_ideographic_space_3000",
+          "top2_margin": 0.8916850090026855
+        },
+        {
+          "input": "a​b",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.11883289366960526,
+            0.8811666965484619,
+            4.0897350572777214e-07
+          ],
+          "name": "vector_zero_width_space_200b",
+          "top2_margin": 0.7623338103294373
+        },
+        {
+          "input": "a﻿b",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.23466423153877258,
+            0.765335738658905,
+            3.240965540385332e-08
+          ],
+          "name": "vector_bom_feff",
+          "top2_margin": 0.5306714773178101
+        },
+        {
+          "input": "a\u0000b",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9945657253265381,
+            0.00541286263614893,
+            2.1383522835094482e-05
+          ],
+          "name": "vector_null_byte",
+          "top2_margin": 0.9891528487205505
+        },
+        {
+          "input": "a\u0001b",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.974251389503479,
+            0.025435172021389008,
+            0.0003134181897621602
+          ],
+          "name": "vector_control_0001",
+          "top2_margin": 0.9488162398338318
+        },
+        {
+          "input": "café",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.00036197382723912597,
+            0.9996335506439209,
+            4.473345143196639e-06
+          ],
+          "name": "vector_composed_e_acute",
+          "top2_margin": 0.9992715716362
+        },
+        {
+          "input": "ﬁle",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.3024618056078907e-05,
+            0.9991689920425415,
+            0.000817998603451997
+          ],
+          "name": "vector_ligature_fi",
+          "top2_margin": 0.998350977897644
+        },
+        {
+          "input": "㈀",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.00027919700369238853,
+            0.9997207522392273,
+            3.871777209951688e-08
+          ],
+          "name": "vector_compat_hangul_parenthesized",
+          "top2_margin": 0.9994415640830994
+        },
+        {
+          "input": "ああ",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.002054081531241536,
+            0.9978786706924438,
+            6.725910498062149e-05
+          ],
+          "name": "vector_truncate_mid_multibyte",
+          "top2_margin": 0.9958245754241943
+        },
+        {
+          "input": "abc",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.6347339749336243,
+            0.3650306761264801,
+            0.000235339772189036
+          ],
+          "name": "vector_max_bytes_zero",
+          "top2_margin": 0.26970329880714417
+        },
+        {
+          "input": " \t\n",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            5.963588773738593e-05,
+            0.9999174475669861,
+            2.2901631382410415e-05
+          ],
+          "name": "vector_whitespace_only_spaces_tabs_newlines",
+          "top2_margin": 0.9998577833175659
+        },
+        {
+          "input": "\u001c\u001d",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            5.963588773738593e-05,
+            0.9999174475669861,
+            2.2901631382410415e-05
+          ],
+          "name": "vector_whitespace_only_info_separators",
+          "top2_margin": 0.9998577833175659
+        },
+        {
+          "input": "berry gamma grape arrow gamma atlas gamma brick",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            1.7602069419808686e-05,
+            0.42927974462509155,
+            0.5707026720046997
+          ],
+          "name": "synthetic_000",
+          "top2_margin": 0.14142292737960815
+        },
+        {
+          "input": "GRAPE GAMMA BERRY GLIDE ALPHA ALPHA BLOOM GRAPE GHOST ATLAS BISON GRAIN",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.986558735370636,
+            0.013409493491053581,
+            3.179316263413057e-05
+          ],
+          "name": "synthetic_001",
+          "top2_margin": 0.9731492400169373
+        },
+        {
+          "input": "  berry   alpha   glide   alpha   bison   glide   apple   amber   bloom   brick\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            2.677094528280577e-07,
+            0.9869216680526733,
+            0.013078075833618641
+          ],
+          "name": "synthetic_002",
+          "top2_margin": 0.9738435745239258
+        },
+        {
+          "input": "apple grain berry gamma beta ghost あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            2.606913767522201e-05,
+            0.9685854315757751,
+            0.031388502568006516
+          ],
+          "name": "synthetic_003",
+          "top2_margin": 0.9371969103813171
+        },
+        {
+          "input": "ghost grain",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.1453437764430419e-05,
+            0.9725493788719177,
+            0.027439169585704803
+          ],
+          "name": "synthetic_004",
+          "top2_margin": 0.9451102018356323
+        },
+        {
+          "input": "grain alpha arrow grain alpha brick atlasgrain alpha arrow grain alpha brick atlasgrain alpha arrow grain alpha brick atlas",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.5971392393112183,
+            0.07419450581073761,
+            0.3286662697792053
+          ],
+          "name": "synthetic_005",
+          "top2_margin": 0.26847296953201294
+        },
+        {
+          "input": "glide brick ghost brick apple arrow grape ghost",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            6.711027253913926e-07,
+            0.9041383266448975,
+            0.09586101770401001
+          ],
+          "name": "synthetic_006",
+          "top2_margin": 0.8082773089408875
+        },
+        {
+          "input": "BRICK GRAPE AMBER GRAIN ATLAS GHOST BETA GHOST BRICK BERRY",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0024021435528993607,
+            0.9806172847747803,
+            0.016980573534965515
+          ],
+          "name": "synthetic_007",
+          "top2_margin": 0.9636366963386536
+        },
+        {
+          "input": "  atlas   amber   grape   amber   grain   alpha   glide   berry   alpha\t",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.09574947506189346,
+            0.14268848299980164,
+            0.7615620493888855
+          ],
+          "name": "synthetic_008",
+          "top2_margin": 0.6188735961914062
+        },
+        {
+          "input": "gamma gamma bloom brick atlas atlas grape alpha あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.02230989560484886,
+            0.8500833511352539,
+            0.12760677933692932
+          ],
+          "name": "synthetic_009",
+          "top2_margin": 0.722476601600647
+        },
+        {
+          "input": "beta grain grape arrow beta gamma atlas beta amber",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.011524456553161144,
+            0.10495994985103607,
+            0.8835155963897705
+          ],
+          "name": "synthetic_010",
+          "top2_margin": 0.7785556316375732
+        },
+        {
+          "input": "amber betaamber betaamber beta",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.6236023902893066,
+            0.37637871503829956,
+            1.886923382699024e-05
+          ],
+          "name": "synthetic_011",
+          "top2_margin": 0.24722367525100708
+        },
+        {
+          "input": "atlas berry glide bison glide atlas beta bison gamma alpha",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0009317221119999886,
+            0.6837420463562012,
+            0.3153262138366699
+          ],
+          "name": "synthetic_012",
+          "top2_margin": 0.36841583251953125
+        },
+        {
+          "input": "GLIDE ATLAS ATLAS GRAPE GRAPE GRAIN GHOST APPLE ALPHA",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9983241558074951,
+            0.0016729747876524925,
+            2.8739284516632324e-06
+          ],
+          "name": "synthetic_013",
+          "top2_margin": 0.9966511726379395
+        },
+        {
+          "input": "  amber   glide   atlas   ghost   berry\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.024355541914701462,
+            0.9756396412849426,
+            4.846089268539799e-06
+          ],
+          "name": "synthetic_014",
+          "top2_margin": 0.9512841105461121
+        },
+        {
+          "input": "grape grain alpha alpha ghost grain grain あいう é́",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.014635639265179634,
+            0.24057792127132416,
+            0.7447864413261414
+          ],
+          "name": "synthetic_015",
+          "top2_margin": 0.504208505153656
+        },
+        {
+          "input": "apple bloom beta beta alpha",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9137520790100098,
+            0.08624791353940964,
+            1.5423018417948242e-09
+          ],
+          "name": "synthetic_016",
+          "top2_margin": 0.8275041580200195
+        },
+        {
+          "input": "grapegrapegrape",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            8.302973583340645e-06,
+            0.9624168872833252,
+            0.03757482022047043
+          ],
+          "name": "synthetic_017",
+          "top2_margin": 0.9248420596122742
+        },
+        {
+          "input": "brick alpha gamma apple",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            3.802143169195915e-07,
+            0.6651520729064941,
+            0.3348475396633148
+          ],
+          "name": "synthetic_018",
+          "top2_margin": 0.3303045332431793
+        },
+        {
+          "input": "BERRY BERRY BLOOM BERRY AMBER GLIDE ATLAS",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0001867449755081907,
+            0.9961603283882141,
+            0.003652929561212659
+          ],
+          "name": "synthetic_019",
+          "top2_margin": 0.9925073981285095
+        },
+        {
+          "input": "  gamma   grape   grape   glide   bloom   grain\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.04645919054746628,
+            0.5931562781333923,
+            0.3603845536708832
+          ],
+          "name": "synthetic_020",
+          "top2_margin": 0.23277172446250916
+        },
+        {
+          "input": "alpha ghost bloom gamma beta grape glide beta beta ghost alpha gamma あいう é́",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.22544240951538086,
+            0.1544569879770279,
+            0.6201006174087524
+          ],
+          "name": "synthetic_021",
+          "top2_margin": 0.3946582078933716
+        },
+        {
+          "input": "atlas apple",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9381930828094482,
+            0.06180328130722046,
+            3.6418300624063704e-06
+          ],
+          "name": "synthetic_022",
+          "top2_margin": 0.8763898015022278
+        },
+        {
+          "input": "bloom brick amber beta brick bloom brick arrowbloom brick amber beta brick bloom brick arrowbloom brick amber beta brick bloom brick arrow",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            4.7070418077055365e-05,
+            0.9996685981750488,
+            0.00028432748513296247
+          ],
+          "name": "synthetic_023",
+          "top2_margin": 0.9993842840194702
+        },
+        {
+          "input": "ghost ghost glide glide apple apple glide",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            1.3833458979206625e-05,
+            0.023183349519968033,
+            0.9768028259277344
+          ],
+          "name": "synthetic_024",
+          "top2_margin": 0.9536194801330566
+        },
+        {
+          "input": "GRAIN ATLAS",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.2973011507710908e-05,
+            0.999987006187439,
+            4.9595549889147605e-09
+          ],
+          "name": "synthetic_025",
+          "top2_margin": 0.9999740123748779
+        },
+        {
+          "input": "  ghost   gamma   bloom   ghost   grain   apple   berry   bison   gamma\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.00010572811879683286,
+            0.903190016746521,
+            0.09670427441596985
+          ],
+          "name": "synthetic_026",
+          "top2_margin": 0.8064857721328735
+        },
+        {
+          "input": "beta bloom grain あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.97174949789769e-06,
+            0.998420000076294,
+            0.0015780443791300058
+          ],
+          "name": "synthetic_027",
+          "top2_margin": 0.9968419671058655
+        },
+        {
+          "input": "glide",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            1.90528135135537e-05,
+            0.3508729934692383,
+            0.6491079926490784
+          ],
+          "name": "synthetic_028",
+          "top2_margin": 0.2982349991798401
+        },
+        {
+          "input": "glide grape apple bison grain alpha amberglide grape apple bison grain alpha amberglide grape apple bison grain alpha amber",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.019712474197149277,
+            0.09025179594755173,
+            0.8900357484817505
+          ],
+          "name": "synthetic_029",
+          "top2_margin": 0.7997839450836182
+        },
+        {
+          "input": "alpha apple beta ghost bloom apple",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9968218803405762,
+            0.002983790822327137,
+            0.0001943074312293902
+          ],
+          "name": "synthetic_030",
+          "top2_margin": 0.9938380718231201
+        },
+        {
+          "input": "ARROW ALPHA GLIDE ARROW BRICK ALPHA BRICK BETA AMBER",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.005061195231974125,
+            0.9847312569618225,
+            0.010207566432654858
+          ],
+          "name": "synthetic_031",
+          "top2_margin": 0.974523663520813
+        },
+        {
+          "input": "  ghost   berry   brick   glide   grape   ghost   beta\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            8.553658699383959e-05,
+            0.934719443321228,
+            0.06519502401351929
+          ],
+          "name": "synthetic_032",
+          "top2_margin": 0.8695244193077087
+        },
+        {
+          "input": "berry ghost berry bloom あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.3929829947301187e-06,
+            0.9999964237213135,
+            2.1824598661623895e-06
+          ],
+          "name": "synthetic_033",
+          "top2_margin": 0.9999942183494568
+        },
+        {
+          "input": "glide bloom grape bloom bloom bloom grain arrow amber apple bison",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.00019479649199638516,
+            0.045620765537023544,
+            0.9541844129562378
+          ],
+          "name": "synthetic_034",
+          "top2_margin": 0.9085636734962463
+        },
+        {
+          "input": "bloom bloom bloom brick brick alpha bison berry brick amber bloom gammabloom bloom bloom brick brick alpha bison berry brick amber bloom gammabloom bloom bloom brick brick alpha bison berry brick amber bloom gamma",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            2.0010895696032094e-06,
+            0.9999251961708069,
+            7.282712613232434e-05
+          ],
+          "name": "synthetic_035",
+          "top2_margin": 0.9998523592948914
+        },
+        {
+          "input": "grain gamma apple",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.23915335536003113,
+            0.6480250358581543,
+            0.11282162368297577
+          ],
+          "name": "synthetic_036",
+          "top2_margin": 0.40887168049812317
+        },
+        {
+          "input": "GHOST GLIDE APPLE BISON ALPHA BISON BETA GLIDE BETA AMBER BERRY",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.000575397745706141,
+            0.9823206067085266,
+            0.017104022204875946
+          ],
+          "name": "synthetic_037",
+          "top2_margin": 0.9652165770530701
+        },
+        {
+          "input": "  glide   bison   grain   grain   arrow   brick   apple   bloom   berry\t",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.005577733740210533,
+            0.10689341276884079,
+            0.8875288367271423
+          ],
+          "name": "synthetic_038",
+          "top2_margin": 0.780635416507721
+        },
+        {
+          "input": "brick glide grain berry alpha brick ghost あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            2.8979690114283585e-07,
+            0.9797134399414062,
+            0.02028629556298256
+          ],
+          "name": "synthetic_039",
+          "top2_margin": 0.9594271183013916
+        },
+        {
+          "input": "gamma grain glide grain berry amber",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.01024049986153841,
+            0.5989985466003418,
+            0.39076095819473267
+          ],
+          "name": "synthetic_040",
+          "top2_margin": 0.20823758840560913
+        },
+        {
+          "input": "bloom ghost amber alphabloom ghost amber alphabloom ghost amber alpha",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.03986464813351631,
+            0.5319769382476807,
+            0.4281584322452545
+          ],
+          "name": "synthetic_041",
+          "top2_margin": 0.10381850600242615
+        },
+        {
+          "input": "alpha bloom berry grain bison bloom brick amber",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.083285860659089e-05,
+            0.9982678890228271,
+            0.0017212844686582685
+          ],
+          "name": "synthetic_042",
+          "top2_margin": 0.9965466260910034
+        },
+        {
+          "input": "BLOOM GRAPE APPLE GRAIN AMBER BLOOM",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.1575148105621338,
+            0.8424851298332214,
+            7.00510796036724e-08
+          ],
+          "name": "synthetic_043",
+          "top2_margin": 0.6849703192710876
+        },
+        {
+          "input": "  brick   ghost   beta\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.597780752149447e-08,
+            0.9998466968536377,
+            0.00015328197332564741
+          ],
+          "name": "synthetic_044",
+          "top2_margin": 0.9996933937072754
+        },
+        {
+          "input": "berry gamma gamma grain glide grape bloom grape ghost あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.5466761396965012e-05,
+            0.9197133183479309,
+            0.08027119934558868
+          ],
+          "name": "synthetic_045",
+          "top2_margin": 0.8394421339035034
+        },
+        {
+          "input": "amber arrow apple gamma ghost",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.25268223881721497,
+            0.7473174333572388,
+            3.264606789343816e-07
+          ],
+          "name": "synthetic_046",
+          "top2_margin": 0.4946351945400238
+        },
+        {
+          "input": "arrow beta berry beta arrow beta alpha berry glidearrow beta berry beta arrow beta alpha berry glidearrow beta berry beta arrow beta alpha berry glide",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.08630145341157913,
+            0.8870473504066467,
+            0.02665121667087078
+          ],
+          "name": "synthetic_047",
+          "top2_margin": 0.8007459044456482
+        },
+        {
+          "input": "apple atlas amber grape grain berry grain",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0009323377744294703,
+            0.7622262835502625,
+            0.2368413805961609
+          ],
+          "name": "synthetic_048",
+          "top2_margin": 0.5253849029541016
+        },
+        {
+          "input": "ATLAS AMBER BISON GHOST",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.03652279078960419,
+            0.9555966258049011,
+            0.007880592718720436
+          ],
+          "name": "synthetic_049",
+          "top2_margin": 0.9190738201141357
+        },
+        {
+          "input": "  bison   grape   grape   grain   arrow   brick   bloom   grape   apple   beta\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.003117998130619526,
+            0.6122819185256958,
+            0.38460010290145874
+          ],
+          "name": "synthetic_050",
+          "top2_margin": 0.22768181562423706
+        },
+        {
+          "input": "apple bloom あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0001225271262228489,
+            0.9998774528503418,
+            3.184771057984648e-10
+          ],
+          "name": "synthetic_051",
+          "top2_margin": 0.9997549057006836
+        },
+        {
+          "input": "brick berry alpha ghost beta beta gamma",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            2.161227030228474e-06,
+            0.9999977350234985,
+            1.0113458159821676e-07
+          ],
+          "name": "synthetic_052",
+          "top2_margin": 0.9999955892562866
+        },
+        {
+          "input": "glide grain brick bloom grain bison ghost brick glide beta grainglide grain brick bloom grain bison ghost brick glide beta grainglide grain brick bloom grain bison ghost brick glide beta grain",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.4497704796667676e-06,
+            0.6213920712471008,
+            0.37860649824142456
+          ],
+          "name": "synthetic_053",
+          "top2_margin": 0.24278557300567627
+        },
+        {
+          "input": "apple bloom grape ghost ghost bloom arrow brick amber",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.3770902454853058,
+            0.2826467454433441,
+            0.3402630388736725
+          ],
+          "name": "synthetic_054",
+          "top2_margin": 0.0368272066116333
+        },
+        {
+          "input": "GHOST ARROW AMBER APPLE APPLE BERRY APPLE BRICK ARROW BERRY BERRY",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9742118716239929,
+            0.025225944817066193,
+            0.0005621620221063495
+          ],
+          "name": "synthetic_055",
+          "top2_margin": 0.9489859342575073
+        },
+        {
+          "input": "  bloom   gamma   alpha   amber\t",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9536274671554565,
+            0.040487077087163925,
+            0.005885480437427759
+          ],
+          "name": "synthetic_056",
+          "top2_margin": 0.9131404161453247
+        },
+        {
+          "input": "apple apple beta ghost glide grape gamma atlas berry atlas grain bloom あいう é́",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9765318632125854,
+            0.011887644417583942,
+            0.011580505408346653
+          ],
+          "name": "synthetic_057",
+          "top2_margin": 0.964644193649292
+        },
+        {
+          "input": "arrow glide atlas gamma ghost bison brick",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            2.9949555937491823e-06,
+            0.6244801878929138,
+            0.375516802072525
+          ],
+          "name": "synthetic_058",
+          "top2_margin": 0.2489633858203888
+        },
+        {
+          "input": "brick bloom grain alphabrick bloom grain alphabrick bloom grain alpha",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            2.1701793230022304e-05,
+            0.9441137313842773,
+            0.05586455762386322
+          ],
+          "name": "synthetic_059",
+          "top2_margin": 0.8882491588592529
+        },
+        {
+          "input": "amber berry glide arrow arrow arrow",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.01074040774255991,
+            0.9892565608024597,
+            3.017937842741958e-06
+          ],
+          "name": "synthetic_060",
+          "top2_margin": 0.978516161441803
+        },
+        {
+          "input": "BISON GHOST GRAIN BISON BETA APPLE GRAIN GRAIN",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.00012002946459688246,
+            0.9996210932731628,
+            0.0002588908246252686
+          ],
+          "name": "synthetic_061",
+          "top2_margin": 0.9993622303009033
+        },
+        {
+          "input": "  bloom   ghost   bison   ghost   grain   arrow   alpha   bloom   grape   glide\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0669776126742363,
+            0.9205326437950134,
+            0.012489722110331059
+          ],
+          "name": "synthetic_062",
+          "top2_margin": 0.8535550236701965
+        },
+        {
+          "input": "alpha amber bloom arrow atlas grape ghost amber glide glide あいう é́",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.8928556442260742,
+            0.06689855456352234,
+            0.04024582356214523
+          ],
+          "name": "synthetic_063",
+          "top2_margin": 0.8259570598602295
+        },
+        {
+          "input": "gamma gamma gamma apple brick bloom beta bloom glide atlas",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.0001001376222120598,
+            0.00842493399977684,
+            0.9914749264717102
+          ],
+          "name": "synthetic_064",
+          "top2_margin": 0.9830499887466431
+        },
+        {
+          "input": "apple arrow ghost beta brick atlas amber atlas glideapple arrow ghost beta brick atlas amber atlas glideapple arrow ghost beta brick atlas amber atlas glide",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.14199887216091156,
+            0.11790816485881805,
+            0.740092933177948
+          ],
+          "name": "synthetic_065",
+          "top2_margin": 0.5980940461158752
+        },
+        {
+          "input": "grape",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            1.0059709438792197e-06,
+            0.10808289051055908,
+            0.8919160962104797
+          ],
+          "name": "synthetic_066",
+          "top2_margin": 0.7838332056999207
+        },
+        {
+          "input": "GAMMA BLOOM GRAIN",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.0186824539459849e-07,
+            0.9999988675117493,
+            1.0229470035483246e-06
+          ],
+          "name": "synthetic_067",
+          "top2_margin": 0.9999978542327881
+        },
+        {
+          "input": "  bison   atlas   brick   bloom   brick   apple   grape\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            6.283009861363098e-05,
+            0.9622609615325928,
+            0.037676192820072174
+          ],
+          "name": "synthetic_068",
+          "top2_margin": 0.9245847463607788
+        },
+        {
+          "input": "grape apple amber bloom bison arrow gamma apple あいう é́",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.3794171214103699,
+            0.05814511701464653,
+            0.5624377727508545
+          ],
+          "name": "synthetic_069",
+          "top2_margin": 0.18302065134048462
+        },
+        {
+          "input": "brick glide apple grain atlas grain apple grain apple atlas",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.021207056939601898,
+            0.9568018317222595,
+            0.021991094574332237
+          ],
+          "name": "synthetic_070",
+          "top2_margin": 0.9348107576370239
+        },
+        {
+          "input": "berry grape bloom apple apple bloom amber grapeberry grape bloom apple apple bloom amber grapeberry grape bloom apple apple bloom amber grape",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.3808847825202974e-06,
+            0.9999115467071533,
+            8.707296365173534e-05
+          ],
+          "name": "synthetic_071",
+          "top2_margin": 0.9998244643211365
+        },
+        {
+          "input": "bloom",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0008165990002453327,
+            0.9991834163665771,
+            1.163978982643421e-10
+          ],
+          "name": "synthetic_072",
+          "top2_margin": 0.9983668327331543
+        },
+        {
+          "input": "BRICK GAMMA GRAPE GRAPE GAMMA BISON ALPHA AMBER GLIDE BLOOM",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9210544228553772,
+            0.07807117700576782,
+            0.0008743904181756079
+          ],
+          "name": "synthetic_073",
+          "top2_margin": 0.8429832458496094
+        },
+        {
+          "input": "  bloom   grain   bison   alpha   bloom   ghost   alpha   apple   arrow   amber\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.06250154972076416,
+            0.8993299603462219,
+            0.03816848620772362
+          ],
+          "name": "synthetic_074",
+          "top2_margin": 0.8368284106254578
+        },
+        {
+          "input": "bison gamma grain brick ghost beta grape gamma brick apple あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            9.461170702707022e-05,
+            0.9172456860542297,
+            0.08265972137451172
+          ],
+          "name": "synthetic_075",
+          "top2_margin": 0.834585964679718
+        },
+        {
+          "input": "bison",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            5.8716214113019305e-08,
+            0.9999999403953552,
+            1.1509113106988877e-10
+          ],
+          "name": "synthetic_076",
+          "top2_margin": 0.9999998807907104
+        },
+        {
+          "input": "alpha ghost alpha grape ghost grain grape bison grape brick amber brickalpha ghost alpha grape ghost grain grape bison grape brick amber brickalpha ghost alpha grape ghost grain grape bison grape brick amber brick",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9783655405044556,
+            0.014982037246227264,
+            0.006652418524026871
+          ],
+          "name": "synthetic_077",
+          "top2_margin": 0.9633834958076477
+        },
+        {
+          "input": "atlas brick arrow gamma apple arrow apple ghost",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0007931740838102996,
+            0.9701592922210693,
+            0.029047558084130287
+          ],
+          "name": "synthetic_078",
+          "top2_margin": 0.9411117434501648
+        },
+        {
+          "input": "BETA BERRY BETA GRAPE BLOOM BERRY",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0011235432466492057,
+            0.6015635132789612,
+            0.3973129689693451
+          ],
+          "name": "synthetic_079",
+          "top2_margin": 0.2042505443096161
+        },
+        {
+          "input": "  glide   apple   glide   gamma   grape\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.015512870624661446,
+            0.969179630279541,
+            0.01530750747770071
+          ],
+          "name": "synthetic_080",
+          "top2_margin": 0.9536667466163635
+        },
+        {
+          "input": "grain glide apple gamma glide ghost apple gamma bison alpha amber あいう é́",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.04872157797217369,
+            0.0711207240819931,
+            0.8801577091217041
+          ],
+          "name": "synthetic_081",
+          "top2_margin": 0.8090369701385498
+        },
+        {
+          "input": "apple gamma grain bloom ghost",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.12075367569923401,
+            0.8792111873626709,
+            3.512304465402849e-05
+          ],
+          "name": "synthetic_082",
+          "top2_margin": 0.7584575414657593
+        },
+        {
+          "input": "ghost brick brickghost brick brickghost brick brick",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            4.456765267946139e-08,
+            0.908497154712677,
+            0.09150277823209763
+          ],
+          "name": "synthetic_083",
+          "top2_margin": 0.8169943690299988
+        },
+        {
+          "input": "apple bloom berry bloom apple berry gamma bison glide glide",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0031917255837470293,
+            0.9950706958770752,
+            0.0017375549068674445
+          ],
+          "name": "synthetic_084",
+          "top2_margin": 0.9918789863586426
+        },
+        {
+          "input": "BLOOM ARROW GRAPE ATLAS AMBER BLOOM ARROW",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0012200678465887904,
+            0.9712035059928894,
+            0.027576453983783722
+          ],
+          "name": "synthetic_085",
+          "top2_margin": 0.9436270594596863
+        },
+        {
+          "input": "  apple   brick   glide   grape   grape   ghost\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            3.0855353543302044e-06,
+            0.9997875094413757,
+            0.00020937675435561687
+          ],
+          "name": "synthetic_086",
+          "top2_margin": 0.9995781183242798
+        },
+        {
+          "input": "bison grape gamma apple arrow bloom brick あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            5.7172630476998165e-05,
+            0.9692139029502869,
+            0.03072892315685749
+          ],
+          "name": "synthetic_087",
+          "top2_margin": 0.9384849667549133
+        },
+        {
+          "input": "berry ghost",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            4.6893622318577854e-09,
+            1.0,
+            7.78682984758916e-09
+          ],
+          "name": "synthetic_088",
+          "top2_margin": 1.0
+        },
+        {
+          "input": "apple gammaapple gammaapple gamma",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.10578691959381104,
+            0.14902591705322266,
+            0.7451871633529663
+          ],
+          "name": "synthetic_089",
+          "top2_margin": 0.5961612462997437
+        },
+        {
+          "input": "beta beta atlas amber ghost grape amber alpha beta gamma atlas grape",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.5602183938026428,
+            0.35686513781547546,
+            0.08291647583246231
+          ],
+          "name": "synthetic_090",
+          "top2_margin": 0.20335325598716736
+        },
+        {
+          "input": "ATLAS BLOOM GHOST BERRY GAMMA BLOOM BRICK BISON ARROW ARROW",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9068781733512878,
+            0.09062273055315018,
+            0.0024991068057715893
+          ],
+          "name": "synthetic_091",
+          "top2_margin": 0.8162554502487183
+        },
+        {
+          "input": "  amber   ghost   grape   amber   bloom   berry   ghost\t",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            5.240025984676322e-06,
+            0.13793997466564178,
+            0.8620547652244568
+          ],
+          "name": "synthetic_092",
+          "top2_margin": 0.7241147756576538
+        },
+        {
+          "input": "gamma あいう é́",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.25544634461402893,
+            0.006149780936539173,
+            0.7384039163589478
+          ],
+          "name": "synthetic_093",
+          "top2_margin": 0.4829575717449188
+        },
+        {
+          "input": "ghost atlas brick apple grape beta berry ghost grape berry brick ghost",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            2.2758573322789744e-05,
+            0.2927207052707672,
+            0.707256555557251
+          ],
+          "name": "synthetic_094",
+          "top2_margin": 0.41453585028648376
+        },
+        {
+          "input": "bison atlas glide berry gamma bison glide brick bisonbison atlas glide berry gamma bison glide brick bisonbison atlas glide berry gamma bison glide brick bison",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            3.351085979375057e-05,
+            0.6609765887260437,
+            0.3389899432659149
+          ],
+          "name": "synthetic_095",
+          "top2_margin": 0.3219866454601288
+        },
+        {
+          "input": "grain arrow ghost berry bloom grape gamma bison grain grape grape",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            7.147330325096846e-05,
+            0.045817550271749496,
+            0.9541109800338745
+          ],
+          "name": "synthetic_096",
+          "top2_margin": 0.9082934260368347
+        },
+        {
+          "input": "ARROW BETA",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.00016418859013356268,
+            0.9998357892036438,
+            2.349060279627224e-09
+          ],
+          "name": "synthetic_097",
+          "top2_margin": 0.9996715784072876
+        },
+        {
+          "input": "  bloom   apple   atlas   arrow   amber   amber   berry   gamma   berry   bloom   amber   brick\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.016886288300156593,
+            0.9786586165428162,
+            0.0044551026076078415
+          ],
+          "name": "synthetic_098",
+          "top2_margin": 0.9617723226547241
+        },
+        {
+          "input": "atlas ghost gamma あいう é́",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9997010827064514,
+            0.00029578397516161203,
+            3.16281762025028e-06
+          ],
+          "name": "synthetic_099",
+          "top2_margin": 0.9994053244590759
+        },
+        {
+          "input": "beta arrow berry gamma bloom grain gamma grain bloom",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.008867788128554821,
+            0.11662542074918747,
+            0.8745067715644836
+          ],
+          "name": "synthetic_100",
+          "top2_margin": 0.7578813433647156
+        },
+        {
+          "input": "beta bloom bloom amber bloom berry atlasbeta bloom bloom amber bloom berry atlasbeta bloom bloom amber bloom berry atlas",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.46606603264808655,
+            0.5273258090019226,
+            0.006608151365071535
+          ],
+          "name": "synthetic_101",
+          "top2_margin": 0.06125977635383606
+        },
+        {
+          "input": "grape berry apple glide",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            1.7502898685961554e-07,
+            0.1546667218208313,
+            0.8453330993652344
+          ],
+          "name": "synthetic_102",
+          "top2_margin": 0.6906663775444031
+        },
+        {
+          "input": "GAMMA",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            9.454143764742184e-06,
+            0.9999905228614807,
+            3.4205405174958514e-09
+          ],
+          "name": "synthetic_103",
+          "top2_margin": 0.9999810457229614
+        },
+        {
+          "input": "  grape   grape   amber   ghost   gamma   arrow   alpha   apple   beta   ghost   bloom\t",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.8057953119277954,
+            0.11495834589004517,
+            0.07924636453390121
+          ],
+          "name": "synthetic_104",
+          "top2_margin": 0.6908369660377502
+        },
+        {
+          "input": "grain bloom atlas bloom grain あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            3.7783747757202946e-06,
+            0.750749945640564,
+            0.249246284365654
+          ],
+          "name": "synthetic_105",
+          "top2_margin": 0.5015036463737488
+        },
+        {
+          "input": "glide amber grain glide bison bison gamma atlas apple gamma berry arrow",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.0015275547048076987,
+            0.012142110615968704,
+            0.9863303303718567
+          ],
+          "name": "synthetic_106",
+          "top2_margin": 0.9741882085800171
+        },
+        {
+          "input": "glide grain beta arrow appleglide grain beta arrow appleglide grain beta arrow apple",
+          "mlx_label_index": 2,
+          "mlx_probs": [
+            0.005158761981874704,
+            0.011431240476667881,
+            0.9834100008010864
+          ],
+          "name": "synthetic_107",
+          "top2_margin": 0.9719787836074829
+        },
+        {
+          "input": "bison grape berry berry",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            4.847761658766103e-08,
+            0.9991350173950195,
+            0.0008649194496683776
+          ],
+          "name": "synthetic_108",
+          "top2_margin": 0.9982700943946838
+        },
+        {
+          "input": "ALPHA BLOOM GRAIN BERRY ARROW BRICK",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0003708236035890877,
+            0.9996291995048523,
+            5.946941073267653e-13
+          ],
+          "name": "synthetic_109",
+          "top2_margin": 0.9992583990097046
+        },
+        {
+          "input": "  alpha   grain   apple   grain   arrow\t",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.5983948111534119,
+            0.4016038477420807,
+            1.3108852954246686e-06
+          ],
+          "name": "synthetic_110",
+          "top2_margin": 0.19679096341133118
+        },
+        {
+          "input": "berry ghost atlas あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.877465911093168e-05,
+            0.9999812245368958,
+            3.432865991470635e-09
+          ],
+          "name": "synthetic_111",
+          "top2_margin": 0.9999624490737915
+        },
+        {
+          "input": "atlas arrow brick amber glide",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.000693160982336849,
+            0.9993067979812622,
+            4.455121782598326e-08
+          ],
+          "name": "synthetic_112",
+          "top2_margin": 0.9986136555671692
+        },
+        {
+          "input": "arrow glide berry atlas bloom alpha grape gammaarrow glide berry atlas bloom alpha grape gammaarrow glide berry atlas bloom alpha grape gamma",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.5703446269035339,
+            0.39638519287109375,
+            0.033270176500082016
+          ],
+          "name": "synthetic_113",
+          "top2_margin": 0.17395943403244019
+        },
+        {
+          "input": "glide beta brick",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            4.6257127905846573e-08,
+            0.9840832948684692,
+            0.01591663993895054
+          ],
+          "name": "synthetic_114",
+          "top2_margin": 0.9681666493415833
+        },
+        {
+          "input": "BRICK GRAIN ARROW BETA GHOST BERRY APPLE AMBER BRICK GAMMA BLOOM",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.09777487069368362,
+            0.8995470404624939,
+            0.0026781167834997177
+          ],
+          "name": "synthetic_115",
+          "top2_margin": 0.8017721772193909
+        },
+        {
+          "input": "  berry   brick   grain   atlas   arrow\t",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            1.0043236216006335e-06,
+            0.9999974370002747,
+            1.5680365095249726e-06
+          ],
+          "name": "synthetic_116",
+          "top2_margin": 0.9999958872795105
+        },
+        {
+          "input": "bison atlas berry arrow apple berry gamma brick glide alpha gamma ghost あいう é́",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            0.0017898693913593888,
+            0.9953743815422058,
+            0.002835777821019292
+          ],
+          "name": "synthetic_117",
+          "top2_margin": 0.9925386309623718
+        },
+        {
+          "input": "beta",
+          "mlx_label_index": 1,
+          "mlx_probs": [
+            3.609444476637691e-08,
+            0.9999999403953552,
+            3.939051307355612e-10
+          ],
+          "name": "synthetic_118",
+          "top2_margin": 0.9999998807907104
+        },
+        {
+          "input": "apple amberapple amberapple amber",
+          "mlx_label_index": 0,
+          "mlx_probs": [
+            0.9998804926872253,
+            8.953026554081589e-05,
+            2.9957580409245566e-05
+          ],
+          "name": "synthetic_119",
+          "top2_margin": 0.9997909665107727
+        }
+      ],
+      "config": {
+        "batch_size": 16,
+        "dims": 16,
+        "dropout": 0.0,
+        "epochs": 30,
+        "heads": 2,
+        "layers": 1,
+        "lr": 0.005,
+        "warmup_steps": 10,
+        "weight_decay": 0.0001
+      },
+      "excluded_near_tie": 0,
+      "generated_on": "Darwin arm64",
+      "label_order": [
+        "alpha",
+        "beta",
+        "gamma"
+      ],
+      "max_bytes": 48,
+      "max_ref_prob_diff": 2.2649765014648438e-06,
+      "near_tie_margin": 0.001,
+      "onnx": "ar.onnx",
+      "onnx_sha256": "6c95c0e3999432cd811a66584dd9b8101553fa2c082fb4c3d03f83710b69b7ab",
+      "seed": 20260929,
+      "versions": {
+        "mlx": "0.32.2",
+        "numpy": "2.5.3",
+        "onnx": "1.23.0"
+      }
+    },
     "c1": {
       "cases": [
         {

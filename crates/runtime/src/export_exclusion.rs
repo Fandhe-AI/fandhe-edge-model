@@ -126,6 +126,8 @@ pub enum ExportKind {
     C3,
     /// 追加学習（Qwen2 の LoRA 統合・採点グラフ）。推論の実行器は #434 で接続する。
     Qwen2Lora,
+    /// バイト単位の小型自己回帰 decoder（REQ-19b）。推論の実行器は #420 で接続済み。
+    Autoregressive,
 }
 
 impl ExportKind {
@@ -135,6 +137,7 @@ impl ExportKind {
             Self::C1 => "c1",
             Self::C3 => "c3",
             Self::Qwen2Lora => "qwen2_lora",
+            Self::Autoregressive => "autoregressive",
         }
     }
 
@@ -144,6 +147,7 @@ impl ExportKind {
             Self::C1 => Some(ModelKind::C1),
             Self::C3 => Some(ModelKind::C3),
             Self::Qwen2Lora => None,
+            Self::Autoregressive => Some(ModelKind::Autoregressive),
         }
     }
 }
@@ -154,6 +158,7 @@ impl From<ModelKind> for ExportKind {
             ModelKind::C1 => Self::C1,
             ModelKind::C3 => Self::C3,
             ModelKind::Qwen2Lora => Self::Qwen2Lora,
+            ModelKind::Autoregressive => Self::Autoregressive,
         }
     }
 }
@@ -161,7 +166,7 @@ impl From<ModelKind> for ExportKind {
 /// 配布候補の構成（種類 × ランタイム × 数値形式）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportConfig {
-    /// モデルの種類（`autoregressive` は未対応。REQ-19b の後続 TASK）。
+    /// モデルの種類。
     pub kind: ExportKind,
     /// 推論ランタイム。
     pub runtime: InferenceRuntime,

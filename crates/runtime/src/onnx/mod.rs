@@ -43,9 +43,10 @@
 //!   `invalid_input`（64）、上限超過が `limit_exceeded`（20）、ファイル I/O 失敗が
 //!   `runtime_error`（70）
 //! - 対応するのは C1・C3 と、追加学習 `qwen2_lora` の採点グラフ（[`scoring`]。外部データ付きで
-//!   [`OnnxBackend::from_bytes_with_shards`] だけが読める。REQ-41・#434）。`autoregressive`
-//!   （REQ-19b）等の ONNX 読み込みは後続 TASK
-//!   （実装済みを装わない。[`ModelKind::parse`] は `unsupported_kind` で拒否する）
+//!   [`OnnxBackend::from_bytes_with_shards`] だけが読める。REQ-41・#434）、`autoregressive`
+//!   （REQ-19b。重みを内蔵した採点グラフ。`qwen2_lora` と同じ [`scoring`] の実行器で
+//!   [`OnnxBackend::from_bytes`] が読む。#420）。それ以外の `kind` は [`ModelKind::parse`] が
+//!   `unsupported_kind` で拒否する
 
 mod c1;
 mod c3;
@@ -133,6 +134,26 @@ pub const FINETUNE_MODEL_LIMITS: ModelLimits = ModelLimits {
     }),
 };
 
+/// `autoregressive`（REQ-19b・#420）の上限。学習側の上限（`trainer/.../limits.py`）から求める。
+///
+/// 書き出しグラフは固定の前置き 57 ノード + 1 層あたり 51 ノード + 末尾 20 ノード（`_export_ar_onnx`）、
+/// initializer は前置き 21 + 1 層あたり 24 + 末尾 5。層数の上限 `MAX_AR_LAYERS`=32 で
+/// 1709 ノード・794 initializer になる。
+///
+/// - 本体: C1・C3 と同じ [`MAX_MODEL_FILE_BYTES`]（重みは内蔵で `MAX_MODEL_BYTES` 40 MiB + 余裕 4 MiB）
+/// - ノード: 1709 の約 1.2 倍の 2048
+/// - initializer: 794 の約 1.3 倍の 1024
+/// - 次元: initializer・入出力の rank は最大 3（`sep_block`）なので C1・C3 と同じ 4
+/// - bf16・外部データは持たない（拒否）
+pub const AR_MODEL_LIMITS: ModelLimits = ModelLimits {
+    max_model_file_bytes: MAX_MODEL_FILE_BYTES,
+    max_nodes: 2048,
+    max_initializers: 1024,
+    max_dims: 4,
+    allow_bf16: false,
+    external: None,
+};
+
 /// `max_bytes`（前処理で切り詰めるバイト数）の下限。学習ワーカーの `limits.py`・共有 fixture
 /// `fixtures/train_contract/limits.json` の `min_max_bytes` と一致する（テストで照合）。
 pub const MIN_MAX_BYTES: usize = 1;
@@ -157,26 +178,31 @@ pub enum ModelKind {
     /// 追加学習（Qwen2 + LoRA 統合の採点グラフ。`kind="qwen2_lora"`。REQ-41・#434）。
     /// 重みは外部データなので [`OnnxBackend::from_bytes_with_shards`] だけが読み込める。
     Qwen2Lora,
+    /// バイト単位の小型自己回帰 decoder（`kind="autoregressive"`。REQ-19b・#420）。重みは ONNX に内蔵
+    /// （外部データなし）で、前処理は C3 と同じバイトエンコード。
+    Autoregressive,
 }
 
 impl ModelKind {
-    /// `artifact.json` の `kind` 文字列から種類を決める。未対応の種類（`autoregressive` を含む）は
+    /// `artifact.json` の `kind` 文字列から種類を決める。未対応の種類は
     /// [`OnnxLoadError::UnsupportedKind`]（許可リスト方式。REQ-39）。
     pub fn parse(kind: &str) -> Result<Self, OnnxLoadError> {
         match kind {
             "c1" => Ok(Self::C1),
             "c3" => Ok(Self::C3),
             "qwen2_lora" => Ok(Self::Qwen2Lora),
+            "autoregressive" => Ok(Self::Autoregressive),
             _ => Err(OnnxLoadError::UnsupportedKind),
         }
     }
 
     /// この種類のモデル上限（C1・C3 は [`STRICT_MODEL_LIMITS`]、`qwen2_lora` は
-    /// [`FINETUNE_MODEL_LIMITS`]）。
+    /// [`FINETUNE_MODEL_LIMITS`]、`autoregressive` は [`AR_MODEL_LIMITS`]）。
     pub fn limits(self) -> &'static ModelLimits {
         match self {
             Self::C1 | Self::C3 => &STRICT_MODEL_LIMITS,
             Self::Qwen2Lora => &FINETUNE_MODEL_LIMITS,
+            Self::Autoregressive => &AR_MODEL_LIMITS,
         }
     }
 
@@ -186,6 +212,7 @@ impl ModelKind {
             Self::C1 => "c1",
             Self::C3 => "c3",
             Self::Qwen2Lora => "qwen2_lora",
+            Self::Autoregressive => "autoregressive",
         }
     }
 }
@@ -296,10 +323,13 @@ impl OnnxBackend {
         if u64::try_from(bytes.len()).map_or(true, |n| n > kind.limits().max_model_file_bytes) {
             return Err(OnnxLoadError::LimitExceeded);
         }
-        let model = decode_checked(bytes, kind.limits())?;
+        let mut model = decode_checked(bytes, kind.limits())?;
         let inner = match kind {
             ModelKind::C1 => Inner::C1(c1::C1Model::from_graph(&model.graph)?),
             ModelKind::C3 => Inner::C3(c3::C3Model::from_graph(&model.graph)?),
+            ModelKind::Autoregressive => {
+                Inner::Scoring(scoring::ScoringModel::from_graph(&mut model.graph)?)
+            }
             ModelKind::Qwen2Lora => return Err(OnnxLoadError::UnsupportedKind),
         };
         Ok(Self { kind, inner })
@@ -346,17 +376,25 @@ impl OnnxBackend {
     }
 }
 
+impl OnnxBackend {
+    /// 入力の語彙・長さを入口で検査する（C1・C3・autoregressive 共通のバイトエンコード用）。
+    /// `qwen2_lora` の id 列は tokenizer 語彙で別の検査（採点グラフ側）なので対象外。
+    fn check_input(&self, ids: &[i64]) -> Result<(), BackendError> {
+        match self.inner {
+            Inner::Scoring(_) if self.kind != ModelKind::Autoregressive => Ok(()),
+            _ => check_token_ids(ids),
+        }
+    }
+}
+
 impl ScoringBackend for OnnxBackend {
     fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
         let ids = ids.as_slice();
-        if let Inner::Scoring(m) = &self.inner {
-            return m.scores(ids);
-        }
-        check_token_ids(ids)?;
+        self.check_input(ids)?;
         match &self.inner {
             Inner::C1(m) => m.scores(ids),
             Inner::C3(m) => m.scores(ids),
-            Inner::Scoring(_) => Err(BackendError::Failed),
+            Inner::Scoring(m) => m.scores(ids),
         }
     }
 
@@ -366,14 +404,11 @@ impl ScoringBackend for OnnxBackend {
         limit: std::time::Duration,
     ) -> Result<Vec<f64>, BackendError> {
         let ids = ids.as_slice();
-        if let Inner::Scoring(m) = &self.inner {
-            return m.scores_limited(ids, limit);
-        }
-        check_token_ids(ids)?;
+        self.check_input(ids)?;
         match &self.inner {
             Inner::C1(m) => m.scores_limited(ids, limit),
             Inner::C3(m) => m.scores_limited(ids, limit),
-            Inner::Scoring(_) => Err(BackendError::Failed),
+            Inner::Scoring(m) => m.scores_limited(ids, limit),
         }
     }
 }
