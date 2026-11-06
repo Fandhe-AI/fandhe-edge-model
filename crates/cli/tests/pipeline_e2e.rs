@@ -5947,7 +5947,11 @@ mod suite {
             .unwrap_or_default()
             .iter()
             .map(|v| {
-                let label = v.input().split(' ').next().unwrap_or("red");
+                let first = v.input().split(' ').next().unwrap_or("red");
+                let label = match eight_labels_winner(request) {
+                    Some(w) if w != "qwen2_lora" => "red",
+                    _ => first,
+                };
                 format!(
                     r#"{{"id":"{}","status":"ok","predicted_label":"{label}"}}"#,
                     v.id()
@@ -6704,9 +6708,37 @@ mod suite {
         );
     }
 
-    /// REQ-19b・REQ-18・#697: 両方の明示指定専用の種類を指定すると `train --all` は候補 0・1・2・3 を固定番号で学習する。
+    /// 偽ワーカーが c1・c3・autoregressive に 8 選択肢の fixture を使う目印（プロジェクト直下。#699）。
+    /// 中身は「validation 予測が正解になる種類」の名前で、ほかの種類は固定ラベル `red` を返して外す。
+    const EIGHT_LABELS_MARKER: &str = "eight_labels_fixture";
+
+    /// 目印の中身（正解を返す種類）。目印が無ければ `None`。
+    fn eight_labels_winner(request: &TrainRequest) -> Option<String> {
+        std::fs::read_to_string(
+            Path::new(request.root())
+                .join("../..")
+                .join(EIGHT_LABELS_MARKER),
+        )
+        .ok()
+    }
+
+    /// REQ-19b・REQ-18・REQ-24・REQ-25・REQ-33・#699: 両方の明示指定専用の種類を指定すると、選択肢 8 つの
+    /// fixture で 7 工程が exit 0 で通り、候補番号は 0・1・2・3 に固定され、選定記録の `candidate_index` と
+    /// evaluate の `candidate` が一致する（証拠種別: テストハーネス）。
     pub fn autoregressive_with_qwen2_lora_uses_numbers_0_to_3() {
-        let env = qwen2_inspected("ar-both", true);
+        mixed_kinds_pass_fixed_number(3, "autoregressive");
+    }
+
+    /// REQ-19b・REQ-18・REQ-24・REQ-25・REQ-33・#699: 同じ両指定で qwen2_lora（番号 2）が選ばれる場合も、
+    /// select・evaluate・package・infer が番号 2 で通る。
+    pub fn mixed_kinds_select_qwen2_lora_number_2() {
+        mixed_kinds_pass_fixed_number(2, "qwen2_lora");
+    }
+
+    /// 両指定の 7 工程。`winner` だけ validation 予測が正解になり、番号 `number` で選ばれることを確かめる。
+    fn mixed_kinds_pass_fixed_number(number: usize, winner: &str) {
+        let env = qwen2_inspected(&format!("mixed-{winner}"), true);
+        std::fs::write(env.project_file(EIGHT_LABELS_MARKER), winner).expect("marker");
         let kinds = ["--kind", "qwen2_lora", "--kind", "autoregressive"];
         let mut train = vec![
             "train",
@@ -6725,9 +6757,53 @@ mod suite {
                     .is_file()
             );
         }
-        // select・evaluate は通さない: 偽ワーカーの c1・c3・ar の ONNX は 3 クラス、qwen2_lora の固定資産は 8 クラスで、
-        // 混在プロジェクトでは `select` の `load_backend` が出力クラス数の不一致で止まる（固定番号の select・evaluate は
-        // 単独指定のテストで確認済み）。
+        let mut select = vec!["select", "--project-dir", "proj"];
+        select.extend(kinds);
+        let selected = env.ok(&select);
+        let record = std::fs::read_to_string(env.project_file("selection_record.json")).expect("r");
+        assert!(
+            record.contains("\"explicit_kinds\":[\"qwen2_lora\",\"autoregressive\"]"),
+            "{record}"
+        );
+        assert!(
+            record.contains(&format!("\"candidate_index\":{number},")),
+            "{record}"
+        );
+        assert!(
+            selected.starts_with(&format!(
+                "{{\"step\":\"select\",\"status\":\"ok\",\"candidate\":{number},\"kind\":\"{winner}\","
+            )),
+            "{selected}"
+        );
+        let evaluated = env.ok(&[
+            "evaluate",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            &number.to_string(),
+        ]);
+        assert!(
+            evaluated.starts_with(&format!(
+                "{{\"step\":\"evaluate\",\"status\":\"ok\",\"candidate\":{number},"
+            )),
+            "{evaluated}"
+        );
+        let package = env.ok(&PACKAGE);
+        assert!(
+            package.starts_with("{\"step\":\"package\",\"status\":\"ok\""),
+            "{package}"
+        );
+        let text = env.ok(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--text",
+            "red sample 1",
+        ]);
+        assert!(
+            text.starts_with("{\"id\":\"input\",\"status\":\"ok\""),
+            "{text}"
+        );
     }
 
     /// REQ-19b・REQ-25・#697: autoregressive で学習した後に `--kind` なしで select すると、
@@ -6816,8 +6892,17 @@ mod suite {
         if request.kind() == "qwen2_lora" {
             run_fake_qwen2_worker(&request, &out_dir);
         }
+        // 8 選択肢の fixture の選択（#699）: プロジェクト直下に目印があれば `onnx_parity_8labels` を置く。
+        // 既定は 3 選択肢の `onnx_parity`。
+        let winner = eight_labels_winner(&request);
+        let eight_labels = winner.is_some();
         let onnx_src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/onnx_parity")
+            .join("../../fixtures")
+            .join(if eight_labels {
+                "onnx_parity_8labels"
+            } else {
+                "onnx_parity"
+            })
             .join(if request.kind() == "autoregressive" {
                 "ar.onnx".to_string()
             } else {
@@ -6870,7 +6955,14 @@ mod suite {
             .unwrap_or_default()
             .iter()
             .map(|v| {
-                let label = if kind == "c3" {
+                // 8 選択肢の fixture では入力の先頭の語が正解ラベル（合成データ）。
+                let label = if let Some(w) = &winner {
+                    if w == kind {
+                        v.input().split(' ').next().unwrap_or("red")
+                    } else {
+                        "red"
+                    }
+                } else if kind == "c3" {
                     v.input().split(' ').next().unwrap_or("alpha")
                 } else {
                     "alpha"
@@ -6951,6 +7043,10 @@ fn main() -> std::process::ExitCode {
         (
             "autoregressive_train_all_and_select_use_fixed_numbers",
             suite::autoregressive_train_all_and_select_use_fixed_numbers,
+        ),
+        (
+            "mixed_kinds_select_qwen2_lora_number_2",
+            suite::mixed_kinds_select_qwen2_lora_number_2,
         ),
         (
             "autoregressive_with_qwen2_lora_uses_numbers_0_to_3",

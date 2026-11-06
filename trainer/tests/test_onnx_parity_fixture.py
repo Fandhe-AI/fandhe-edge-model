@@ -19,26 +19,43 @@ from onnx.reference import ReferenceEvaluator
 from conftest import ATOL_MLX_ONNX
 from fandhe_edge_trainer.encoding import encode_bytes
 
-_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "onnx_parity"
+_ROOT = Path(__file__).resolve().parents[2] / "fixtures"
+#: 既定（3 選択肢・max_bytes 48）と、qwen2_lora の fixture にそろえた 8 選択肢版（#699）。
+_DIRS = ["onnx_parity", "onnx_parity_8labels"]
+_KINDS = ["c1", "c3", "autoregressive"]
+_8LABELS = ["red", "tan", "sky", "map", "fox", "owl", "gem", "ink"]
 
 
-def _doc() -> dict:
-    return json.loads((_DIR / "cases.json").read_text(encoding="utf-8"))
+def _doc(d: str) -> dict:
+    return json.loads((_ROOT / d / "cases.json").read_text(encoding="utf-8"))
 
 
-@pytest.mark.parametrize("kind", ["c1", "c3", "autoregressive"])
-def test_fixture_sha256_matches_cases(kind: str) -> None:
+@pytest.mark.parametrize("d", _DIRS)
+@pytest.mark.parametrize("kind", _KINDS)
+def test_fixture_sha256_matches_cases(d: str, kind: str) -> None:
     """REQ-32: cases.json 記載の sha256 がコミット済み ONNX と一致する。"""
-    entry = _doc()["kinds"][kind]
-    digest = hashlib.sha256((_DIR / entry["onnx"]).read_bytes()).hexdigest()
+    entry = _doc(d)["kinds"][kind]
+    digest = hashlib.sha256((_ROOT / d / entry["onnx"]).read_bytes()).hexdigest()
     assert digest == entry["onnx_sha256"]
 
 
-@pytest.mark.parametrize("kind", ["c1", "c3", "autoregressive"])
-def test_reference_evaluator_matches_recorded_mlx_labels(kind: str) -> None:
+@pytest.mark.parametrize("kind", _KINDS)
+def test_8labels_fixture_shape(kind: str) -> None:
+    """REQ-19b・#699: 8 選択肢版は qwen2_lora と同じ選択肢・max_bytes 64、出力幅 8。"""
+    entry = _doc("onnx_parity_8labels")["kinds"][kind]
+    assert entry["label_order"] == _8LABELS
+    assert entry["max_bytes"] == 64
+    session = ReferenceEvaluator((_ROOT / "onnx_parity_8labels" / entry["onnx"]).as_posix())
+    (probs,) = session.run(None, {"ids": np.array([encode_bytes("x", 64)], dtype=np.int64)})
+    assert probs.shape == (1, 8)
+
+
+@pytest.mark.parametrize("d", _DIRS)
+@pytest.mark.parametrize("kind", _KINDS)
+def test_reference_evaluator_matches_recorded_mlx_labels(d: str, kind: str) -> None:
     """REQ-32: ReferenceEvaluator の 1 件ずつの推論が、記録済み MLX ラベルと全件一致する。"""
-    entry = _doc()["kinds"][kind]
-    session = ReferenceEvaluator((_DIR / entry["onnx"]).as_posix())
+    entry = _doc(d)["kinds"][kind]
+    session = ReferenceEvaluator((_ROOT / d / entry["onnx"]).as_posix())
     cases = entry["cases"]
     assert len(cases) >= 100
     assert len({c["mlx_label_index"] for c in cases}) >= 2

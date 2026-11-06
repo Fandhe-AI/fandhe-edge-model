@@ -89,18 +89,24 @@ _WORDS = {
     "beta": ["beta", "berry", "bison", "brick", "bloom"],
     "gamma": ["gamma", "grape", "ghost", "glide", "grain"],
 }
+_DEFAULT_OUT = Path(__file__).resolve().parents[2] / "fixtures" / "onnx_parity"
 _VECTORS_PATH = (
     Path(__file__).resolve().parents[2] / "fixtures" / "preprocess" / "byte_encoding_vectors.json"
 )
 
 
+def _words(label: str) -> list[str]:
+    """ラベル固有の語。既定 3 ラベルは固定表、それ以外はラベル名から派生する（#699）。"""
+    return _WORDS.get(label) or [label + s for s in ("", "a", "bb", "ccc", "dd")]
+
+
 def _train_examples(rng: random.Random) -> list[TrainExample]:
-    """3 ラベルの合成学習データ（各ラベル固有の語＋共通の雑音語）。"""
+    """合成学習データ（各ラベル固有の語＋共通の雑音語）。"""
     noise = ["one", "two", "red", "blue", "ok"]
     out: list[TrainExample] = []
     for label in LABEL_ORDER:
         for i in range(30):
-            words = [rng.choice(_WORDS[label]) for _ in range(3)] + [rng.choice(noise)]
+            words = [rng.choice(_words(label)) for _ in range(3)] + [rng.choice(noise)]
             rng.shuffle(words)
             out.append(TrainExample(input=" ".join(words) + f" {i}", label=label))
     return out
@@ -112,7 +118,7 @@ def _case_inputs(rng: random.Random) -> list[tuple[str, str]]:
     vectors = json.loads(_VECTORS_PATH.read_text(encoding="utf-8"))["vectors"]
     for v in vectors:
         cases.append((f"vector_{v['name']}", v["input"]))
-    every = [w for ws in _WORDS.values() for w in ws]
+    every = [w for label in LABEL_ORDER for w in _words(label)]
     for i in range(120):
         n = rng.randint(1, 12)
         text = " ".join(rng.choice(every) for _ in range(n))
@@ -265,8 +271,20 @@ def _build_kind(
 
 def main() -> None:
     """引数を解釈し、C1・C3・autoregressive の fixture を生成する。"""
+    global LABEL_ORDER, MAX_BYTES  # 生成器全体で共有する実行時の設定（#699）
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", required=True, help="出力先ディレクトリ（存在すること）")
+    parser.add_argument(
+        "--out",
+        "--out-dir",
+        default=str(_DEFAULT_OUT),
+        help="出力先ディレクトリ（無ければ作る。既定 fixtures/onnx_parity）",
+    )
+    parser.add_argument(
+        "--labels",
+        default=",".join(LABEL_ORDER),
+        help="選択肢の並び（カンマ区切り。既定 alpha,beta,gamma）",
+    )
+    parser.add_argument("--max-bytes", type=int, default=MAX_BYTES, help="入力の最大バイト数")
     parser.add_argument(
         "--only",
         choices=["autoregressive"],
@@ -274,9 +292,12 @@ def main() -> None:
     )
     parser.add_argument("--overwrite", action="store_true", help="既存ファイルの上書きを許可する")
     args = parser.parse_args()
+    LABEL_ORDER = args.labels.split(",")
+    if len(set(LABEL_ORDER)) != len(LABEL_ORDER) or "" in LABEL_ORDER or args.max_bytes < 1:
+        raise SystemExit("invalid --labels or --max-bytes")
+    MAX_BYTES = args.max_bytes
     out_dir = Path(args.out).resolve()
-    if not out_dir.is_dir():
-        raise SystemExit(f"output directory does not exist: {out_dir}")
+    out_dir.mkdir(parents=True, exist_ok=True)
     names = (
         ("ar.onnx", "cases.json") if args.only else ("c1.onnx", "c3.onnx", "ar.onnx", "cases.json")
     )

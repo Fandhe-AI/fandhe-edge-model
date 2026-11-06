@@ -20,15 +20,19 @@ const PROB_TOLERANCE: f64 = 1e-5;
 const MAX_CASES_BYTES: u64 = 4 * 1024 * 1024;
 
 fn fixture_dir() -> PathBuf {
+    fixture_dir_of("onnx_parity")
+}
+
+fn fixture_dir_of(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("fixtures")
-        .join("onnx_parity")
+        .join(name)
 }
 
-fn load_cases() -> Value {
-    let path = fixture_dir().join("cases.json");
+fn load_cases(dir: &std::path::Path) -> Value {
+    let path = dir.join("cases.json");
     let len = fs::metadata(&path).expect("cases metadata").len();
     assert!(len <= MAX_CASES_BYTES, "cases.json too large: {len}");
     serde_json::from_str(&fs::read_to_string(&path).expect("cases read")).expect("cases json")
@@ -62,7 +66,11 @@ fn cases_of(entry: &Value) -> Vec<Case> {
 }
 
 fn check_kind(kind: ModelKind) {
-    let doc = load_cases();
+    check_kind_in(kind, &fixture_dir());
+}
+
+fn check_kind_in(kind: ModelKind, dir: &std::path::Path) {
+    let doc = load_cases(dir);
     let entry = doc["kinds"][kind.as_str()].clone();
     let max_bytes =
         usize::try_from(entry["max_bytes"].as_u64().expect("max_bytes")).expect("usize");
@@ -71,7 +79,7 @@ fn check_kind(kind: ModelKind) {
         .expect("sha")
         .parse()
         .expect("sha parse");
-    let path = fixture_dir().join(entry["onnx"].as_str().expect("onnx"));
+    let path = dir.join(entry["onnx"].as_str().expect("onnx"));
     let pipeline = load_pipeline(kind, max_bytes, &path, &sha).expect("load pipeline");
     let cases = cases_of(&entry);
     assert!(
@@ -164,6 +172,16 @@ fn req32_autoregressive_labels_match_mlx() {
     check_kind(ModelKind::Autoregressive);
 }
 
+/// REQ-19b・REQ-32・#699: 選択肢 8 つ・max_bytes 64 の fixture（`onnx_parity_8labels`）でも、
+/// c1・c3・autoregressive の ONNX が MLX 内推論と全件一致する。
+#[test]
+fn req32_8labels_labels_match_mlx() {
+    let dir = fixture_dir_of("onnx_parity_8labels");
+    for kind in [ModelKind::C1, ModelKind::C3, ModelKind::Autoregressive] {
+        check_kind_in(kind, &dir);
+    }
+}
+
 /// 宣言の有無で予測が変わらないこと（REQ-41・TASK-41.3-2・#403）。
 ///
 /// `cases.json` の entry から `artifact.json` を組み（宣言なし／`byte`）、CLI の `build_pipeline` と
@@ -171,7 +189,7 @@ fn req32_autoregressive_labels_match_mlx() {
 /// `byte` はスコアを含めて全件一致し、MLX のラベルとも全件一致する。
 fn check_declaration_regression(kind: ModelKind) {
     use fandhe_edge_core::artifact_meta::{ArtifactMeta, PackageInputRepresentation};
-    let doc = load_cases();
+    let doc = load_cases(&fixture_dir());
     let entry = doc["kinds"][kind.as_str()].clone();
     let cases = cases_of(&entry);
     assert!(cases.len() >= 100, "{}: too few cases", kind.as_str());
