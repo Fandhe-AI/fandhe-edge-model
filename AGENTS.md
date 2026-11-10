@@ -127,7 +127,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 ### 実行環境（uv venv）を要するテスト（issue #258）
 
 - `crates/train/tests/real_trainer.rs` は実 `trainer/`（MLX・C1/C3・ONNX 書き出し）を Rust の `run_train` から起動して学習ジョブを完走させる（REQ-18/19/34/39。証拠種別: テストハーネス・合成データ・CPU）。`make py-sync` 済みの `trainer/.venv` と MLX CPU が必要で、`rust-ci` の 3 OS runner には無いため `#[ignore]` で既定の `make test` から分離している
-- 実行コマンドは `make test-trainer-integration`（`--ignored --exact` で 4 件のテストを個別に起動し、各起動の出力で `1 passed` を検査する）。`python-ci`（macos-14 arm64）とローカルの `make ci` で実際に実行される。GPU・実機測定を伴わないため上の実機前提テストとは別扱いで、CI で実行されない分離は P0
+- 実行コマンドは `make test-trainer-integration`（`--ignored --exact` で 4 件のテストを個別に起動し、各起動の出力で `1 passed` を検査する）。`python-ci`（macos-15 arm64）とローカルの `make ci` で実際に実行される。GPU・実機測定を伴わないため上の実機前提テストとは別扱いで、CI で実行されない分離は P0
 - `rust-ci` では `ignored` と報告され、Windows は `#![cfg(unix)]` で対象外（`run_train` が `UnsupportedPlatform`）
 
 ### PoC-26 の実機前提テスト（REQ-41・TASK-41.1-5・#390）
@@ -241,5 +241,5 @@ make doctor      # 環境診断のみ（何も導入しない）
 | `ci.yml` への変更 | `ci.yml` を変更する差分では、3 OS matrix（Linux・macOS・Windows）を維持しているか、集約ジョブ `ci-complete` の `needs` に全ジョブが含まれているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にしたジョブが混入していないかを確認する | P1 |
 | 必須チェック名の変更 | ジョブ ID・`name:` の変更で check 名（`codex / *`・`python-ci`・`ci-complete`・`lint-docs / *`・`rust-ci (<os>) / *`・`rust-ci-default-features (<os>)`。matrix の OS の追加・削除を含む）が変わる差分に、ruleset の必須チェックの更新手順（マージ前の置換）が PR 本文に記載されているか。旧名のまま残ると全チェック pass でもマージがブロックされる | P1 |
 | `release.yml` | `workflow_dispatch` 限定のプレースホルダであり、有効化には公開対象 crate 名・crates.io 公開方針の確定を要する。現状のプレースホルダ状態自体は指摘しない | 指摘しない（既知の暫定状態） |
-| `macos-15` ランナーの指定 | GitHub 公式ドキュメント（https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners の標準ランナー一覧）では、`macos-15`・`macos-14`・`macos-latest` は ARM64（Apple Silicon）、Intel（x64）は `macos-15-intel`・`macos-13` 等の別ラベルである。したがって arm64 が必要なジョブの `runs-on: macos-15` は適切なラベルであり、arm64 用ラベルへの変更を求める指摘をしない。Intel 系ラベル（`-intel`・`-large`・`macos-13`）で arm64 を要するジョブを動かす差分は通常どおり P1 とする | 指摘しない（公式ドキュメントに基づく） |
+| `macos-15` ランナーの指定 | GitHub 公式ドキュメント（https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners の標準ランナー一覧）では、`macos-15`・`macos-latest` は ARM64（Apple Silicon）、Intel（x64）は `macos-15-intel`・`macos-13` 等の別ラベルである。したがって arm64 が必要なジョブの `runs-on: macos-15` は適切なラベルであり、arm64 用ラベルへの変更を求める指摘をしない。Intel 系ラベル（`-intel`・`-large`・`macos-13`）で arm64 を要するジョブを動かす差分は通常どおり P1 とする | 指摘しない（公式ドキュメントに基づく） |
 | `update-external.yml` の `runner-json` | `runner-json` は folded block scalar（`>-`）で JSON 文字列 `"ubuntu-latest"`（二重引用符込み、バックスラッシュなし）を渡す正しい記法であり、`fromJSON` で `ubuntu-latest` に解決される。エスケープの誤りとして指摘しない | 指摘しない（正しい記法） |

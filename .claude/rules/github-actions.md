@@ -19,7 +19,7 @@ description: >
     | ワークフロー | runner | 理由 |
     | --- | --- | --- |
     | `ci.yml` | `ubuntu-latest`・`macos-latest`・`windows-latest`（3 OS matrix）・`ci-complete` は `ubuntu-latest` | 3 OS 一級対応（OS 要件による例外） |
-    | `python-ci.yml` | `macos-14` | MLX の arm64 wheel と拡張 ACL 検査が macOS 前提（OS 要件による例外） |
+    | `python-ci.yml` | `macos-15` | MLX の arm64 wheel と拡張 ACL 検査が macOS 前提（OS 要件による例外） |
     | `update-external.yml`・`release.yml` | `ubuntu-latest` | — |
     | `ai-review.yml` | preflight / post_feedback は `ubuntu-latest`、review は reusable workflow 既定の self-hosted `codex` 用途ラベル | 既存の例外。codex の資格情報が self-hosted 側にあり、fork PR は reusable 側が fail-closed で拒否する。新たな self-hosted 利用の追加は禁止 |
 

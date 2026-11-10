@@ -15,7 +15,7 @@
 //! - 既定集合から移したテストではなく新規テスト。必要な環境（`make py-sync`
 //!   で同期した `trainer/.venv` と MLX）が `rust-ci` の 3 OS runner に無い。
 //! - `#[ignore]` は CI を通すためのものではない。`make test-trainer-integration`
-//!   が `--ignored` で実行し、`python-ci`（macos-14 arm64）とローカルの
+//!   が `--ignored` で実行し、`python-ci`（macos-15 arm64）とローカルの
 //!   `make ci` で実際に走らせる。silent skip はせず、libtest が `ignored` と
 //!   明示的に報告する。
 //! - GPU・実機測定を伴わない（`Device::Cpu`・極小設定）ため実機前提テストではない。

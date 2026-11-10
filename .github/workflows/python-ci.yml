@@ -24,11 +24,11 @@ name: Python CI
 # MLX（macOS arm64 ランナー）について: TASK-19.2（既定候補 C3）の実装で
 # trainer/pyproject.toml の dependencies に mlx・numpy・onnx を追加した。
 # spec の検証環境は macOS（Apple Silicon）であり、出力先の拡張 ACL 検査など macOS
-# 固有の経路もここでしか検証できないため、本 job は macos-14 で実行する
-# （[tool.uv] environments は開発環境向けに Linux x86_64 も含むが、CI の正は macOS arm64）。GitHub ホステッドランナーの `macos-14`
+# 固有の経路もここでしか検証できないため、本 job は macos-15 で実行する
+# （[tool.uv] environments は開発環境向けに Linux x86_64 も含むが、CI の正は macOS arm64）。GitHub ホステッドランナーの `macos-15`
 # （および `macos-15`・`macos-latest`）は Apple Silicon（arm64）の標準ランナーである
 # （GitHub 公式ドキュメント about-github-hosted-runners の標準ランナー一覧）。
-# MLX の macOS 向け wheel が要求する macOS 14 以上を満たす最も古い arm64 ラベルを使う。
+# MLX の macOS 向け wheel が要求する macOS 14 以上を満たす arm64 ラベルのうち、現行の macos-15 を使う（macos-14 は 2026-11-02 に GitHub が廃止した）。
 # 念のため下記ステップでアーキテクチャを fail-closed に検査する（ランナーラベルの
 # 意味が将来変わった場合に、CI が気づかず x86_64 上で「MLX 無しでも py-ci が通る」
 # 状態へ静かに劣化するのを防ぐ）。
@@ -67,7 +67,7 @@ concurrency:
 jobs:
   python-ci:
     name: python-ci
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     permissions:
       contents: read
@@ -86,7 +86,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: scripts/ci-docs-only.sh
 
-      # fail-closed: `macos-14` ラベルが指す実体が将来変わっても、arm64 以外
+      # fail-closed: `macos-15` ラベルが指す実体が将来変わっても、arm64 以外
       # （MLX の wheel が存在しないアーキテクチャ）で「py-ci が通った」ことに
       # ならないよう、アーキテクチャの前提をここで明示的に検査する。
       - name: ランナーが arm64 であることを確認する（fail-closed）
