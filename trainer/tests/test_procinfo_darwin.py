@@ -132,7 +132,7 @@ def test_req39_library_load_failure_is_unknown(monkeypatch: pytest.MonkeyPatch) 
 def test_req38_req39_child_status_works_under_real_sandbox_exec() -> None:
     """REQ-38・REQ-39・#327 回帰: 実 `sandbox-exec` 下で `/bin/ps` が使えなくても、
     `child_status` は子に対して `(rss>0, False)` を返す。sandbox-exec が無ければ
-    skip せず失敗させる（CI の python-ci は macos-14）。"""
+    skip せず失敗させる（CI の python-ci は macos-15）。"""
     assert os.path.exists(_SANDBOX_EXEC), "sandbox-exec is required on macOS"
     script = textwrap.dedent(
         """

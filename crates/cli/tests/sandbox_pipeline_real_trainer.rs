@@ -24,7 +24,7 @@
 //!
 //! 必要な環境（`make py-sync` で同期した `trainer/.venv` と MLX CPU）が `rust-ci` の runner に無い
 //! 新規テストで、既定集合から移したものではない。`make test-trainer-integration` が `--ignored`
-//! で実行し、`python-ci`（macos-14 arm64）とローカルの `make ci` で実際に走る。
+//! で実行し、`python-ci`（macos-15 arm64）とローカルの `make ci` で実際に走る。
 //!
 //! # テスト名と Makefile の同期
 //!
