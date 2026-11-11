@@ -377,6 +377,11 @@ impl Default for BatchLimits {
 pub(crate) enum StallPolicy {
     /// プロセスの終了で回収する（CLI の 1 呼び出し 1 プロセス）。
     TerminateProcess,
+    /// 常駐プロセス（`serve`。#708）用。期限超過でもプロセスを終えず、`limit_exceeded` を結果として返す。
+    /// 切り離した計算スレッドは残りうる（協調的に打ち切れない停止の見張りは #709）。出力先はメモリ上の
+    /// `Vec<u8>` のみで書き込みは停止しない。serve は Linux・macOS 限定のため、他の OS では使われない。
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    Resident,
     /// 回収しない（切り離したスレッド・停止した書き込みが残りうる）。ユニットテスト専用。
     #[cfg(test)]
     Leak,
@@ -386,6 +391,7 @@ impl StallPolicy {
     pub(crate) const fn terminates(self) -> bool {
         match self {
             Self::TerminateProcess => true,
+            Self::Resident => false,
             #[cfg(test)]
             Self::Leak => false,
         }
@@ -850,6 +856,23 @@ where
     W: Write,
     T: Send + 'static,
 {
+    run_with_stall_guard_flagged(out, duration, output_duration, policy, &mut false, work)
+}
+
+/// [`run_with_stall_guard`] に、期限超過で計算スレッドを切り離したかを `detached` へ返す口を足したもの。
+/// スレッドを起動できなかった・panic した場合は、残る計算が無いので切り離しではない（偽のまま。#708）。
+pub(crate) fn run_with_stall_guard_flagged<W, T>(
+    out: &mut W,
+    duration: Duration,
+    output_duration: Duration,
+    policy: StallPolicy,
+    detached: &mut bool,
+    work: impl FnOnce() -> Result<T, ErrorReport> + Send + 'static,
+) -> Result<T, ErrorReport>
+where
+    W: Write,
+    T: Send + 'static,
+{
     let deadline = Instant::now().checked_add(duration);
     let (tx, rx) = mpsc::channel();
     let spawned = thread::Builder::new()
@@ -868,6 +891,7 @@ where
         Ok(outcome) => outcome,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let outcome: Result<T, ErrorReport> = Err(report(ExitCode::LimitExceeded));
+            *detached = true;
             if policy.terminates() {
                 let watchdog = OutputWatchdog::arm(true, output_duration);
                 std::process::exit(finish_abandoned(out, &outcome, watchdog));
@@ -929,6 +953,40 @@ where
         },
         StallPolicy::TerminateProcess,
     )
+}
+
+/// 常駐プロセス（`serve`。#708）用の単件推論。単独の [`emit_infer_single_scoped`] と同じ組み立てで
+/// 1 行の JSON を `Vec<u8>` へ書き、`(stdout のバイト列, 終了コード)` を返す。期限超過はプロセスを
+/// 終えずに `limit_exceeded`（exit 20）の結果として返す（REQ-21・REQ-33・REQ-39）。
+///
+/// 3 つ目の値は、計算スレッドを切り離した（ハード期限で見切った）か。真なら呼び出し側は結果を返した後に
+/// プロセスを終える（切り離したスレッドとメモリを積み上げない。fail-closed）。協調的な期限
+/// （`TimeLimitExceeded`）による `limit_exceeded` は偽で、常駐は続けられる。
+/// serve は Linux・macOS 限定のため、他の OS では使われない。
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn infer_single_to_bytes<P, B>(
+    call: SingleCall<'_>,
+    pipeline: Arc<InferencePipeline<P, B>>,
+) -> io::Result<(Vec<u8>, ExitCode, bool)>
+where
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    let duration = call.duration;
+    let mut buf = Vec::new();
+    let mut detached = false;
+    let code = emit_infer_single_core(
+        &mut buf,
+        pipeline,
+        call,
+        BatchLimits {
+            duration,
+            ..default_single_limits()
+        },
+        StallPolicy::Resident,
+        &mut detached,
+    )?;
+    Ok((buf, code, detached))
 }
 
 /// [`emit_infer_single`] の上限を指定できる版。停止の回収は常にプロセス終了（CLI の 1 呼び出し
@@ -995,6 +1053,24 @@ where
     P: Preprocessor + Send + Sync + 'static,
     B: ScoringBackend + Send + Sync + 'static,
 {
+    emit_infer_single_core(out, pipeline, call, limits, policy, &mut false)
+}
+
+/// [`emit_infer_single_inner`] の本体。`detached` に、計算スレッドが期限内に終わらず切り離されたか
+/// （`StallPolicy::Resident` の常駐が、応答後にプロセスを終える判断に使う。呼び出しごとの値。#708）を返す。
+pub(crate) fn emit_infer_single_core<W, P, B>(
+    out: &mut W,
+    pipeline: Arc<InferencePipeline<P, B>>,
+    call: SingleCall<'_>,
+    limits: BatchLimits,
+    policy: StallPolicy,
+    detached: &mut bool,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
     let SingleCall {
         io,
         options,
@@ -1011,13 +1087,20 @@ where
     let hard = cooperative.saturating_add(SINGLE_HARD_LIMIT_GRACE);
     let worker_options = options.to_vec();
     let worker_scope = scope.clone();
-    let outcome = run_with_stall_guard(out, hard, limits.output_duration, policy, move || {
-        // 推論側へ渡すのは `input` のみ（REQ-27）。
-        let prediction = pipeline
-            .infer_one_within(input.input(), cooperative)
-            .map_err(|e| e.to_error_report())?;
-        judgment_from_prediction_scoped(&worker_options, &worker_scope, input.id(), &prediction)
-    });
+    let outcome = run_with_stall_guard_flagged(
+        out,
+        hard,
+        limits.output_duration,
+        policy,
+        detached,
+        move || {
+            // 推論側へ渡すのは `input` のみ（REQ-27）。
+            let prediction = pipeline
+                .infer_one_within(input.input(), cooperative)
+                .map_err(|e| e.to_error_report())?;
+            judgment_from_prediction_scoped(&worker_options, &worker_scope, input.id(), &prediction)
+        },
+    );
     // 書き込みの停止も期限でプロセス終了へ倒す（バッチと同じ見張り）。
     let _watchdog = OutputWatchdog::arm(policy.terminates(), limits.output_duration)?;
     match outcome {

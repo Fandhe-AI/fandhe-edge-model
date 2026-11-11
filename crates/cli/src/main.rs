@@ -20,12 +20,32 @@ use fandhe_edge_cli::args::{self, Invocation};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use fandhe_edge_cli::infer_supervisor;
 use fandhe_edge_cli::output::write_error_report;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use fandhe_edge_cli::serve;
 use fandhe_edge_cli::stages;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 
 fn main() -> std::process::ExitCode {
     let report = match args::parse(std::env::args_os().skip(1)) {
         Ok(Invocation::Help(topic)) => ErrorReport::new(ExitCode::Ok, args::render_help(topic)),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Ok(Invocation::Serve(serve_args)) => {
+            let Ok(cwd) = std::env::current_dir() else {
+                return emit(&ErrorReport::new(
+                    ExitCode::RuntimeError,
+                    "cannot resolve working directory",
+                ));
+            };
+            return match serve::run(&mut std::io::stdout(), &serve_args, &cwd) {
+                Ok(code) => code.into(),
+                Err(_) => ExitCode::RuntimeError.into(),
+            };
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        Ok(Invocation::Serve(_)) => ErrorReport::new(
+            ExitCode::InvalidInput,
+            "serve is not supported on this platform",
+        ),
         Ok(Invocation::Run(command)) => {
             let Ok(cwd) = std::env::current_dir() else {
                 return emit(&ErrorReport::new(
@@ -33,6 +53,7 @@ fn main() -> std::process::ExitCode {
                     "cannot resolve working directory",
                 ));
             };
+            // 常駐への委譲（#708）は worker の中（`stages::infer::run`）で行う。
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let args::Command::Infer(infer) = &command
                 && !infer_supervisor::is_worker()

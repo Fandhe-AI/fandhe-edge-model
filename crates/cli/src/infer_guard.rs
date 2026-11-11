@@ -73,6 +73,7 @@ use fandhe_edge_runtime::onnx::MAX_MODEL_FILE_BYTES;
 
 use crate::args::{InferArgs, InferVersion};
 use crate::error_report::ToErrorReport;
+use crate::serve_layout::FileStat;
 
 /// パッケージ内のメタデータのファイル名（パッケージ形式の確定は TASK-28/32）。
 const ARTIFACT_META_FILE: &str = "artifact.json";
@@ -96,6 +97,10 @@ pub struct PathFormatCheckedInputs {
     /// 検査に使った `artifact.json` のバイト列（台帳と照合済みならその内容。`stages::infer` は開き直さず
     /// これを解析する。#491）。
     pub meta_bytes: Vec<u8>,
+    /// 読んだ `artifact.json` の fd の識別情報（配置の指紋用。#708）。
+    pub meta_stat: FileStat,
+    /// 読んだ ONNX の fd の識別情報（配置の指紋用。#708）。
+    pub onnx_stat: FileStat,
 }
 
 /// 閉じ込め → `artifact.json` の上限付き読み → 解析 → `kind` 許可リスト検査（手順 1〜4）。
@@ -103,11 +108,22 @@ pub struct PathFormatCheckedInputs {
 fn read_meta_and_kind(
     workspace: &Path,
     package: &Path,
-) -> Result<(ConfinedPackage, Vec<u8>, ArtifactOnnxRef, CheckedKind), ErrorReport> {
+) -> Result<
+    (
+        ConfinedPackage,
+        Vec<u8>,
+        ArtifactOnnxRef,
+        CheckedKind,
+        FileStat,
+    ),
+    ErrorReport,
+> {
     let package = confine_package(workspace, package).map_err(|e| e.to_error_report())?;
     let (meta_file, _) = package
         .open_member(Path::new(ARTIFACT_META_FILE))
         .map_err(|e| e.to_error_report())?;
+    let meta_stat = FileStat::of(ARTIFACT_META_FILE, &meta_file)
+        .map_err(|_| crate::project::runtime("cannot inspect package file"))?;
     let bytes = read_bounded_open_file(
         meta_file,
         Path::new(ARTIFACT_META_FILE),
@@ -119,7 +135,7 @@ fn read_meta_and_kind(
     let kind = KindAllowlist::supported()
         .check(onnx_ref.kind())
         .map_err(|e| e.to_error_report())?;
-    Ok((package, bytes, onnx_ref, kind))
+    Ok((package, bytes, onnx_ref, kind, meta_stat))
 }
 
 /// 親（監督層）が種類別の安全上限を選ぶために `kind` だけを読む（REQ-39・TASK-41.8・#435）。
@@ -129,7 +145,7 @@ fn read_meta_and_kind(
 pub fn peek_checked_kind(workspace: &Path, package: &Path) -> Option<CheckedKind> {
     read_meta_and_kind(workspace, package)
         .ok()
-        .map(|(_, _, _, k)| k)
+        .map(|(_, _, _, k, _)| k)
 }
 
 /// `args.package` と `artifact.json` の `onnx_file` の経路を閉じ込め、ONNX ファイルを開いて形式を検査する。
@@ -146,7 +162,7 @@ pub fn check_infer_path_and_format(
     workspace: &Path,
     args: &InferArgs,
 ) -> Result<PathFormatCheckedInputs, ErrorReport> {
-    let (package, bytes, onnx_ref, kind) = read_meta_and_kind(workspace, &args.package)?;
+    let (package, bytes, onnx_ref, kind, meta_stat) = read_meta_and_kind(workspace, &args.package)?;
     // 版の検査も同様にモデルのバイト列を開く前に行う（REQ-39・PoC-20 ケース 7・TASK-39.6-1）。
     let kind_version = KindVersionAllowlist::supported()
         .check(kind, onnx_ref.kind_version())
@@ -158,6 +174,8 @@ pub fn check_infer_path_and_format(
     let (onnx, onnx_path) = package
         .open_member(Path::new(onnx_ref.onnx_file()))
         .map_err(|e| e.to_error_report())?;
+    let onnx_stat = FileStat::of(onnx_ref.onnx_file(), &onnx)
+        .map_err(|_| crate::project::runtime("cannot inspect package file"))?;
     // 実体パスの拡張子を確認してから、保持した fd を上限付きで読み切り形式を検査する
     // （パスから開き直さない。読み込み前の上限確認は check_open_file 内。REQ-39）。
     if onnx_path
@@ -182,6 +200,8 @@ pub fn check_infer_path_and_format(
         onnx,
         onnx_path,
         meta_bytes: bytes,
+        meta_stat,
+        onnx_stat,
     })
 }
 
