@@ -1,4 +1,4 @@
-//! `infer --text` を常駐プロセス（[`crate::serve`]）へ委ねる側（#708。REQ-21・REQ-33・REQ-38・REQ-39）。
+//! `infer --text` を常駐プロセス（[`crate::serve`]）へ委ねる側（#708・#709。REQ-21・REQ-33・REQ-38・REQ-39）。
 //!
 //! # 呼び出し文脈
 //!
@@ -9,6 +9,9 @@
 //!
 //! # 委ねる条件
 //!
+//! ソケットのファイル名は 1 行 JSON の形の版ごとに分かれている（`serve::SOCKET_FILE`）。版の違う常駐の
+//! ソケットは見ない（ソケットが無い扱いで、何も言わず単独で判定する。#709）。
+//!
 //! 置き場所が 0700 でソケットがある・`--text` のみ（`--id`・`--input-file`・`--out`・`--version-ledger` なし）・`FANDHE_EDGE_NO_SERVE` 未設定・
 //! ソケットにつながり、軽い検査（[`check_infer_path_and_format`]。閉じ込め・`artifact.json`・
 //! 形式・`kind_version`。重い shard の検証は常駐の起動時に済み）を通り、`artifact.json` の記録が実体の
@@ -16,11 +19,15 @@
 //!
 //! # つながった後
 //!
-//! 単独へは戻らない（7B の読み込み直しで負荷が二重になるため）。時間切れは `limit_exceeded`（20）、
+//! 要求には 1 行 JSON の形の版（`PROTOCOL_VERSION`）と自分の版（`CARGO_PKG_VERSION`）を入れる（#709）。
+//! 常駐が判定した後は単独へ戻らない（7B の読み込み直しで負荷が二重になるため）。時間切れは `limit_exceeded`（20）、
 //! 応答の不正・切断は `runtime_error`（70）を単独と同じ形のエラー JSON で出す。時間は監督の `infer` の
-//! 親の上限より `SUPERVISOR_GRACE` 短い期限。`package_mismatch` と、応答の前に常駐が終わった（EOF・切断）
-//! ときは単独へ戻る。応答の `stdout` は加工せず流し、
-//! `exit_code` で終える。
+//! 親の上限より `SUPERVISOR_GRACE` 短い期限。応答の `stdout` は加工せず流し、`exit_code` で終える。
+//!
+//! 単独へ戻るのは、常駐が判定していないと分かる場合だけ: `package_mismatch`・`version_mismatch`（版の違う
+//! 常駐）・応答の前に常駐が終わった（EOF・切断）・要求を送り切れず応答も読めなかった。要求の書き込みが
+//! 時間切れ以外で失敗しても、応答の 1 行が読めればそれを使う（常駐が接続数の上限で、要求を読まずに
+//! `limit_exceeded` を返して閉じた場合。#709）。
 
 use std::io::{self, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -33,8 +40,8 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
 use fandhe_edge_core::serve_protocol::{
-    MAX_REQUEST_LINE_BYTES, MAX_RESPONSE_LINE_BYTES, ServeRequest, ServeResponse, decode_response,
-    encode_request,
+    MAX_REQUEST_LINE_BYTES, MAX_RESPONSE_LINE_BYTES, PROTOCOL_VERSION, ServeRequest, ServeResponse,
+    decode_response, encode_request,
 };
 use fandhe_edge_guard::resource::safety_limits_for_kind;
 
@@ -136,6 +143,8 @@ pub fn try_delegate_in<W: Write>(
             .saturating_add(SINGLE_HARD_LIMIT_GRACE);
 
     let request = encode_request(&ServeRequest {
+        protocol: PROTOCOL_VERSION,
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
         id: request_id(),
         text: text.clone(),
         package: identity,
@@ -157,15 +166,21 @@ pub fn try_delegate_in<W: Write>(
     } else {
         stream.set_write_timeout(Some(remaining))
     };
-    let line = armed
-        .and_then(|()| stream.write_all(&request))
-        .and_then(|()| read_line_bounded(&mut stream, MAX_RESPONSE_LINE_BYTES, deadline));
-    let line = match line {
-        Ok(line) => line,
-        Err(e) => return failed(out, &e),
+    let written = armed.and_then(|()| stream.write_all(&request));
+    let read = read_line_bounded(&mut stream, MAX_RESPONSE_LINE_BYTES, deadline);
+    let line = match (written, read) {
+        (Err(e), _) if is_timeout(&e) => return failed(out, &e),
+        // 書き込みが時間切れ以外で失敗しても、常駐が要求を読まずに応答して閉じた（接続数の上限の
+        // `limit_exceeded`）場合があるので、応答が読めればそれを使う（#709）。
+        (_, Ok(line)) => line,
+        // 要求を送り切れていないので常駐は判定しておらず、単独へ戻しても読み込みは二重にならない。
+        (Err(_), Err(_)) => return Ok(Delegation::Standalone("serve closed the connection")),
+        (Ok(()), Err(e)) => return failed(out, &e),
     };
     match decode_response(&line) {
         Ok(ServeResponse::PackageMismatch) => Ok(Delegation::Standalone("package mismatch")),
+        // 版の違う常駐には委ねない（#709）。常駐は判定していないので単独へ戻れる。
+        Ok(ServeResponse::VersionMismatch) => Ok(Delegation::Standalone("version mismatch")),
         Ok(ServeResponse::Ok { exit_code, stdout }) => {
             match ExitCode::try_from(i32::from(exit_code)) {
                 Ok(code) => {
@@ -179,7 +194,10 @@ pub fn try_delegate_in<W: Write>(
                 Err(_) => runtime_failed(out),
             }
         }
-        Err(_) => runtime_failed(out),
+        // `ready`・`ok_retiring` は常駐の親と worker 子の間専用で、ソケットに流れてきたら不正な応答。
+        Ok(ServeResponse::Ready { .. } | ServeResponse::OkRetiring { .. }) | Err(_) => {
+            runtime_failed(out)
+        }
     }
 }
 
@@ -195,10 +213,7 @@ fn failed<W: Write>(out: &mut W, e: &io::Error) -> io::Result<Delegation> {
     ) {
         return Ok(Delegation::Standalone("serve closed the connection"));
     }
-    if matches!(
-        e.kind(),
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-    ) {
+    if is_timeout(e) {
         let report = ErrorReport::new(
             ExitCode::LimitExceeded,
             default_message(ExitCode::LimitExceeded),
@@ -207,6 +222,13 @@ fn failed<W: Write>(out: &mut W, e: &io::Error) -> io::Result<Delegation> {
         return emit_error_report(out, &report).map(Delegation::Done);
     }
     runtime_failed(out)
+}
+
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
 }
 
 fn runtime_failed<W: Write>(out: &mut W) -> io::Result<Delegation> {

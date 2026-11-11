@@ -59,17 +59,20 @@
 
 `package` は配布用の `package/artifact.json` に `definition_sha256`（`package/definition.json` のバイト列の sha256）も追記し、`infer` は欄があれば `definition.json` と照合して、不一致を `invalid_input`（`package definition does not match its recorded hash`）で拒否します（欄の無い旧パッケージは照合しません）。あわせて `package` は版管理台帳 `<project>/version_ledger.json` に、配布用 `artifact.json`・`data/train.jsonl`・`selection_record.json` の sha256 を同じ版 ID（`v1`・`v2`…）で記録して読み取り専用にし、stdout の末尾に `"version":{"id","previous"}` を載せます（`--previous-project-dir OLD` で OLD の台帳を照合して引き継ぎます）。`infer --version-ledger L [--version-id V]` は配布用 `artifact.json` を台帳の model 版と照合してから推論します（前版への復帰。定義・ONNX・校正は `artifact.json` の記録を介して束縛されます。台帳ファイル自体の改変は検出しません。REQ-39・#491）。
 
-## 常駐プロセス `serve`（#708・REQ-21・REQ-33・REQ-38・REQ-39）
+## 常駐プロセス `serve`（#708・#709・REQ-21・REQ-33・REQ-38・REQ-39）
 
-`fandhe-edge serve --package <dir>` は 7 工程の外にある補助コマンドです。前景で動き、起動時にパッケージを `infer` と同じ検査（sha256 の全量照合を含む）で読み込んで保持し、`infer --text` の要求を Unix ソケットで受けます。複数のプロジェクト・セッションが 1 つの常駐を共有し、重いモデルの読み込みを 1 回に抑えます。
+`fandhe-edge serve --package <dir>` は 7 工程の外にある補助コマンドです。前景で動き、起動時に worker 子プロセスを起こし、worker がパッケージを `infer` と同じ検査（sha256 の全量照合を含む）で読み込んで保持します。親は `infer --text` の要求を Unix ソケットで受け、worker へ渡します。親は置き場所・ロック・ソケット・待ち行列・見張りを受け持ちます。複数のプロジェクト・セッションが 1 つの常駐を共有し、重いモデルの読み込みを 1 回に抑えます。
 
-- 置き場所は `$HOME/Library/Application Support/fandhe-edge/`（`FANDHE_EDGE_SERVE_DIR` で変更）。ディレクトリ 0700・ソケット `serve.sock` 0600・二重起動防止は `serve.lock`。ネットワークでは待ち受けません。置き場所が 0700 でない、またはソケットが無いときは、`infer` は何も出さず単独で判定します
+- 置き場所は `$HOME/Library/Application Support/fandhe-edge/`（`FANDHE_EDGE_SERVE_DIR` で変更）。ディレクトリ 0700・ソケット `serve.v1.sock` 0600・二重起動防止は `serve.lock`。ネットワークでは待ち受けません。置き場所が 0700 でない、またはソケットが無いときは、`infer` は何も出さず単独で判定します。ソケット名の数字は常駐と CLI の間の取り決めの版です。#708 の版の常駐（`serve.sock`）が動いていても、新しい CLI はそれを見ず、何も出さず単独で判定します。新しい `serve` は、古い `serve` が動いている間は起動できません（`serve.lock`）。古い `serve` を止めてから起動してください
 - `infer` は、ソケットがあり、`--text` のみ（`--id`・`--input-file`・`--out`・`--version-ledger` なし）で、`artifact.json` の ONNX と shard の sha256 が常駐のパッケージと一致するときだけ委ねます。同一性は `artifact.json`・`definition.json`・校正ファイルの sha256 も含みます。shard の実体は常駐の起動時に 1 回だけ検証し、委ねる側は構成ファイル（`artifact.json`・`definition.json`・ONNX・shard・`tokenizer.json`・`vocab.json`・校正）の配置の指紋（相対名・dev・ino・サイズ・mtime・ctime の sha256）と `artifact.json` の記録で照合します。読み込み後にファイルを書き換える・消すと指紋が変わるため委ねず、単独が全量検証して拒否します。委ねても stdout のバイト列と終了コードは単独と同じです。それ以外は今までの経路で判定します
 - 委ねる処理は `infer` の監督下の worker の中で行い、検査・ハッシュ・往復・書き込みが単独と同じ時間・RSS の上限と出力の見張りの下に入ります。入力が 1 MiB を超える場合は委ねず、単独のエラーを出します
-- 単独へ戻る条件: 試しの接続ができない、検査が通らない、パッケージが違う、**常駐が応答の前に終わった（接続が切れた）**。つながって要求を送った後の時間切れは `limit_exceeded`（20）で、単独へは戻りません。待ちは 8 件までで、超えると `limit_exceeded`
-- 常駐の資源上限: 起動から自分の RSS と起動（読み込み）の時間を、単独の監督と同じ種類別の上限で見張ります（RSS 超過・読み込みの時間超過は exit 20 で終了）。判定がハード期限で止まったときは、その要求に `limit_exceeded` を返して終了します（待っていた要求は単独へ戻ります）
+- 単独へ戻る条件: 試しの接続ができない、検査が通らない、パッケージが違う、版が違う（`version mismatch`。要求に入れた取り決めの版・CLI の版が常駐と食い違う）、**常駐が応答の前に終わった（接続が切れた）**。つながって要求を送った後の時間切れは `limit_exceeded`（20）で、単独へは戻りません。待ちは 8 件までで、超えると `limit_exceeded`
+- 常駐の資源上限: 親が worker の時間と RSS を、単独の監督と同じ種類別の上限で見張ります（約 50 ms ごと）。worker 自身も同じ上限と、親がいなくなったことを見張ります
+- 判定が期限を過ぎた・RSS が上限を超えたときは、その要求に `limit_exceeded`（20）を返し、worker を止めて作り直します。常駐は続き、待っていた要求は作り直しの後に処理されます
+- 常駐ごと終わる場合: 起動中の時間・RSS の超過（exit 20）、作り直しの起動失敗、作り直した worker の版・パッケージが起動時と違う（稼働中に CLI を更新した・パッケージを差し替えた）、作り直しが 3 回続けて 1 件も判定できない（いずれも次の `infer` は単独で判定します）
+- 常駐での 1 件の時間の上限は、単独と同じ値です（常駐向けの値は実機の計測 #710 の後に決めます）
 - `FANDHE_EDGE_NO_SERVE`（任意の値）を設定すると委ねません。常駐がいる環境では stderr に `serve: delegated` または `serve: standalone (<理由>)` を 1 行出します（stdout には出しません。ソケットが無い環境は従来どおり無言）
-- SIGTERM は既定の動きで、残ったソケットは次の起動が作り直します。見張り・版の照合・メモリ上限は #709 です
+- SIGTERM は既定の動きで、残ったソケットは次の起動が作り直します。接続してきた相手の uid の照合は行っていません（置き場所 0700・ソケット 0600 の権限で、他の利用者は接続できません）
 
 ## 開発環境構築
 
