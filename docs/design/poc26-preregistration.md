@@ -10,7 +10,7 @@ spec の内容は要約であり、詳細は spec の `02-poc-plan.md` PoC-26 �
 | 項目 | 記入 |
 | ---- | ---- |
 | 確定日 | 2026-10-06（評価データはまだ存在せず、どのモデルもどの評価データにも当てていない） |
-| 確定者 | yu-doly（オーナー） |
+| 確定者 | PoC-26 の担当者 |
 | 確定した Playwright MCP の版 | `@playwright/mcp` 0.0.83 |
 | 確定したラベル集合 | 案 A（既定ツール 25 ＋ `none` ＝ 26。3 節の共通の規則を含む） |
 | Holm の族 | seed ごとに m=3（P 対 majority・C1・C3）。autoregressive は参考 |
@@ -146,7 +146,7 @@ Core automation（24）＋ Tab management（1）＋ `none`。
 - Holm の族: seed ごとに m=3（P 対 majority・C1・C3）。autoregressive は参考
 - 必要件数の仮定: PoC-10 と同じ（b 側 0.15・c 側 0.05・検出力 0.8）
 
-## 10. オーナーが確定した事項（2026-10-06、yu-doly）
+## 10. 確定した事項（2026-10-06）
 
 1. Playwright MCP の版: 0.0.83（2 節）
 2. ラベル集合: 案 A ＋ 3 節「共通の規則」の capability 付きツールの扱い。README とソースの整合は #387 の前に `tools/list` で照合（2・3 節）
