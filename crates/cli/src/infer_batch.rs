@@ -874,10 +874,6 @@ where
         Ok(outcome) => outcome,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let outcome: Result<T, ErrorReport> = Err(report(ExitCode::LimitExceeded));
-            if policy == StallPolicy::Resident {
-                // 計算スレッドを切り離す。常駐は応答後にプロセスを終える（#708）。
-                RESIDENT_DETACHED.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
             if policy.terminates() {
                 let watchdog = OutputWatchdog::arm(true, output_duration);
                 std::process::exit(finish_abandoned(out, &outcome, watchdog));
@@ -941,10 +937,6 @@ where
     )
 }
 
-/// `StallPolicy::Resident` で計算スレッドを切り離した（協調的に打ち切れなかった）ことの印。
-/// 判定スレッドは 1 本だけなので、[`infer_single_to_bytes`] が呼び出しの直後に読んで下ろす。
-static RESIDENT_DETACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// 常駐プロセス（`serve`。#708）用の単件推論。単独の [`emit_infer_single_scoped`] と同じ組み立てで
 /// 1 行の JSON を `Vec<u8>` へ書き、`(stdout のバイト列, 終了コード)` を返す。期限超過はプロセスを
 /// 終えずに `limit_exceeded`（exit 20）の結果として返す（REQ-21・REQ-33・REQ-39）。
@@ -964,7 +956,8 @@ where
 {
     let duration = call.duration;
     let mut buf = Vec::new();
-    let code = emit_infer_single_inner(
+    let mut detached = false;
+    let code = emit_infer_single_core(
         &mut buf,
         pipeline,
         call,
@@ -973,8 +966,8 @@ where
             ..default_single_limits()
         },
         StallPolicy::Resident,
+        &mut detached,
     )?;
-    let detached = RESIDENT_DETACHED.swap(false, std::sync::atomic::Ordering::SeqCst);
     Ok((buf, code, detached))
 }
 
@@ -1042,6 +1035,24 @@ where
     P: Preprocessor + Send + Sync + 'static,
     B: ScoringBackend + Send + Sync + 'static,
 {
+    emit_infer_single_core(out, pipeline, call, limits, policy, &mut false)
+}
+
+/// [`emit_infer_single_inner`] の本体。`detached` に、計算スレッドが期限内に終わらず切り離されたか
+/// （`StallPolicy::Resident` の常駐が、応答後にプロセスを終える判断に使う。呼び出しごとの値。#708）を返す。
+pub(crate) fn emit_infer_single_core<W, P, B>(
+    out: &mut W,
+    pipeline: Arc<InferencePipeline<P, B>>,
+    call: SingleCall<'_>,
+    limits: BatchLimits,
+    policy: StallPolicy,
+    detached: &mut bool,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
     let SingleCall {
         io,
         options,
@@ -1058,13 +1069,26 @@ where
     let hard = cooperative.saturating_add(SINGLE_HARD_LIMIT_GRACE);
     let worker_options = options.to_vec();
     let worker_scope = scope.clone();
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished_in_worker = Arc::clone(&finished);
     let outcome = run_with_stall_guard(out, hard, limits.output_duration, policy, move || {
         // 推論側へ渡すのは `input` のみ（REQ-27）。
-        let prediction = pipeline
+        let result = pipeline
             .infer_one_within(input.input(), cooperative)
-            .map_err(|e| e.to_error_report())?;
-        judgment_from_prediction_scoped(&worker_options, &worker_scope, input.id(), &prediction)
+            .map_err(|e| e.to_error_report())
+            .and_then(|prediction| {
+                judgment_from_prediction_scoped(
+                    &worker_options,
+                    &worker_scope,
+                    input.id(),
+                    &prediction,
+                )
+            });
+        finished_in_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+        result
     });
+    // 戻ってきたのに計算が終わっていない = 期限で切り離した（スレッドを起動できなかった場合も含め fail-closed）。
+    *detached = !finished.load(std::sync::atomic::Ordering::SeqCst);
     // 書き込みの停止も期限でプロセス終了へ倒す（バッチと同じ見張り）。
     let _watchdog = OutputWatchdog::arm(policy.terminates(), limits.output_duration)?;
     match outcome {

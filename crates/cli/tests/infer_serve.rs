@@ -264,6 +264,17 @@ fn c_identity(ws: &Path) -> PackageIdentity {
         artifact_sha256: sha("artifact.json"),
         definition_sha256: sha("definition.json"),
         calibration_sha256: None,
+        layout_sha256: {
+            use fandhe_edge_cli::serve_layout::{FileStat, layout_sha256};
+            let stats = ["artifact.json", "model.onnx", "definition.json"]
+                .iter()
+                .map(|n| {
+                    let f = fs::File::open(ws.join("c").join(n)).expect("open");
+                    FileStat::of(n, &f).expect("stat")
+                })
+                .collect();
+            layout_sha256(stats)
+        },
     }
 }
 
@@ -359,23 +370,44 @@ fn req39_different_calibration_runs_standalone() {
     let _ = fs::remove_dir_all(&ws);
 }
 
-/// REQ-39: 読み込んだ後に shard を書き換えても、常駐の結果は変わらない（メモリ上の検証済みの内容で判定）。
+/// REQ-39: 読み込んだ後に shard を書き換えたら、配置の指紋が変わるので委ねず単独へ戻り、単独が全量検証して
+/// `invalid_input`（64）で拒否する。書き換え前は委ねて成功する。
 #[test]
-fn req39_shard_rewrite_after_load_does_not_change_result() {
+fn req39_shard_rewrite_after_load_falls_back_to_standalone() {
     let (ws, dir) = (workspace("shard"), serve_dir("shard"));
     let _server = Server::start(&ws, &dir, "q", &[]);
     let before = infer(&ws, &dir, "q", false, QWEN2_INPUTS[0]);
     assert_eq!(before.code, Some(0));
+    assert_eq!(before.stderr.trim_end(), "serve: delegated");
     let shard = ws.join("q/weights-00000.bin");
     let len = fs::metadata(&shard).expect("meta").len();
     fs::write(&shard, vec![0u8; usize::try_from(len).expect("len")]).expect("rewrite");
     let after = infer(&ws, &dir, "q", false, QWEN2_INPUTS[0]);
-    assert_eq!(after.stderr.trim_end(), "serve: delegated");
-    assert_eq!(after.code, before.code);
-    assert_eq!(after.stdout, before.stdout);
-    // 単独なら書き換えを検出して拒否する（比較用。検証が常駐の起動時に移っていることの確認）。
+    assert_eq!(
+        after.stderr.trim_end(),
+        "serve: standalone (package mismatch)"
+    );
+    assert_eq!(after.code, Some(64));
     let alone = infer(&ws, &dir, "q", true, QWEN2_INPUTS[0]);
-    assert_eq!(alone.code, Some(64));
+    assert_eq!(after.stdout, alone.stdout);
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39: `tokenizer.json` を消したら、軽い検査で開けず委ねずに単独へ戻り、単独と同じエラーになる。
+#[test]
+fn req39_missing_tokenizer_falls_back_to_standalone() {
+    let (ws, dir) = (workspace("tok"), serve_dir("tok"));
+    let _server = Server::start(&ws, &dir, "q", &[]);
+    fs::remove_file(ws.join("q/tokenizer.json")).expect("remove");
+    let run = infer(&ws, &dir, "q", false, QWEN2_INPUTS[0]);
+    assert_eq!(
+        run.stderr.trim_end(),
+        "serve: standalone (package check failed)"
+    );
+    let alone = infer(&ws, &dir, "q", true, QWEN2_INPUTS[0]);
+    assert_ne!(run.code, Some(0));
+    assert_eq!(run.code, alone.code);
+    assert_eq!(run.stdout, alone.stdout);
     let _ = fs::remove_dir_all(&ws);
 }
 
@@ -581,6 +613,7 @@ fn req39_malformed_request_is_rejected_and_serve_survives() {
             artifact_sha256: "0".repeat(64),
             definition_sha256: "0".repeat(64),
             calibration_sha256: None,
+            layout_sha256: "0".repeat(64),
         },
     });
     assert_eq!(call(&request), ServeResponse::PackageMismatch);

@@ -85,6 +85,7 @@ use crate::output::write_stage_line;
 use crate::project::{
     DEFINITION_FILE, fs_report, invalid, parse_definition, runtime, write_rejection,
 };
+use crate::serve_layout::{FileStat, layout_sha256};
 
 /// 推論を許可する `kind_version` の許可リスト（REQ-39。`kind` ごとに列挙する）。
 ///
@@ -153,6 +154,7 @@ pub(crate) fn package_identity(
     meta_bytes: &[u8],
     def_bytes: &[u8],
     calibration_sha256: Option<String>,
+    layout_sha256: String,
 ) -> Result<PackageIdentity, ErrorReport> {
     let shard_sha256 = if is_tokenizer_qwen2(meta) {
         TokenizerPackageRefs::parse(meta_bytes)
@@ -170,23 +172,29 @@ pub(crate) fn package_identity(
         artifact_sha256: Sha256Digest::of_bytes(meta_bytes).to_hex(),
         definition_sha256: Sha256Digest::of_bytes(def_bytes).to_hex(),
         calibration_sha256,
+        layout_sha256,
     })
 }
 
 /// 委ねる側（軽い検査）の同一性。`artifact.json`（ガードが読んだバイト列）・`definition.json`・校正ファイルを
-/// 閉じ込めたパッケージから上限つきで読み、実体のバイト列から作る（shard の実体は読まない。#708）。
+/// 閉じ込めたパッケージから上限つきで読んで sha256 を作り、構成ファイル（`artifact.json`・`definition.json`・
+/// ONNX・shard・`tokenizer.json`・`vocab.json`・校正）を同じ閉じ込めた開き方で開いた fd の識別情報から
+/// 配置の指紋を作る。shard の実体は読まない（常駐の起動時に検証済み。#708・REQ-39）。
 ///
 /// # Errors
-/// 読み込み・解析の失敗（呼び出し側は委ねずに単独へ戻す）。
+/// 読み込み・解析・必要なファイルを開けない失敗（呼び出し側は委ねずに単独へ戻し、単独に同じエラーを出させる）。
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(crate) fn light_package_identity(
     checked: &crate::infer_guard::PathFormatCheckedInputs,
     meta: &ArtifactMeta,
 ) -> Result<PackageIdentity, ErrorReport> {
+    let stat_err = |_| runtime("cannot inspect package file");
+    let mut stats = vec![checked.meta_stat.clone(), checked.onnx_stat.clone()];
     let (def_file, def_path) = checked
         .package
         .open_member(Path::new(DEFINITION_FILE))
         .map_err(|e| e.to_error_report())?;
+    stats.push(FileStat::of(DEFINITION_FILE, &def_file).map_err(stat_err)?);
     let def_bytes = read_bounded_open_file(def_file, def_path.as_path(), MAX_DEFINITION_FILE_BYTES)
         .map_err(|e| fs_report(&e))?;
     let calibration = match checked
@@ -194,6 +202,7 @@ pub(crate) fn light_package_identity(
         .open_member(Path::new(PACKAGE_CALIBRATION_FILE))
     {
         Ok((file, path)) => {
+            stats.push(FileStat::of(PACKAGE_CALIBRATION_FILE, &file).map_err(stat_err)?);
             let bytes = read_bounded_open_file(file, path.as_path(), MAX_DEFINITION_FILE_BYTES)
                 .map_err(|e| fs_report(&e))?;
             Some(Sha256Digest::of_bytes(&bytes).to_hex())
@@ -205,7 +214,32 @@ pub(crate) fn light_package_identity(
         }
         Err(e) => return Err(e.to_error_report()),
     };
-    package_identity(meta, &checked.meta_bytes, &def_bytes, calibration)
+    match checked.package.open_member(Path::new(VOCAB_FILE_NAME)) {
+        Ok((file, _)) => stats.push(FileStat::of(VOCAB_FILE_NAME, &file).map_err(stat_err)?),
+        Err(PathRejection::Unresolvable { source, .. })
+            if source.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_error_report()),
+    }
+    if is_tokenizer_qwen2(meta) {
+        let refs =
+            TokenizerPackageRefs::parse(&checked.meta_bytes).map_err(|e| e.to_error_report())?;
+        let names = std::iter::once(&refs.tokenizer_file)
+            .chain(refs.external_data.iter().map(|e| &e.location));
+        for name in names {
+            let (file, _) = checked
+                .package
+                .open_member(Path::new(name))
+                .map_err(|e| e.to_error_report())?;
+            stats.push(FileStat::of(name, &file).map_err(stat_err)?);
+        }
+    }
+    package_identity(
+        meta,
+        &checked.meta_bytes,
+        &def_bytes,
+        calibration,
+        layout_sha256(stats),
+    )
 }
 
 /// `infer` を実行し、結果（または `ErrorReport`）を `out` へ書く。
@@ -522,6 +556,12 @@ pub(crate) fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorRep
         .package
         .open_member(Path::new(DEFINITION_FILE))
         .map_err(|e| e.to_error_report())?;
+    // 配置の指紋は、読んだ fd の識別情報から作る（パスを開き直さない。#708）。
+    let mut stats = vec![checked.meta_stat.clone(), checked.onnx_stat.clone()];
+    stats.push(
+        FileStat::of(DEFINITION_FILE, &def_file)
+            .map_err(|_| runtime("cannot inspect package file"))?,
+    );
     let def_bytes = read_bounded_open_file(def_file, def_path.as_path(), MAX_DEFINITION_FILE_BYTES)
         .map_err(|e| fs_report(&e))?;
     // 配布用 `artifact.json` に `definition_sha256` があれば、保持 fd から読んだこのバイト列と照合し、照合した
@@ -561,6 +601,12 @@ pub(crate) fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorRep
         }
         Err(e) => return Err(e.to_error_report()),
     };
+    if let Some((file, _)) = &vocab_file {
+        stats.push(
+            FileStat::of(VOCAB_FILE_NAME, file)
+                .map_err(|_| runtime("cannot inspect package file"))?,
+        );
+    }
     super::candidate_artifact::verify_vocab_file(
         &meta,
         vocab_file.as_ref().map(|(f, p)| (f, p.as_path())),
@@ -574,15 +620,17 @@ pub(crate) fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorRep
         meta.calibration_sha256(),
         onnx,
         &definition,
+        &mut stats,
     )?;
     let n_options = definition.options().len();
     let pipeline = if is_tokenizer_qwen2(&meta) {
-        build_qwen2_pipeline(
+        build_qwen2_pipeline_with_stats(
             onnx,
             &checked.package,
             &checked.meta_bytes,
             &meta,
             n_options,
+            &mut stats,
         )?
     } else {
         build_pipeline(onnx, &meta, n_options)?
@@ -597,6 +645,7 @@ pub(crate) fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorRep
         &checked.meta_bytes,
         &def_bytes,
         meta.calibration_sha256().map(str::to_string),
+        layout_sha256(stats),
     )?;
     Ok(Prepared {
         definition,
@@ -628,6 +677,7 @@ fn load_calibration(
     recorded: Option<&str>,
     onnx: &[u8],
     definition: &Definition,
+    stats: &mut Vec<FileStat>,
 ) -> Result<Option<InferCalibration>, ErrorReport> {
     let opened = match package.open_member(Path::new(PACKAGE_CALIBRATION_FILE)) {
         Ok(opened) => Some(opened),
@@ -648,6 +698,10 @@ fn load_calibration(
         (Some(_), None) => return Err(invalid("package calibration has no recorded hash")),
         (Some(opened), Some(recorded)) => (opened, recorded),
     };
+    stats.push(
+        FileStat::of(PACKAGE_CALIBRATION_FILE, &file)
+            .map_err(|_| runtime("cannot inspect package file"))?,
+    );
     let bytes = read_bounded_open_file(file, path.as_path(), MAX_DEFINITION_FILE_BYTES)
         .map_err(|e| fs_report(&e))?;
     if Sha256Digest::of_bytes(&bytes).to_hex() != recorded {
@@ -704,6 +758,19 @@ pub(crate) fn build_qwen2_pipeline(
     meta: &ArtifactMeta,
     n_options: usize,
 ) -> Result<Pipeline, ErrorReport> {
+    build_qwen2_pipeline_with_stats(onnx, package, meta_bytes, meta, n_options, &mut Vec::new())
+}
+
+/// [`build_qwen2_pipeline`] に、開いた `tokenizer.json`・shard の fd の識別情報を `stats` へ集める口を足したもの
+/// （常駐の配置の指紋用。パスを開き直さない。#708）。
+pub(crate) fn build_qwen2_pipeline_with_stats(
+    onnx: &[u8],
+    package: &ConfinedPackage,
+    meta_bytes: &[u8],
+    meta: &ArtifactMeta,
+    n_options: usize,
+    stats: &mut Vec<FileStat>,
+) -> Result<Pipeline, ErrorReport> {
     let kind = ModelKind::Qwen2Lora;
     if !kind_version_allowed(kind, meta.kind_version()) {
         return Err(invalid("unsupported kind_version"));
@@ -714,6 +781,10 @@ pub(crate) fn build_qwen2_pipeline(
     let (tok_file, _) = package
         .open_member(tok_path)
         .map_err(|e| e.to_error_report())?;
+    stats.push(
+        FileStat::of(&refs.tokenizer_file, &tok_file)
+            .map_err(|_| runtime("cannot inspect package file"))?,
+    );
     let tok_bytes = read_bounded_open_file(tok_file, tok_path, MAX_TOKENIZER_JSON_BYTES)
         .map_err(|e| fs_report(&e))?;
     if Sha256Digest::of_bytes(&tok_bytes).to_hex() != refs.tokenizer_sha256 {
@@ -734,6 +805,9 @@ pub(crate) fn build_qwen2_pipeline(
         let (file, _) = package
             .open_member(Path::new(&e.location))
             .map_err(|err| err.to_error_report())?;
+        stats.push(
+            FileStat::of(&e.location, &file).map_err(|_| runtime("cannot inspect package file"))?,
+        );
         let sha256 = e
             .sha256
             .parse()

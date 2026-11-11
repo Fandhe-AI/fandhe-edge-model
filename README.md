@@ -64,7 +64,7 @@
 `fandhe-edge serve --package <dir>` は 7 工程の外にある補助コマンドです。前景で動き、起動時にパッケージを `infer` と同じ検査（sha256 の全量照合を含む）で読み込んで保持し、`infer --text` の要求を Unix ソケットで受けます。複数のプロジェクト・セッションが 1 つの常駐を共有し、重いモデルの読み込みを 1 回に抑えます。
 
 - 置き場所は `$HOME/Library/Application Support/fandhe-edge/`（`FANDHE_EDGE_SERVE_DIR` で変更）。ディレクトリ 0700・ソケット `serve.sock` 0600・二重起動防止は `serve.lock`。ネットワークでは待ち受けません。置き場所が 0700 でない、またはソケットが無いときは、`infer` は何も出さず単独で判定します
-- `infer` は、ソケットがあり、`--text` のみ（`--id`・`--input-file`・`--out`・`--version-ledger` なし）で、`artifact.json` の ONNX と shard の sha256 が常駐のパッケージと一致するときだけ委ねます。同一性は `artifact.json`・`definition.json`・校正ファイルの sha256 も含みます。shard の実体は常駐の起動時に 1 回だけ検証し、委ねる側は `artifact.json` の記録で照合します。委ねても stdout のバイト列と終了コードは単独と同じです。それ以外は今までの経路で判定します
+- `infer` は、ソケットがあり、`--text` のみ（`--id`・`--input-file`・`--out`・`--version-ledger` なし）で、`artifact.json` の ONNX と shard の sha256 が常駐のパッケージと一致するときだけ委ねます。同一性は `artifact.json`・`definition.json`・校正ファイルの sha256 も含みます。shard の実体は常駐の起動時に 1 回だけ検証し、委ねる側は構成ファイル（`artifact.json`・`definition.json`・ONNX・shard・`tokenizer.json`・`vocab.json`・校正）の配置の指紋（相対名・dev・ino・サイズ・mtime・ctime の sha256）と `artifact.json` の記録で照合します。読み込み後にファイルを書き換える・消すと指紋が変わるため委ねず、単独が全量検証して拒否します。委ねても stdout のバイト列と終了コードは単独と同じです。それ以外は今までの経路で判定します
 - 委ねる処理は `infer` の監督下の worker の中で行い、検査・ハッシュ・往復・書き込みが単独と同じ時間・RSS の上限と出力の見張りの下に入ります。入力が 1 MiB を超える場合は委ねず、単独のエラーを出します
 - 単独へ戻る条件: 試しの接続ができない、検査が通らない、パッケージが違う、**常駐が応答の前に終わった（接続が切れた）**。つながって要求を送った後の時間切れは `limit_exceeded`（20）で、単独へは戻りません。待ちは 8 件までで、超えると `limit_exceeded`
 - 常駐の資源上限: 起動から自分の RSS と起動（読み込み）の時間を、単独の監督と同じ種類別の上限で見張ります（RSS 超過・読み込みの時間超過は exit 20 で終了）。判定がハード期限で止まったときは、その要求に `limit_exceeded` を返して終了します（待っていた要求は単独へ戻ります）

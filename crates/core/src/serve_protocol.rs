@@ -69,6 +69,10 @@ pub struct PackageIdentity {
     pub definition_sha256: String,
     /// 校正ファイルのバイト列。校正ファイルが無ければ `None`（JSON では null）。
     pub calibration_sha256: Option<String>,
+    /// 構成ファイルの配置の指紋（inode・サイズ・mtime・ctime など）を cli 側でまとめた sha256。
+    /// 計算は cli が行い、core は運んで照合するだけ。常駐の起動後にファイルが差し替えられたら
+    /// 値が変わり、委ねる側が気づいて単独に戻れる（REQ-39 の完全性）。
+    pub layout_sha256: String,
 }
 
 /// CLI から常駐への要求。
@@ -110,10 +114,15 @@ fn validate_request(r: &ServeRequest) -> Result<(), ProtocolError> {
         return Err(ProtocolError::TooManyShards);
     }
     let p = &r.package;
-    let all = [&p.onnx_sha256, &p.artifact_sha256, &p.definition_sha256]
-        .into_iter()
-        .chain(&p.shard_sha256)
-        .chain(p.calibration_sha256.as_ref());
+    let all = [
+        &p.onnx_sha256,
+        &p.artifact_sha256,
+        &p.definition_sha256,
+        &p.layout_sha256,
+    ]
+    .into_iter()
+    .chain(&p.shard_sha256)
+    .chain(p.calibration_sha256.as_ref());
     if all.into_iter().any(|h| !valid_sha256(h)) {
         return Err(ProtocolError::InvalidSha256);
     }
@@ -196,6 +205,7 @@ mod tests {
                 artifact_sha256: h('c'),
                 definition_sha256: h('d'),
                 calibration_sha256: None,
+                layout_sha256: h('f'),
             },
         }
     }
@@ -205,11 +215,12 @@ mod tests {
         let r = req("hi");
         let bytes = encode_request(&r);
         let expected = format!(
-            "{{\"id\":\"r1\",\"text\":\"hi\",\"package\":{{\"onnx_sha256\":\"{}\",\"shard_sha256\":[\"{}\"],\"artifact_sha256\":\"{}\",\"definition_sha256\":\"{}\",\"calibration_sha256\":null}}}}\n",
+            "{{\"id\":\"r1\",\"text\":\"hi\",\"package\":{{\"onnx_sha256\":\"{}\",\"shard_sha256\":[\"{}\"],\"artifact_sha256\":\"{}\",\"definition_sha256\":\"{}\",\"calibration_sha256\":null,\"layout_sha256\":\"{}\"}}}}\n",
             h('a'),
             h('b'),
             h('c'),
-            h('d')
+            h('d'),
+            h('f')
         );
         assert_eq!(bytes, expected.as_bytes());
         assert_eq!(decode_request(&bytes), Ok(r.clone()));
@@ -353,6 +364,12 @@ mod tests {
         );
         let mut r = req("t");
         r.package.artifact_sha256 = "a".repeat(10);
+        assert_eq!(
+            decode_request(&encode_request(&r)),
+            Err(ProtocolError::InvalidSha256)
+        );
+        let mut r = req("t");
+        r.package.layout_sha256 = "F".repeat(64);
         assert_eq!(
             decode_request(&encode_request(&r)),
             Err(ProtocolError::InvalidSha256)

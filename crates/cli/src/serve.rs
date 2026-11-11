@@ -5,7 +5,8 @@
 //! `main.rs` が `serve --package <dir>` を受けると [`run`] が前景で動き続ける。起動時に `infer` と同じ
 //! `prepare`（経路の閉じ込め・形式・sha256 の全量検証・モデルの読み込み）を 1 回だけ通し、得た推論
 //! パイプラインを保持して、`infer --text` の委ねる要求（[`crate::serve_client`]）を Unix ソケットで受ける。
-//! 読み込んだ後にファイルを差し替えても、判定はメモリ上の検証済みの内容で行う。
+//! 判定はメモリ上の検証済みの内容で行い、読み込み後にファイルが書き換わった・消えた場合は、委ねる側が配置の
+//! 指紋（[`crate::serve_layout`]）の不一致で検出して単独へ戻る。
 //!
 //! # 受け付けと判定
 //!
@@ -18,7 +19,8 @@
 //!   打ち切れない停止の見張りと常駐のメモリ上限は #709
 //! - 資源の上限: 起動から自分の RSS と起動（`prepare`）の時間を、単独の監督と同じ種類別の上限で見張る
 //!   （[`spawn_guard_thread`]）。ハード期限で計算スレッドを切り離したら、その要求に `limit_exceeded` を返して終える
-//! - ログ（stderr）に入力本文・判定結果は出さない（受け付け時刻・id・終了コードのみ）
+//! - ログ（stderr）に入力本文・判定結果は出さない（受け付け時刻・id・終了コードのみ）。書くのは専用スレッドで、
+//!   有界の待ち行列に `try_send` する（満杯なら捨てる）ため、stderr の詰まりで判定・応答が止まらない
 //!
 //! # 置き場所と権限（REQ-39）
 //!
@@ -33,9 +35,9 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +71,8 @@ const QUEUE_DEPTH: usize = 8;
 const MAX_CONNECTIONS: usize = 64;
 /// 要求 1 行を読み切るまでの合計の期限（遅送りで接続を占有されないため）。
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// 起動失敗の JSON を見張りのスレッドが書く場合に、main が終了を待つ上限。
+const STARTUP_ERROR_WAIT: Duration = Duration::from_secs(5);
 /// 資源の見張りの間隔（監督の RSS ポーリングと同程度）。
 const GUARD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// 応答の書き込みの期限。
@@ -191,9 +195,71 @@ fn remove_stale_socket(sock: &Path) -> Result<(), ErrorReport> {
     }
 }
 
-/// stderr へ 1 行（失敗は無視。本文・結果は渡さない）。
+/// ログ行の待ち行列（有界）。stderr が詰まっても判定・応答・終了処理が止まらないよう、書くのは専用スレッドだけで、
+/// 渡すときは `try_send` で満杯なら捨てる（ログの欠落は許し、常駐の動作を止めない）。
+static LOG_TX: OnceLock<SyncSender<String>> = OnceLock::new();
+/// 渡したがまだ書かれていない行の数（終了前の流し切りの待ちに使う）。
+static LOG_PENDING: AtomicUsize = AtomicUsize::new(0);
+/// ログ待ち行列の長さ。
+const LOG_QUEUE: usize = 64;
+/// 終了直前に、ログの流し切りを待つ上限。
+const LOG_DRAIN_WAIT: Duration = Duration::from_millis(200);
+
+/// ログ専用スレッドを起動する（`run` の最初）。起動できなければログは捨てる。
+fn init_logger() {
+    let (tx, rx) = mpsc::sync_channel::<String>(LOG_QUEUE);
+    let spawned = thread::Builder::new()
+        .name("serve-log".to_string())
+        .spawn(move || {
+            for line in rx {
+                let _ = writeln!(io::stderr(), "serve: {line}");
+                LOG_PENDING.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+    if spawned.is_ok() {
+        let _ = LOG_TX.set(tx);
+    }
+}
+
+/// stderr へ 1 行（本文・結果は渡さない）。待ち行列が満杯なら捨てる。
 fn log_line(msg: std::fmt::Arguments<'_>) {
-    let _ = writeln!(io::stderr(), "serve: {msg}");
+    if let Some(tx) = LOG_TX.get() {
+        LOG_PENDING.fetch_add(1, Ordering::SeqCst);
+        if tx.try_send(msg.to_string()).is_err() {
+            LOG_PENDING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// ログを（上限つきで）流し切ってから終了する。stderr が詰まっていても `LOG_DRAIN_WAIT` を超えて待たない。
+fn exit_with(code: ExitCode) -> ! {
+    let deadline = Instant::now() + LOG_DRAIN_WAIT;
+    while LOG_PENDING.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    std::process::exit(i32::from(code.code()))
+}
+
+/// 起動中に stdout へエラー JSON を書く権利（見張りのスレッドと main が両方 JSON を出さないよう、
+/// 先に取った側だけが書く）。
+static STDOUT_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+fn claim_stdout() -> bool {
+    !STDOUT_CLAIMED.swap(true, Ordering::SeqCst)
+}
+
+/// 起動失敗のエラーを stdout へ 1 回だけ書く。先に見張りのスレッドが書く（終了する）側なら、その終了を待つ。
+fn emit_startup_error<W: Write>(out: &mut W, report: &ErrorReport) -> io::Result<ExitCode> {
+    if claim_stdout() {
+        emit_error_report(out, report)
+    } else {
+        // 見張りのスレッドが終了させるまで待つ。stdout で詰まっても残り続けないよう、期限つき。
+        let deadline = Instant::now() + STARTUP_ERROR_WAIT;
+        while Instant::now() < deadline {
+            thread::park_timeout(Duration::from_millis(100));
+        }
+        exit_with(ExitCode::RuntimeError)
+    }
 }
 
 fn unix_secs() -> u64 {
@@ -240,16 +306,17 @@ fn limit_response() -> ServeResponse {
 /// # Errors
 /// `out` への書き込み失敗。
 pub fn run<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result<ExitCode> {
+    init_logger();
     // 起動時（`prepare` の前）から、単独の監督と同じ種類別の時間・RSS の上限で自分を見張る。
     let limits = peek_checked_kind(cwd, &args.package)
         .map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(k.as_str()));
     let loaded = Arc::new(AtomicBool::new(false));
     if spawn_guard_thread(limits, Arc::clone(&loaded)).is_err() {
-        return emit_error_report(out, &runtime("cannot start serve guard thread"));
+        return emit_startup_error(out, &runtime("cannot start serve guard thread"));
     }
     let (listener, prepared, _lock) = match start(args, cwd) {
         Ok(started) => started,
-        Err(report) => return emit_error_report(out, &report),
+        Err(report) => return emit_startup_error(out, &report),
     };
     loaded.store(true, Ordering::SeqCst);
     let identity = Arc::new(prepared.identity.clone());
@@ -259,7 +326,7 @@ pub fn run<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result<Ex
         .spawn(move || judge_loop(&rx, prepared))
         .is_err()
     {
-        return emit_error_report(out, &runtime("cannot start serve judge thread"));
+        return emit_startup_error(out, &runtime("cannot start serve judge thread"));
     }
     log_line(format_args!("ready"));
     let active = Arc::new(AtomicUsize::new(0));
@@ -363,7 +430,7 @@ fn respond(
         Err(TrySendError::Disconnected(_)) => {
             // 判定スレッドが死んだ常駐は続けても全件失敗するため、落として再起動に任せる（fail-closed）。
             log_line(format_args!("judge thread stopped; exiting"));
-            std::process::exit(i32::from(ExitCode::RuntimeError.code()));
+            exit_with(ExitCode::RuntimeError);
         }
     }
     reply_rx
@@ -437,9 +504,40 @@ fn judge_loop(rx: &mpsc::Receiver<Job>, prepared: Prepared) {
             // 常駐を終える（待っていた要求は EOF で単独へ戻る）。応答の書き出しを待つために少しだけ待つ。
             log_line(format_args!("judge stalled past the hard limit; exiting"));
             thread::sleep(Duration::from_millis(500));
-            std::process::exit(i32::from(ExitCode::LimitExceeded.code()));
+            exit_with(ExitCode::LimitExceeded);
         }
     }
+}
+
+/// RSS を読めずに終わる。起動中なら `runtime_error` の JSON を stdout に 1 回だけ出してから exit 70。
+fn runtime_exit(msg: &'static str, startup: bool) -> ! {
+    log_line(format_args!("{msg}"));
+    if startup && claim_stdout() {
+        let report = ErrorReport::new(
+            ExitCode::RuntimeError,
+            default_message(ExitCode::RuntimeError),
+        );
+        let _ = write_error_report(&mut io::stdout().lock(), &report);
+    }
+    exit_with(ExitCode::RuntimeError)
+}
+
+/// 上限超過で終わる。起動中（ソケットを作る前）なら `limit_exceeded` の JSON を stdout に 1 回だけ出す
+/// （先に取った側だけが書く。`STDOUT_CLAIMED`）。
+///
+/// 限界: 見張りが `claim_stdout` に負けた（main が起動失敗の JSON を書いている）場合、終了コードは
+/// 20 になり、main 側のコードとは一致しないことがある。競合は起動失敗と上限超過が同じ 50 ms 内に重なる
+/// ときだけで窓は狭く、どちらの場合も stdout の JSON は 1 つだけである。
+fn limit_exit(msg: &'static str, startup: bool) -> ! {
+    log_line(format_args!("{msg}"));
+    if startup && claim_stdout() {
+        let report = ErrorReport::new(
+            ExitCode::LimitExceeded,
+            default_message(ExitCode::LimitExceeded),
+        );
+        let _ = write_error_report(&mut io::stdout().lock(), &report);
+    }
+    exit_with(ExitCode::LimitExceeded)
 }
 
 /// 常駐自身の資源の見張り（約 50 ms ごと。REQ-39・#708）。上限は単独の監督と同じ種類別の値。
@@ -454,25 +552,16 @@ fn spawn_guard_thread(limits: SafetyLimits, loaded: Arc<AtomicBool>) -> io::Resu
         .spawn(move || {
             loop {
                 thread::sleep(GUARD_POLL_INTERVAL);
-                if !loaded.load(Ordering::SeqCst) && started.elapsed() > limits.time().get() {
-                    log_line(format_args!("startup time limit exceeded; exiting"));
-                    let report = ErrorReport::new(
-                        ExitCode::LimitExceeded,
-                        default_message(ExitCode::LimitExceeded),
-                    );
-                    let _ = write_error_report(&mut io::stdout().lock(), &report);
-                    std::process::exit(i32::from(ExitCode::LimitExceeded.code()));
+                let startup = !loaded.load(Ordering::SeqCst);
+                if startup && started.elapsed() > limits.time().get() {
+                    limit_exit("startup time limit exceeded; exiting", true);
                 }
                 match current_process_rss_bytes() {
                     Ok(Some(rss)) if rss > limits.memory().get() => {
-                        log_line(format_args!("memory limit exceeded; exiting"));
-                        std::process::exit(i32::from(ExitCode::LimitExceeded.code()));
+                        limit_exit("memory limit exceeded; exiting", startup);
                     }
                     Ok(_) => {}
-                    Err(_) => {
-                        log_line(format_args!("memory probe failed; exiting"));
-                        std::process::exit(i32::from(ExitCode::RuntimeError.code()));
-                    }
+                    Err(_) => runtime_exit("memory probe failed; exiting", startup),
                 }
             }
         })

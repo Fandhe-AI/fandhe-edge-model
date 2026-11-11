@@ -53,5 +53,6 @@ pub mod score_predictions;
 pub mod serve;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod serve_client;
+pub mod serve_layout;
 pub mod stage_output;
 pub mod stages;

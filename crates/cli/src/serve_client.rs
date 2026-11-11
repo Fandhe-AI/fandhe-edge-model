@@ -149,9 +149,6 @@ pub fn try_delegate_in<W: Write>(
         return Ok(Delegation::Standalone("cannot connect"));
     };
 
-    // 出力の書き込みの見張り（stdout が詰まっても止まらない。書き込み停止は exit 20）。
-    let _watchdog = OutputWatchdog::arm(true, MAX_INFER_BATCH_OUTPUT_DURATION)?;
-
     // 送った後は、時間切れ以外では単独へ戻らない。ただし応答の前に常駐が終わった（EOF・切断）なら
     // 読み込みが二重になる心配がないので単独へ戻す。
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -172,6 +169,9 @@ pub fn try_delegate_in<W: Write>(
         Ok(ServeResponse::Ok { exit_code, stdout }) => {
             match ExitCode::try_from(i32::from(exit_code)) {
                 Ok(code) => {
+                    // 出力の書き込みの見張りは、応答を受け取った後・書く直前に始める（stdout が詰まっても
+                    // 止まらない。書き込み停止は exit 20）。待っている間の時間は数えない。
+                    let _watchdog = OutputWatchdog::arm(true, MAX_INFER_BATCH_OUTPUT_DURATION)?;
                     out.write_all(stdout.as_bytes())?;
                     out.flush()?;
                     Ok(Delegation::Done(code))
@@ -203,6 +203,7 @@ fn failed<W: Write>(out: &mut W, e: &io::Error) -> io::Result<Delegation> {
             ExitCode::LimitExceeded,
             default_message(ExitCode::LimitExceeded),
         );
+        let _watchdog = OutputWatchdog::arm(true, MAX_INFER_BATCH_OUTPUT_DURATION)?;
         return emit_error_report(out, &report).map(Delegation::Done);
     }
     runtime_failed(out)
@@ -213,6 +214,7 @@ fn runtime_failed<W: Write>(out: &mut W) -> io::Result<Delegation> {
         ExitCode::RuntimeError,
         default_message(ExitCode::RuntimeError),
     );
+    let _watchdog = OutputWatchdog::arm(true, MAX_INFER_BATCH_OUTPUT_DURATION)?;
     emit_error_report(out, &report).map(Delegation::Done)
 }
 
