@@ -5451,6 +5451,53 @@ def test_run_bounded_stops_the_child_when_stdout_or_stderr_exceeds_the_cap(
     )
 
 
+def test_run_bounded_marks_child_may_remain_when_the_group_outlives_the_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39・#715: KILL 後にグループが消えたと確かめられなければ、印を立てて `unreaped`。"""
+    real_killpg = os.killpg
+
+    def killpg(pgid: int, sig: int) -> None:
+        if sig != 0:
+            real_killpg(pgid, sig)  # KILL は本当に送り、確認（シグナル 0）だけ「まだ居る」と答える
+
+    monkeypatch.setattr(mod, "_child_may_remain", False)
+    monkeypatch.setattr(mod, "REAP_WAIT_LIMIT_SECONDS", 0.2)
+    monkeypatch.setattr(mod.os, "killpg", killpg)
+    assert _bounded(tmp_path, "yes >&2")[0] == (None, "unreaped")
+    assert mod._child_may_remain is True
+
+
+@pytest.mark.parametrize("reap_group", [True, False])
+def test_run_cmd_waits_for_the_group_only_when_the_wrapper_killed_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reap_group: bool
+) -> None:
+    """REQ-39・#715: 正常終了でもラッパーが KILL したときだけ待つ。消えなければ `unreaped`。
+
+    `reap_group=False`（H の `GROUP_WRAPPER_NO_REAP`）では待たない。H は子孫を自分で確かめる。
+    """
+    calls: list[int] = []
+
+    def never_gone(pgid: int) -> bool:
+        calls.append(pgid)
+        return False
+
+    monkeypatch.setattr(mod, "_child_may_remain", False)
+    monkeypatch.setattr(mod, "_wait_group_gone", never_gone)
+    r = mod.run_cmd(
+        ["/bin/sh", "-c", "exit 0"], tmp_path, tmp_path / "o", tmp_path / "e", 5, 10, 10,
+        reap_group=reap_group,
+    )  # fmt: skip
+    if reap_group:
+        assert len(calls) == 1
+        assert (r.exit_code, r.reason) == (None, "unreaped")
+        assert mod._child_may_remain is True
+    else:
+        assert calls == []
+        assert (r.exit_code, r.reason) == (0, None)
+        assert mod._child_may_remain is False
+
+
 def test_run_bounded_reports_spawn_error(tmp_path: Path) -> None:
     """REQ-39: 実行できないコマンドは `spawn_error`。"""
     with open(tmp_path / "o", "wb") as fo, open(tmp_path / "e", "wb") as fe:
