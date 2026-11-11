@@ -81,7 +81,7 @@
 - 有効化: 値が `1` と完全一致するときだけ有効です。それ以外の値では、ファイルもディレクトリも作りません
 - 対象: `infer --text`（`--id` 付きを含む）のみです。`--input-file`（`--out` を含む）は残しません
 - 置き場所: 常駐と同じディレクトリ（既定 `$HOME/Library/Application Support/fandhe-edge/`、`FANDHE_EDGE_SERVE_DIR` で変更）の `history.jsonl` です。ディレクトリは 0700、ファイルは 0600 で作ります
-- 書かない条件: 置き場所が 0700 の実ディレクトリでない（symlink を含む）、`history.jsonl` が通常ファイルでない（symlink を含む）、group・other の権限がある、のいずれかに当たるときは書きません
+- 書かない条件: 置き場所が 0700 の実ディレクトリでない（symlink を含む）、`history.jsonl` が通常ファイルでない（symlink を含む）、group・other の権限がある、置き場所か `history.jsonl` の所有者が実行したユーザーでない、のいずれかに当たるときは書きません。当たったファイルは `history.jsonl.1` へ回すこともしません
 - 1 行の欄:
 
 | 欄 | 内容 |
@@ -95,7 +95,7 @@
 | `cli_version` | CLI の版 |
 
 - 常駐へ委ねた場合も単独の場合も、判定を行った `infer` が 1 行書きます。エラーの JSON を出して終わった場合も残ります
-- 上限 64 MiB を超えていたら、次の追記の前に `history.jsonl.1` へ回します。前の `history.jsonl.1` は置き換わります。消すには `history.jsonl` と `history.jsonl.1` を削除します
+- 上限 64 MiB を超えていたら、次の追記の前に `history.jsonl.1` へ回します。前の `history.jsonl.1` は置き換わります。回せないときは書きません。消すには `history.jsonl` と `history.jsonl.1` を削除します
 - 追記は `history.lock` の排他の下で行います。ロックは短く数回だけ試し、取れなければ書きません
 - 保存の失敗は無視します。stdout・stderr・終了コードは、有効でも無効でも変わりません
 - 限界: 時間・RSS の上限で監督が止めた判定は残りません。送信はしません（手元のファイルだけです）

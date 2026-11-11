@@ -268,6 +268,32 @@ fn history_refuses_unsafe_locations() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// REQ-39・#711: 置き場所を作った後にパス指定で権限を直さない。umask で 0700 にならなかった置き場所（0500）は
+/// そのまま残り、履歴は書かれず、stdout・終了コードは変わらない。
+#[test]
+fn history_does_not_chmod_created_dir() {
+    let (ws, dir) = (workspace("umask"), dir_for("umask"));
+    let off = baseline(&ws);
+    let out = Command::new("/bin/sh")
+        .args(["-c", "umask 277; exec \"$0\" \"$@\""])
+        .arg(env!("CARGO_BIN_EXE_fandhe-edge"))
+        .args(["infer", "--package", "c", "--text", "hello \"world\""])
+        .current_dir(&ws)
+        .env("FANDHE_EDGE_SERVE_DIR", &dir)
+        .env("FANDHE_EDGE_HISTORY", "1")
+        .env("FANDHE_EDGE_NO_SERVE", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!((out.status.code(), &out.stdout), (off.code, &off.stdout));
+    let mode = fs::metadata(&dir).expect("dir").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o500);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(fs::read_dir(&dir).expect("ls").count(), 0);
+    let _ = fs::remove_dir_all(&ws);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// 無効のときの結果（stdout・終了コード）。
 fn baseline(ws: &Path) -> Run {
     infer(ws, &dir_for("base"), None, true, "c")
