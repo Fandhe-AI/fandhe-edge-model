@@ -71,6 +71,8 @@ const QUEUE_DEPTH: usize = 8;
 const MAX_CONNECTIONS: usize = 64;
 /// 要求 1 行を読み切るまでの合計の期限（遅送りで接続を占有されないため）。
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// 判定スレッドの応答を待つ上限（待ち 8 件 + 判定中 1 件が最長のハード期限〔追加学習 60.5 秒〕で並んだ場合を覆う）。
+const REPLY_WAIT: Duration = Duration::from_secs(10 * 60);
 /// 起動失敗の JSON を見張りのスレッドが書く場合に、main が終了を待つ上限。
 const STARTUP_ERROR_WAIT: Duration = Duration::from_secs(5);
 /// 資源の見張りの間隔（監督の RSS ポーリングと同程度）。
@@ -244,6 +246,21 @@ fn exit_with(code: ExitCode) -> ! {
 /// 先に取った側だけが書く）。
 static STDOUT_CLAIMED: AtomicBool = AtomicBool::new(false);
 
+/// stdout への書き込みで止まっても、この時間でプロセスを終える保険（REQ-39）。
+const EXIT_WRITE_DEADLINE: Duration = Duration::from_secs(3);
+
+/// 終了直前に stdout へ同期で書く前に張る、上限つきの終了の保険。`EXIT_WRITE_DEADLINE` 後に同じ終了コードで
+/// プロセスを終える（出力先が詰まっていても有界時間内に終わる）。張れなければ `false`（書かずに終える）。
+fn arm_exit_deadline(code: ExitCode) -> bool {
+    thread::Builder::new()
+        .name("serve-exit".to_string())
+        .spawn(move || {
+            thread::sleep(EXIT_WRITE_DEADLINE);
+            std::process::exit(i32::from(code.code()));
+        })
+        .is_ok()
+}
+
 fn claim_stdout() -> bool {
     !STDOUT_CLAIMED.swap(true, Ordering::SeqCst)
 }
@@ -251,6 +268,10 @@ fn claim_stdout() -> bool {
 /// 起動失敗のエラーを stdout へ 1 回だけ書く。先に見張りのスレッドが書く（終了する）側なら、その終了を待つ。
 fn emit_startup_error<W: Write>(out: &mut W, report: &ErrorReport) -> io::Result<ExitCode> {
     if claim_stdout() {
+        // main が返ればプロセスは終わるが、書き込みで止まっても終われるよう保険を張る。張れなければ書かない。
+        if !arm_exit_deadline(report.code) {
+            return Ok(report.code);
+        }
         emit_error_report(out, report)
     } else {
         // 見張りのスレッドが終了させるまで待つ。stdout で詰まっても残り続けないよう、期限つき。
@@ -433,9 +454,12 @@ fn respond(
             exit_with(ExitCode::RuntimeError);
         }
     }
-    reply_rx
-        .recv()
-        .unwrap_or_else(|_| error_response(&runtime("serve judge failed")))
+    // 判定スレッドは必ず（ハード期限内に）返すが、無期限には待たない。
+    match reply_rx.recv_timeout(REPLY_WAIT) {
+        Ok(response) => response,
+        Err(mpsc::RecvTimeoutError::Timeout) => limit_response(),
+        Err(mpsc::RecvTimeoutError::Disconnected) => error_response(&runtime("serve judge failed")),
+    }
 }
 
 /// 判定スレッド: 保持した `Prepared` で 1 件ずつ順に判定する（`Pipeline` は呼び出し間で状態を持たない）。
@@ -512,7 +536,7 @@ fn judge_loop(rx: &mpsc::Receiver<Job>, prepared: Prepared) {
 /// RSS を読めずに終わる。起動中なら `runtime_error` の JSON を stdout に 1 回だけ出してから exit 70。
 fn runtime_exit(msg: &'static str, startup: bool) -> ! {
     log_line(format_args!("{msg}"));
-    if startup && claim_stdout() {
+    if startup && claim_stdout() && arm_exit_deadline(ExitCode::RuntimeError) {
         let report = ErrorReport::new(
             ExitCode::RuntimeError,
             default_message(ExitCode::RuntimeError),
@@ -530,7 +554,7 @@ fn runtime_exit(msg: &'static str, startup: bool) -> ! {
 /// ときだけで窓は狭く、どちらの場合も stdout の JSON は 1 つだけである。
 fn limit_exit(msg: &'static str, startup: bool) -> ! {
     log_line(format_args!("{msg}"));
-    if startup && claim_stdout() {
+    if startup && claim_stdout() && arm_exit_deadline(ExitCode::LimitExceeded) {
         let report = ErrorReport::new(
             ExitCode::LimitExceeded,
             default_message(ExitCode::LimitExceeded),

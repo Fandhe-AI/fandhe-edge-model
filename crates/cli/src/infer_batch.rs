@@ -856,6 +856,23 @@ where
     W: Write,
     T: Send + 'static,
 {
+    run_with_stall_guard_flagged(out, duration, output_duration, policy, &mut false, work)
+}
+
+/// [`run_with_stall_guard`] に、期限超過で計算スレッドを切り離したかを `detached` へ返す口を足したもの。
+/// スレッドを起動できなかった・panic した場合は、残る計算が無いので切り離しではない（偽のまま。#708）。
+pub(crate) fn run_with_stall_guard_flagged<W, T>(
+    out: &mut W,
+    duration: Duration,
+    output_duration: Duration,
+    policy: StallPolicy,
+    detached: &mut bool,
+    work: impl FnOnce() -> Result<T, ErrorReport> + Send + 'static,
+) -> Result<T, ErrorReport>
+where
+    W: Write,
+    T: Send + 'static,
+{
     let deadline = Instant::now().checked_add(duration);
     let (tx, rx) = mpsc::channel();
     let spawned = thread::Builder::new()
@@ -874,6 +891,7 @@ where
         Ok(outcome) => outcome,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let outcome: Result<T, ErrorReport> = Err(report(ExitCode::LimitExceeded));
+            *detached = true;
             if policy.terminates() {
                 let watchdog = OutputWatchdog::arm(true, output_duration);
                 std::process::exit(finish_abandoned(out, &outcome, watchdog));
@@ -1069,26 +1087,20 @@ where
     let hard = cooperative.saturating_add(SINGLE_HARD_LIMIT_GRACE);
     let worker_options = options.to_vec();
     let worker_scope = scope.clone();
-    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let finished_in_worker = Arc::clone(&finished);
-    let outcome = run_with_stall_guard(out, hard, limits.output_duration, policy, move || {
-        // 推論側へ渡すのは `input` のみ（REQ-27）。
-        let result = pipeline
-            .infer_one_within(input.input(), cooperative)
-            .map_err(|e| e.to_error_report())
-            .and_then(|prediction| {
-                judgment_from_prediction_scoped(
-                    &worker_options,
-                    &worker_scope,
-                    input.id(),
-                    &prediction,
-                )
-            });
-        finished_in_worker.store(true, std::sync::atomic::Ordering::SeqCst);
-        result
-    });
-    // 戻ってきたのに計算が終わっていない = 期限で切り離した（スレッドを起動できなかった場合も含め fail-closed）。
-    *detached = !finished.load(std::sync::atomic::Ordering::SeqCst);
+    let outcome = run_with_stall_guard_flagged(
+        out,
+        hard,
+        limits.output_duration,
+        policy,
+        detached,
+        move || {
+            // 推論側へ渡すのは `input` のみ（REQ-27）。
+            let prediction = pipeline
+                .infer_one_within(input.input(), cooperative)
+                .map_err(|e| e.to_error_report())?;
+            judgment_from_prediction_scoped(&worker_options, &worker_scope, input.id(), &prediction)
+        },
+    );
     // 書き込みの停止も期限でプロセス終了へ倒す（バッチと同じ見張り）。
     let _watchdog = OutputWatchdog::arm(policy.terminates(), limits.output_duration)?;
     match outcome {
