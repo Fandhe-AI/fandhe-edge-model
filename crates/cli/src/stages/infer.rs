@@ -138,7 +138,8 @@ pub(crate) struct Prepared {
     /// 一括推論の全体上限（`kind` 別。既存 3 種 600 秒・追加学習 1500 秒。REQ-39・REQ-41・#662）。
     batch_time: Duration,
     /// 読み込んだ内容の同一性（`artifact.json` の記録。ONNX は保持バイト列と、shard は読み込み時の照合と
-    /// 一致済み）。常駐が自分のパッケージを名乗るのに使う（#708）。
+    /// 一致済み）。常駐が自分のパッケージを名乗るのに使う（#708。serve は Linux・macOS 限定）。
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     pub(crate) identity: PackageIdentity,
 }
 
@@ -177,6 +178,7 @@ pub(crate) fn package_identity(
 ///
 /// # Errors
 /// 読み込み・解析の失敗（呼び出し側は委ねずに単独へ戻す）。
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(crate) fn light_package_identity(
     checked: &crate::infer_guard::PathFormatCheckedInputs,
     meta: &ArtifactMeta,

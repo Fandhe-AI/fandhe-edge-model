@@ -379,7 +379,8 @@ pub(crate) enum StallPolicy {
     TerminateProcess,
     /// 常駐プロセス（`serve`。#708）用。期限超過でもプロセスを終えず、`limit_exceeded` を結果として返す。
     /// 切り離した計算スレッドは残りうる（協調的に打ち切れない停止の見張りは #709）。出力先はメモリ上の
-    /// `Vec<u8>` のみで書き込みは停止しない。
+    /// `Vec<u8>` のみで書き込みは停止しない。serve は Linux・macOS 限定のため、他の OS では使われない。
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Resident,
     /// 回収しない（切り離したスレッド・停止した書き込みが残りうる）。ユニットテスト専用。
     #[cfg(test)]
@@ -939,6 +940,8 @@ where
 /// 常駐プロセス（`serve`。#708）用の単件推論。単独の [`emit_infer_single_scoped`] と同じ組み立てで
 /// 1 行の JSON を `Vec<u8>` へ書き、`(stdout のバイト列, 終了コード)` を返す。期限超過はプロセスを
 /// 終えずに `limit_exceeded`（exit 20）の結果として返す（REQ-21・REQ-33・REQ-39）。
+/// serve は Linux・macOS 限定のため、他の OS では使われない。
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(crate) fn infer_single_to_bytes<P, B>(
     call: SingleCall<'_>,
     pipeline: Arc<InferencePipeline<P, B>>,

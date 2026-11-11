@@ -137,6 +137,8 @@ impl Server {
         panic!("serve did not become ready");
     }
 
+    /// `lsof` の確認（macOS のみ）で使う。
+    #[cfg(target_os = "macos")]
     fn pid(&self) -> u32 {
         self.child.as_ref().expect("child").id()
     }
