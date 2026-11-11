@@ -407,6 +407,10 @@ fn launch<W: Write>(
                 if std::env::var_os(crate::serve::NO_SERVE_ENV).is_some() {
                     cmd = cmd.env(crate::serve::NO_SERVE_ENV, "1");
                 }
+                // 判定履歴の有効化（#711）。書くのは worker の `run` なので、有効のときだけ渡す。
+                if std::env::var_os(crate::infer_history::HISTORY_ENV).is_some_and(|v| v == "1") {
+                    cmd = cmd.env(crate::infer_history::HISTORY_ENV, "1");
+                }
             }
             Ok((cmd, config))
         });

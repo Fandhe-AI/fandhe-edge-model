@@ -44,6 +44,8 @@ pub mod frozen_dir;
 pub mod held_ledger_dir;
 pub mod infer_batch;
 pub mod infer_guard;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod infer_history;
 pub mod infer_supervisor;
 pub mod log;
 pub mod output;

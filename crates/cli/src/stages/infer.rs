@@ -244,9 +244,27 @@ pub(crate) fn light_package_identity(
 
 /// `infer` を実行し、結果（または `ErrorReport`）を `out` へ書く。
 ///
+/// `FANDHE_EDGE_HISTORY=1` で `--text` のときだけ、終えた後に判定履歴を 1 行追記する
+/// （既定は無効。入力の全文が手元の `history.jsonl` に残る。常駐経由でも単独でも、ここ 1 か所。
+/// 履歴の失敗は捨て、出力・終了コードは変えない。`--input-file` は対象外。
+/// [`crate::infer_history`]。#711・REQ-33・REQ-38・REQ-39）。
+///
 /// # Errors
 /// `out` への書き込み失敗（呼び出し側は exit 70 に写し、追加の出力をしない）。
 pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<ExitCode> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(started) = crate::infer_history::begin(args) {
+        let mut tee = crate::infer_history::Tee::new(out);
+        let code = run_inner(&mut tee, args, cwd)?;
+        // 判定の出力を先に届けてから履歴を書く。flush の失敗は run の失敗と同じ扱いで、履歴は書かない。
+        tee.flush()?;
+        crate::infer_history::record(args, started, &tee.captured, code);
+        return Ok(code);
+    }
+    run_inner(out, args, cwd)
+}
+
+fn run_inner<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<ExitCode> {
     // 常駐へ委ねる（#708）。監督下の worker の中で行い、検査・ハッシュ・往復・書き込みを監督の上限の下に置く。
     // 委ねられなければ（単独へ戻る）続きの経路をそのまま通る。
     #[cfg(any(target_os = "linux", target_os = "macos"))]
