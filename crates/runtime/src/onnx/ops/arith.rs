@@ -1220,13 +1220,17 @@ mod tests {
         let a = t(&[4, k], vec![1.0; 4 * k]);
         let w = t(&[4, k], vec![1.0; 4 * k]);
         let calls = AtomicUsize::new(0);
+        // 期限は十分先に置き（負荷で最初のブロックの前に切れない）、最初の展開の中で期限を過ぎるまで待つ
+        let until = Instant::now().checked_add(std::time::Duration::from_millis(500));
+        let deadline = until.expect("deadline fits in Instant");
         let to_f32 = |v: f32| {
             if calls.fetch_add(1, Ordering::Relaxed) == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                while Instant::now() <= deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
             v
         };
-        let until = Instant::now().checked_add(std::time::Duration::from_millis(5));
         assert_eq!(
             gemm_trans_b_with(Some(1), &a, &w, None, to_f32, until),
             Err(OpError::DeadlineExceeded)
