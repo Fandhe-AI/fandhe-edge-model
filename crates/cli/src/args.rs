@@ -44,10 +44,12 @@ pub enum Subcommand {
     Select,
     Package,
     Infer,
+    /// 常駐プロセス（#708）。7 工程の契約の外にあり、[`Subcommand::ALL`] と top-level の help には含めない。
+    Serve,
 }
 
 impl Subcommand {
-    /// 工程順の全サブコマンド。
+    /// 工程順の全サブコマンド（7 工程。`serve` は含めない。REQ-33）。
     pub const ALL: [Subcommand; 7] = [
         Subcommand::Register,
         Subcommand::Inspect,
@@ -68,11 +70,15 @@ impl Subcommand {
             Subcommand::Select => "select",
             Subcommand::Package => "package",
             Subcommand::Infer => "infer",
+            Subcommand::Serve => "serve",
         }
     }
 
     fn from_name(name: &str) -> Option<Subcommand> {
-        Subcommand::ALL.into_iter().find(|s| s.name() == name)
+        Subcommand::ALL
+            .into_iter()
+            .chain([Subcommand::Serve])
+            .find(|s| s.name() == name)
     }
 
     const fn summary(self) -> &'static str {
@@ -84,6 +90,7 @@ impl Subcommand {
             Subcommand::Select => "Select a candidate",
             Subcommand::Package => "Build a distribution package",
             Subcommand::Infer => "Run inference with a package",
+            Subcommand::Serve => "Keep a package loaded and serve infer requests locally",
         }
     }
 }
@@ -243,6 +250,12 @@ const EVALUATE_OPTS: &[OptSpec] = &[
         "Evaluated project of the same candidate trained with another seed (repeatable; at least 2 for a reproducibility check)",
     ),
 ];
+const SERVE_OPTS: &[OptSpec] = &[opt(
+    "--package",
+    "PATH",
+    true,
+    "Path to the package to serve",
+)];
 const INFER_OPTS: &[OptSpec] = &[
     opt("--package", "PATH", true, "Path to the package"),
     opt(
@@ -291,6 +304,7 @@ pub const fn options(sub: Subcommand) -> &'static [OptSpec] {
         Subcommand::Train => TRAIN_OPTS,
         Subcommand::Evaluate => EVALUATE_OPTS,
         Subcommand::Infer => INFER_OPTS,
+        Subcommand::Serve => SERVE_OPTS,
     }
 }
 
@@ -410,6 +424,12 @@ pub struct InferArgs {
     pub version: Option<InferVersion>,
 }
 
+/// `serve` の引数（#708）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeArgs {
+    pub package: PathBuf,
+}
+
 /// 解析済みのコマンド。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -426,6 +446,8 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     Run(Command),
+    /// 常駐プロセス（7 工程の `Command` には入れない。#708）。
+    Serve(ServeArgs),
     Help(Option<Subcommand>),
 }
 
@@ -640,6 +662,11 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, Ar
         if !values.iter().any(|(n, _)| *n == spec.name) {
             return Err(ArgsError::MissingRequired { option: spec.name });
         }
+    }
+    if sub == Subcommand::Serve {
+        return Ok(Invocation::Serve(ServeArgs {
+            package: Values(values).path("--package")?,
+        }));
     }
     build(sub, values).map(Invocation::Run)
 }
@@ -937,6 +964,8 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
             allow_smoke: v.take("--allow-smoke").is_some(),
             previous_project_dir: v.opt_path("--previous-project-dir"),
         }),
+        // `serve` は `parse` が `build` の前に分岐するため、ここへは来ない。
+        Subcommand::Serve => return Err(ArgsError::UnknownSubcommand),
         Subcommand::Infer => {
             let package = v.path("--package")?;
             let text = v.opt_string("--text")?;
@@ -1013,6 +1042,26 @@ pub fn render_help(topic: Option<Subcommand>) -> String {
 mod tests {
     //! REQ-33・TASK-33.1-1 のパーサ検証。
     use super::*;
+
+    /// #708: `serve` は 7 工程の `ALL` に入らず、`--package` 必須の別の入口として解析される。
+    #[test]
+    fn serve_is_parsed_outside_the_seven_stages() {
+        assert_eq!(Subcommand::ALL.len(), 7);
+        assert!(!Subcommand::ALL.contains(&Subcommand::Serve));
+        assert_eq!(
+            p(&["serve", "--package", "pkg"]),
+            Ok(Invocation::Serve(ServeArgs {
+                package: PathBuf::from("pkg")
+            }))
+        );
+        assert_eq!(
+            p(&["serve"]),
+            Err(ArgsError::MissingRequired {
+                option: "--package"
+            })
+        );
+        assert!(!render_help(None).contains("serve"));
+    }
 
     fn p(args: &[&str]) -> Result<Invocation, ArgsError> {
         parse(args.iter().map(OsString::from))

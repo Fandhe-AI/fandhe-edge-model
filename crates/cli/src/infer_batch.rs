@@ -377,6 +377,10 @@ impl Default for BatchLimits {
 pub(crate) enum StallPolicy {
     /// プロセスの終了で回収する（CLI の 1 呼び出し 1 プロセス）。
     TerminateProcess,
+    /// 常駐プロセス（`serve`。#708）用。期限超過でもプロセスを終えず、`limit_exceeded` を結果として返す。
+    /// 切り離した計算スレッドは残りうる（協調的に打ち切れない停止の見張りは #709）。出力先はメモリ上の
+    /// `Vec<u8>` のみで書き込みは停止しない。
+    Resident,
     /// 回収しない（切り離したスレッド・停止した書き込みが残りうる）。ユニットテスト専用。
     #[cfg(test)]
     Leak,
@@ -386,6 +390,7 @@ impl StallPolicy {
     pub(crate) const fn terminates(self) -> bool {
         match self {
             Self::TerminateProcess => true,
+            Self::Resident => false,
             #[cfg(test)]
             Self::Leak => false,
         }
@@ -929,6 +934,32 @@ where
         },
         StallPolicy::TerminateProcess,
     )
+}
+
+/// 常駐プロセス（`serve`。#708）用の単件推論。単独の [`emit_infer_single_scoped`] と同じ組み立てで
+/// 1 行の JSON を `Vec<u8>` へ書き、`(stdout のバイト列, 終了コード)` を返す。期限超過はプロセスを
+/// 終えずに `limit_exceeded`（exit 20）の結果として返す（REQ-21・REQ-33・REQ-39）。
+pub(crate) fn infer_single_to_bytes<P, B>(
+    call: SingleCall<'_>,
+    pipeline: Arc<InferencePipeline<P, B>>,
+) -> io::Result<(Vec<u8>, ExitCode)>
+where
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    let duration = call.duration;
+    let mut buf = Vec::new();
+    let code = emit_infer_single_inner(
+        &mut buf,
+        pipeline,
+        call,
+        BatchLimits {
+            duration,
+            ..default_single_limits()
+        },
+        StallPolicy::Resident,
+    )?;
+    Ok((buf, code))
 }
 
 /// [`emit_infer_single`] の上限を指定できる版。停止の回収は常にプロセス終了（CLI の 1 呼び出し

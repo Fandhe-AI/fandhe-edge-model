@@ -72,5 +72,6 @@ pub mod judgment;
 pub mod limits;
 pub mod package_calibration;
 pub mod rebuild;
+pub mod serve_protocol;
 pub mod stage_report;
 pub mod version_ledger_record;

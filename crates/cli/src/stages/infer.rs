@@ -59,6 +59,7 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::{Sha256Digest, Sha256Stream};
 use fandhe_edge_core::package_calibration::{PACKAGE_CALIBRATION_FILE, PackageCalibration};
+use fandhe_edge_core::serve_protocol::PackageIdentity;
 use fandhe_edge_core::stage_report::InferBatchReport;
 use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
@@ -105,7 +106,7 @@ pub(crate) fn kind_version_allowed(kind: ModelKind, version: u32) -> bool {
 }
 
 /// `--id` を省略した `--text` の入力 ID。
-const DEFAULT_TEXT_ID: &str = "input";
+pub(crate) const DEFAULT_TEXT_ID: &str = "input";
 
 /// 入力表現ごとの前処理（byte は c1・c3、tokenizer は `qwen2_lora`。REQ-41・#626）。
 ///
@@ -126,16 +127,83 @@ impl Preprocessor for InferPreprocessor {
 
 pub(crate) type Pipeline = InferencePipeline<InferPreprocessor, OnnxBackend>;
 
-/// 検査を通過したパッケージから組み立てた推論の準備。
-struct Prepared {
-    definition: Definition,
-    pipeline: Pipeline,
+/// 検査を通過したパッケージから組み立てた推論の準備。常駐プロセス（`serve`。#708）も保持して使う。
+pub(crate) struct Prepared {
+    pub(crate) definition: Definition,
+    pub(crate) pipeline: Pipeline,
     /// 定義の対象外ラベルとパッケージの校正（REQ-22・#478・#497）。
-    scope: JudgmentScope,
+    pub(crate) scope: JudgmentScope,
     /// 単件推論の協調的な期限（`kind` 別の安全上限の時間。REQ-39・TASK-41.8・#435）。
-    single_time: Duration,
+    pub(crate) single_time: Duration,
     /// 一括推論の全体上限（`kind` 別。既存 3 種 600 秒・追加学習 1500 秒。REQ-39・REQ-41・#662）。
     batch_time: Duration,
+    /// 読み込んだ内容の同一性（`artifact.json` の記録。ONNX は保持バイト列と、shard は読み込み時の照合と
+    /// 一致済み）。常駐が自分のパッケージを名乗るのに使う（#708）。
+    pub(crate) identity: PackageIdentity,
+}
+
+/// `artifact.json` の記録からパッケージの同一性（ONNX と外部データ shard の sha256）を作る。
+/// 委ねる側（軽い検査）と常駐（起動時の全量検証後）が同じ規則で作る（REQ-39・#708）。
+///
+/// # Errors
+/// tokenizer 表現の `qwen2_lora` で外部データ欄が不正なとき（`invalid_input`）。
+pub(crate) fn package_identity(
+    meta: &ArtifactMeta,
+    meta_bytes: &[u8],
+    def_bytes: &[u8],
+    calibration_sha256: Option<String>,
+) -> Result<PackageIdentity, ErrorReport> {
+    let shard_sha256 = if is_tokenizer_qwen2(meta) {
+        TokenizerPackageRefs::parse(meta_bytes)
+            .map_err(|e| e.to_error_report())?
+            .external_data
+            .iter()
+            .map(|e| e.sha256.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(PackageIdentity {
+        onnx_sha256: meta.onnx_sha256().to_string(),
+        shard_sha256,
+        artifact_sha256: Sha256Digest::of_bytes(meta_bytes).to_hex(),
+        definition_sha256: Sha256Digest::of_bytes(def_bytes).to_hex(),
+        calibration_sha256,
+    })
+}
+
+/// 委ねる側（軽い検査）の同一性。`artifact.json`（ガードが読んだバイト列）・`definition.json`・校正ファイルを
+/// 閉じ込めたパッケージから上限つきで読み、実体のバイト列から作る（shard の実体は読まない。#708）。
+///
+/// # Errors
+/// 読み込み・解析の失敗（呼び出し側は委ねずに単独へ戻す）。
+pub(crate) fn light_package_identity(
+    checked: &crate::infer_guard::PathFormatCheckedInputs,
+    meta: &ArtifactMeta,
+) -> Result<PackageIdentity, ErrorReport> {
+    let (def_file, def_path) = checked
+        .package
+        .open_member(Path::new(DEFINITION_FILE))
+        .map_err(|e| e.to_error_report())?;
+    let def_bytes = read_bounded_open_file(def_file, def_path.as_path(), MAX_DEFINITION_FILE_BYTES)
+        .map_err(|e| fs_report(&e))?;
+    let calibration = match checked
+        .package
+        .open_member(Path::new(PACKAGE_CALIBRATION_FILE))
+    {
+        Ok((file, path)) => {
+            let bytes = read_bounded_open_file(file, path.as_path(), MAX_DEFINITION_FILE_BYTES)
+                .map_err(|e| fs_report(&e))?;
+            Some(Sha256Digest::of_bytes(&bytes).to_hex())
+        }
+        Err(PathRejection::Unresolvable { source, .. })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            None
+        }
+        Err(e) => return Err(e.to_error_report()),
+    };
+    package_identity(meta, &checked.meta_bytes, &def_bytes, calibration)
 }
 
 /// `infer` を実行し、結果（または `ErrorReport`）を `out` へ書く。
@@ -425,7 +493,7 @@ pub(crate) fn load_backend(
 }
 
 /// 経路・形式・自己整合性を検査し、推論パイプラインを組み立てる。
-fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
+pub(crate) fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
     let checked = check_infer_path_and_format(cwd, args)?;
 
     // ガードが検査（`--version-ledger` があれば台帳と照合）したバイト列そのものを解析する
@@ -505,10 +573,18 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
         calibration,
     };
+    // 校正は上で記録の sha256 との一致を確かめ済み（ファイルの有無も記録と一致）。
+    let identity = package_identity(
+        &meta,
+        &checked.meta_bytes,
+        &def_bytes,
+        meta.calibration_sha256().map(str::to_string),
+    )?;
     Ok(Prepared {
         definition,
         pipeline,
         scope,
+        identity,
         single_time: safety_limits_for_kind(checked.kind.as_str()).time().get(),
         batch_time: safety_limits_for_kind(checked.kind.as_str()).batch_duration(),
     })
