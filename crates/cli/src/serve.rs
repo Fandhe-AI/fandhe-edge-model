@@ -16,6 +16,8 @@
 //!   順に行う。満杯なら即座に単独と同じ形の `limit_exceeded`（exit 20）を返す
 //! - 期限超過はプロセスを終えずに `limit_exceeded` として返す（`StallPolicy::Resident`）。協調的に
 //!   打ち切れない停止の見張りと常駐のメモリ上限は #709
+//! - 資源の上限: 起動から自分の RSS と起動（`prepare`）の時間を、単独の監督と同じ種類別の上限で見張る
+//!   （[`spawn_guard_thread`]）。ハード期限で計算スレッドを切り離したら、その要求に `limit_exceeded` を返して終える
 //! - ログ（stderr）に入力本文・判定結果は出さない（受け付け時刻・id・終了コードのみ）
 //!
 //! # 置き場所と権限（REQ-39）
@@ -32,7 +34,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,11 +43,14 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::serve_protocol::{
     MAX_REQUEST_LINE_BYTES, PackageIdentity, ServeResponse, decode_request, encode_response,
 };
+use fandhe_edge_guard::resource::{
+    SafetyLimits, current_process_rss_bytes, safety_limits_for_kind,
+};
 
 use crate::args::{InferArgs, InferSource, ServeArgs};
 use crate::error_report::{default_message, emit_error_report};
 use crate::infer_batch::{SINGLE_HARD_LIMIT_GRACE, SingleCall, infer_single_to_bytes};
-use crate::infer_supervisor::SUPERVISOR_GRACE;
+use crate::infer_guard::peek_checked_kind;
 use crate::output::write_error_report;
 use crate::project::{invalid, runtime};
 use crate::stages::infer::{DEFAULT_TEXT_ID, Prepared, prepare};
@@ -64,6 +69,8 @@ const QUEUE_DEPTH: usize = 8;
 const MAX_CONNECTIONS: usize = 64;
 /// 要求 1 行を読み切るまでの合計の期限（遅送りで接続を占有されないため）。
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// 資源の見張りの間隔（監督の RSS ポーリングと同程度）。
+const GUARD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// 応答の書き込みの期限。
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -233,10 +240,18 @@ fn limit_response() -> ServeResponse {
 /// # Errors
 /// `out` への書き込み失敗。
 pub fn run<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result<ExitCode> {
+    // 起動時（`prepare` の前）から、単独の監督と同じ種類別の時間・RSS の上限で自分を見張る。
+    let limits = peek_checked_kind(cwd, &args.package)
+        .map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(k.as_str()));
+    let loaded = Arc::new(AtomicBool::new(false));
+    if spawn_guard_thread(limits, Arc::clone(&loaded)).is_err() {
+        return emit_error_report(out, &runtime("cannot start serve guard thread"));
+    }
     let (listener, prepared, _lock) = match start(args, cwd) {
         Ok(started) => started,
         Err(report) => return emit_error_report(out, &report),
     };
+    loaded.store(true, Ordering::SeqCst);
     let identity = Arc::new(prepared.identity.clone());
     let (tx, rx) = mpsc::sync_channel::<Job>(QUEUE_DEPTH);
     if thread::Builder::new()
@@ -375,10 +390,9 @@ fn judge_loop(rx: &mpsc::Receiver<Job>, prepared: Prepared) {
         {
             thread::sleep(Duration::from_millis(ms));
         }
-        // 委ねる側の読みタイムアウトと同じ式。過ぎた要求は相手がもう諦めているので判定せず次へ。
-        let budget = single_time
-            .saturating_add(SINGLE_HARD_LIMIT_GRACE)
-            .saturating_add(SUPERVISOR_GRACE);
+        // 委ねる側の読みの期限（`time + SINGLE_HARD_LIMIT_GRACE`）と同じ式。過ぎた要求は相手がもう
+        // 諦めているので判定せず次へ。
+        let budget = single_time.saturating_add(SINGLE_HARD_LIMIT_GRACE);
         if job.accepted_at.elapsed() > budget {
             let _ = job.reply.send(limit_response());
             continue;
@@ -391,12 +405,16 @@ fn judge_loop(rx: &mpsc::Receiver<Job>, prepared: Prepared) {
             text: &job.text,
             duration: single_time,
         };
+        let mut detached = false;
         let response = match infer_single_to_bytes(call, Arc::clone(&pipeline)) {
-            Ok((buf, code)) => match String::from_utf8(buf) {
-                Ok(stdout) => ServeResponse::Ok {
-                    exit_code: code.code(),
-                    stdout,
-                },
+            Ok((buf, code, was_detached)) => match String::from_utf8(buf) {
+                Ok(stdout) => {
+                    detached = was_detached;
+                    ServeResponse::Ok {
+                        exit_code: code.code(),
+                        stdout,
+                    }
+                }
                 Err(_) => error_response(&runtime("serve judge failed")),
             },
             Err(_) => error_response(&runtime("serve judge failed")),
@@ -414,7 +432,51 @@ fn judge_loop(rx: &mpsc::Receiver<Job>, prepared: Prepared) {
             ));
         }
         let _ = job.reply.send(response);
+        if detached {
+            // ハード期限で計算スレッドを切り離した。積み上げないよう、この要求に `limit_exceeded` を返した後に
+            // 常駐を終える（待っていた要求は EOF で単独へ戻る）。応答の書き出しを待つために少しだけ待つ。
+            log_line(format_args!("judge stalled past the hard limit; exiting"));
+            thread::sleep(Duration::from_millis(500));
+            std::process::exit(i32::from(ExitCode::LimitExceeded.code()));
+        }
     }
+}
+
+/// 常駐自身の資源の見張り（約 50 ms ごと。REQ-39・#708）。上限は単独の監督と同じ種類別の値。
+/// - 起動（`prepare`）が `limits.time()` を過ぎても終わらなければ、ソケットを作る前に `limit_exceeded`
+///   （exit 20）の JSON を出して終わる
+/// - RSS が `limits.memory()` を超えたら stderr に 1 行出して exit 20（判定中の要求のクライアントは EOF で単独へ戻る）。
+///   RSS を読めなければ fail-closed で exit 70
+fn spawn_guard_thread(limits: SafetyLimits, loaded: Arc<AtomicBool>) -> io::Result<()> {
+    let started = Instant::now();
+    thread::Builder::new()
+        .name("serve-guard".to_string())
+        .spawn(move || {
+            loop {
+                thread::sleep(GUARD_POLL_INTERVAL);
+                if !loaded.load(Ordering::SeqCst) && started.elapsed() > limits.time().get() {
+                    log_line(format_args!("startup time limit exceeded; exiting"));
+                    let report = ErrorReport::new(
+                        ExitCode::LimitExceeded,
+                        default_message(ExitCode::LimitExceeded),
+                    );
+                    let _ = write_error_report(&mut io::stdout().lock(), &report);
+                    std::process::exit(i32::from(ExitCode::LimitExceeded.code()));
+                }
+                match current_process_rss_bytes() {
+                    Ok(Some(rss)) if rss > limits.memory().get() => {
+                        log_line(format_args!("memory limit exceeded; exiting"));
+                        std::process::exit(i32::from(ExitCode::LimitExceeded.code()));
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        log_line(format_args!("memory probe failed; exiting"));
+                        std::process::exit(i32::from(ExitCode::RuntimeError.code()));
+                    }
+                }
+            }
+        })
+        .map(|_| ())
 }
 
 #[cfg(test)]

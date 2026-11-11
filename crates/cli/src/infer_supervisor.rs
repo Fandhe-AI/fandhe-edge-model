@@ -397,6 +397,17 @@ fn launch<W: Write>(
             for a in raw_args {
                 cmd = cmd.arg(a);
             }
+            // worker の環境は `env_clear` 済みのため、常駐への委譲（#708）に要る置き場所と無効化の指定だけを
+            // 親が解決して明示的に渡す（`HOME` は渡さない）。
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if workload == Workload::Inference {
+                if let Some(dir) = crate::serve::serve_dir() {
+                    cmd = cmd.env(crate::serve::SERVE_DIR_ENV, dir);
+                }
+                if std::env::var_os(crate::serve::NO_SERVE_ENV).is_some() {
+                    cmd = cmd.env(crate::serve::NO_SERVE_ENV, "1");
+                }
+            }
             Ok((cmd, config))
         });
     match prepared {

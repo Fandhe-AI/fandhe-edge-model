@@ -22,12 +22,8 @@ use fandhe_edge_cli::infer_supervisor;
 use fandhe_edge_cli::output::write_error_report;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use fandhe_edge_cli::serve;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use fandhe_edge_cli::serve_client::{self, Delegation};
 use fandhe_edge_cli::stages;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::io::Write;
 
 fn main() -> std::process::ExitCode {
     let report = match args::parse(std::env::args_os().skip(1)) {
@@ -40,7 +36,7 @@ fn main() -> std::process::ExitCode {
                     "cannot resolve working directory",
                 ));
             };
-            return match serve::run(&mut std::io::stdout().lock(), &serve_args, &cwd) {
+            return match serve::run(&mut std::io::stdout(), &serve_args, &cwd) {
                 Ok(code) => code.into(),
                 Err(_) => ExitCode::RuntimeError.into(),
             };
@@ -57,23 +53,7 @@ fn main() -> std::process::ExitCode {
                     "cannot resolve working directory",
                 ));
             };
-            // 常駐へ委ねられるなら、監督（子 worker の起動）に入る前に委ねる（#708）。worker の中では委ねない。
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if let args::Command::Infer(infer) = &command
-                && !infer_supervisor::is_worker()
-            {
-                match serve_client::try_delegate(&mut std::io::stdout().lock(), infer, &cwd) {
-                    Ok(Delegation::Done(code)) => {
-                        let _ = writeln!(std::io::stderr(), "serve: delegated");
-                        return code.into();
-                    }
-                    Ok(Delegation::NotInUse) => {}
-                    Ok(Delegation::Standalone(reason)) => {
-                        let _ = writeln!(std::io::stderr(), "serve: standalone ({reason})");
-                    }
-                    Err(_) => return ExitCode::RuntimeError.into(),
-                }
-            }
+            // 常駐への委譲（#708）は worker の中（`stages::infer::run`）で行う。
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let args::Command::Infer(infer) = &command
                 && !infer_supervisor::is_worker()

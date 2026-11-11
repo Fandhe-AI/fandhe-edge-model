@@ -213,6 +213,22 @@ pub(crate) fn light_package_identity(
 /// # Errors
 /// `out` への書き込み失敗（呼び出し側は exit 70 に写し、追加の出力をしない）。
 pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<ExitCode> {
+    // 常駐へ委ねる（#708）。監督下の worker の中で行い、検査・ハッシュ・往復・書き込みを監督の上限の下に置く。
+    // 委ねられなければ（単独へ戻る）続きの経路をそのまま通る。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::infer_supervisor::is_worker() {
+        use crate::serve_client::{Delegation, try_delegate};
+        match try_delegate(out, args, cwd)? {
+            Delegation::Done(code) => {
+                let _ = writeln!(io::stderr(), "serve: delegated");
+                return Ok(code);
+            }
+            Delegation::Standalone(reason) => {
+                let _ = writeln!(io::stderr(), "serve: standalone ({reason})");
+            }
+            Delegation::NotInUse => {}
+        }
+    }
     // OUT の検査は推論の計算（パッケージの読み込みを含む）より前に行う（#459）。
     let target = match &args.source {
         InferSource::InputFile {

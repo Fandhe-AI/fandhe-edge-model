@@ -874,6 +874,10 @@ where
         Ok(outcome) => outcome,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let outcome: Result<T, ErrorReport> = Err(report(ExitCode::LimitExceeded));
+            if policy == StallPolicy::Resident {
+                // 計算スレッドを切り離す。常駐は応答後にプロセスを終える（#708）。
+                RESIDENT_DETACHED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if policy.terminates() {
                 let watchdog = OutputWatchdog::arm(true, output_duration);
                 std::process::exit(finish_abandoned(out, &outcome, watchdog));
@@ -937,15 +941,23 @@ where
     )
 }
 
+/// `StallPolicy::Resident` で計算スレッドを切り離した（協調的に打ち切れなかった）ことの印。
+/// 判定スレッドは 1 本だけなので、[`infer_single_to_bytes`] が呼び出しの直後に読んで下ろす。
+static RESIDENT_DETACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 常駐プロセス（`serve`。#708）用の単件推論。単独の [`emit_infer_single_scoped`] と同じ組み立てで
 /// 1 行の JSON を `Vec<u8>` へ書き、`(stdout のバイト列, 終了コード)` を返す。期限超過はプロセスを
 /// 終えずに `limit_exceeded`（exit 20）の結果として返す（REQ-21・REQ-33・REQ-39）。
+///
+/// 3 つ目の値は、計算スレッドを切り離した（ハード期限で見切った）か。真なら呼び出し側は結果を返した後に
+/// プロセスを終える（切り離したスレッドとメモリを積み上げない。fail-closed）。協調的な期限
+/// （`TimeLimitExceeded`）による `limit_exceeded` は偽で、常駐は続けられる。
 /// serve は Linux・macOS 限定のため、他の OS では使われない。
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(crate) fn infer_single_to_bytes<P, B>(
     call: SingleCall<'_>,
     pipeline: Arc<InferencePipeline<P, B>>,
-) -> io::Result<(Vec<u8>, ExitCode)>
+) -> io::Result<(Vec<u8>, ExitCode, bool)>
 where
     P: Preprocessor + Send + Sync + 'static,
     B: ScoringBackend + Send + Sync + 'static,
@@ -962,7 +974,8 @@ where
         },
         StallPolicy::Resident,
     )?;
-    Ok((buf, code))
+    let detached = RESIDENT_DETACHED.swap(false, std::sync::atomic::Ordering::SeqCst);
+    Ok((buf, code, detached))
 }
 
 /// [`emit_infer_single`] の上限を指定できる版。停止の回収は常にプロセス終了（CLI の 1 呼び出し

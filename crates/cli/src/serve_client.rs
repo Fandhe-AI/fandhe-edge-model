@@ -2,7 +2,8 @@
 //!
 //! # 呼び出し文脈
 //!
-//! `main.rs` が `infer` を受け、監督（[`crate::infer_supervisor`]）に入る前に [`try_delegate`] を呼ぶ。
+//! 監督下の worker の中で、`stages::infer::run` が `prepare` の前に [`try_delegate`] を呼ぶ。軽い検査・ハッシュ・
+//! ソケットの往復・stdout の書き込みが、監督の時間・RSS の上限と出力の見張りの下に入る。
 //! 委ねられなければ [`Delegation::Standalone`]（常駐がいる環境。理由を stderr に出す）または
 //! [`Delegation::NotInUse`]（ソケットが無い。無言）を返し、呼び出し側が今までの経路（監督つきの子 worker）へ進む。
 //!
@@ -17,18 +18,20 @@
 //!
 //! 単独へは戻らない（7B の読み込み直しで負荷が二重になるため）。時間切れは `limit_exceeded`（20）、
 //! 応答の不正・切断は `runtime_error`（70）を単独と同じ形のエラー JSON で出す。時間は監督の `infer` の
-//! 親の上限と同じ値。`package_mismatch` のときだけ単独へ戻る。応答の `stdout` は加工せず流し、
+//! 親の上限より `SUPERVISOR_GRACE` 短い期限。`package_mismatch` と、応答の前に常駐が終わった（EOF・切断）
+//! ときは単独へ戻る。応答の `stdout` は加工せず流し、
 //! `exit_code` で終える。
 
 use std::io::{self, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fandhe_edge_core::artifact_meta::ArtifactMeta;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
 use fandhe_edge_core::serve_protocol::{
     MAX_REQUEST_LINE_BYTES, MAX_RESPONSE_LINE_BYTES, ServeRequest, ServeResponse, decode_response,
     encode_request,
@@ -37,9 +40,10 @@ use fandhe_edge_guard::resource::safety_limits_for_kind;
 
 use crate::args::{InferArgs, InferSource};
 use crate::error_report::{default_message, emit_error_report};
-use crate::infer_batch::SINGLE_HARD_LIMIT_GRACE;
+use crate::infer_batch::{
+    MAX_INFER_BATCH_OUTPUT_DURATION, OutputWatchdog, SINGLE_HARD_LIMIT_GRACE,
+};
 use crate::infer_guard::check_infer_path_and_format;
-use crate::infer_supervisor::SUPERVISOR_GRACE;
 use crate::serve::{NO_SERVE_ENV, SOCKET_FILE, is_private_dir, read_line_bounded, serve_dir};
 use crate::stages::infer::light_package_identity;
 
@@ -59,9 +63,22 @@ pub enum Delegation {
 /// # Errors
 /// `out` への書き込み失敗（呼び出し側は exit 70 に写す）。
 pub fn try_delegate<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Delegation> {
+    try_delegate_in(out, args, cwd, serve_dir())
+}
+
+/// [`try_delegate`] の置き場所を指定できる版（環境変数を書き換えずに試験するため）。
+///
+/// # Errors
+/// [`try_delegate`] と同じ。
+pub fn try_delegate_in<W: Write>(
+    out: &mut W,
+    args: &InferArgs,
+    cwd: &Path,
+    dir: Option<PathBuf>,
+) -> io::Result<Delegation> {
     // 常駐を使っていない利用者の stderr・挙動を変えないよう、ソケットが無ければ何も言わず単独へ進む
     // （ONNX を読む軽い検査より先に見て、常駐がいない普通の場合の追加コストも避ける）。
-    let Some(dir) = serve_dir() else {
+    let Some(dir) = dir else {
         return Ok(Delegation::NotInUse);
     };
     let sock = dir.join(SOCKET_FILE);
@@ -86,13 +103,18 @@ pub fn try_delegate<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::
         return Ok(Delegation::Standalone("disabled by FANDHE_EDGE_NO_SERVE"));
     }
 
-    // 先につなぐ。つながらなければ ONNX を読まずに単独へ進む（つなぐのは軽いので、検査の失敗時は
-    // 要求を送らずに stream を drop するだけ）。
-    let Ok(mut stream) = UnixStream::connect(&sock) else {
-        return Ok(Delegation::Standalone("cannot connect"));
-    };
+    // (3) 入力の検査は委ねる前に。単独と同じエラー（上限超過など）を単独の経路に出させる。
+    if text.len() > MAX_INFER_INPUT_BYTES {
+        return Ok(Delegation::Standalone("input is too large"));
+    }
+    let started = Instant::now();
 
-    // 軽い検査。失敗は単独へ戻して、単独と同じエラーを出させる。
+    // (a) 試しの接続。つながらなければ ONNX を読まずに単独へ進む。
+    if UnixStream::connect(&sock).is_err() {
+        return Ok(Delegation::Standalone("cannot connect"));
+    }
+
+    // (b) 軽い検査。失敗は単独へ戻して、単独と同じエラーを出させる。
     let Ok(checked) = check_infer_path_and_format(cwd, args) else {
         return Ok(Delegation::Standalone("package check failed"));
     };
@@ -105,12 +127,13 @@ pub fn try_delegate<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::
     let Ok(identity) = light_package_identity(&checked, &meta) else {
         return Ok(Delegation::Standalone("package check failed"));
     };
-    let limits = safety_limits_for_kind(checked.kind.as_str());
-    let timeout = limits
-        .time()
-        .get()
-        .saturating_add(SINGLE_HARD_LIMIT_GRACE)
-        .saturating_add(SUPERVISOR_GRACE);
+    // 期限は監督の上限（`time + SINGLE_HARD_LIMIT_GRACE + SUPERVISOR_GRACE`）より SUPERVISOR_GRACE だけ短い。
+    // 監督に kill される前に、自分で `limit_exceeded` を出せる。検査に使った時間も含める。
+    let deadline = started
+        + safety_limits_for_kind(checked.kind.as_str())
+            .time()
+            .get()
+            .saturating_add(SINGLE_HARD_LIMIT_GRACE);
 
     let request = encode_request(&ServeRequest {
         id: request_id(),
@@ -121,10 +144,23 @@ pub fn try_delegate<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::
         return Ok(Delegation::Standalone("request is too large"));
     }
 
-    // つながった後は単独へ戻らない。
-    let deadline = Instant::now() + timeout;
-    let line = stream
-        .set_write_timeout(Some(timeout))
+    // (c) 要求用に接続し直す。ここでつながらなければまだ何も送っていないので単独へ進める。
+    let Ok(mut stream) = UnixStream::connect(&sock) else {
+        return Ok(Delegation::Standalone("cannot connect"));
+    };
+
+    // 出力の書き込みの見張り（stdout が詰まっても止まらない。書き込み停止は exit 20）。
+    let _watchdog = OutputWatchdog::arm(true, MAX_INFER_BATCH_OUTPUT_DURATION)?;
+
+    // 送った後は、時間切れ以外では単独へ戻らない。ただし応答の前に常駐が終わった（EOF・切断）なら
+    // 読み込みが二重になる心配がないので単独へ戻す。
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let armed = if remaining.is_zero() {
+        Err(io::ErrorKind::TimedOut.into())
+    } else {
+        stream.set_write_timeout(Some(remaining))
+    };
+    let line = armed
         .and_then(|()| stream.write_all(&request))
         .and_then(|()| read_line_bounded(&mut stream, MAX_RESPONSE_LINE_BYTES, deadline));
     let line = match line {
@@ -149,6 +185,16 @@ pub fn try_delegate<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::
 
 /// つながった後の I/O 失敗を単独と同じ形のエラー JSON にする（時間切れは `limit_exceeded`）。
 fn failed<W: Write>(out: &mut W, e: &io::Error) -> io::Result<Delegation> {
+    // 応答の前に常駐が終わった（EOF・切断）。単独へ戻す。
+    if matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    ) {
+        return Ok(Delegation::Standalone("serve closed the connection"));
+    }
     if matches!(
         e.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock

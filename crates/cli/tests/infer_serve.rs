@@ -590,3 +590,75 @@ fn req39_malformed_request_is_rejected_and_serve_survives() {
     );
     let _ = fs::remove_dir_all(&ws);
 }
+
+/// 1 MiB を超える `--text` は委ねずに単独へ戻す（単独と同じ上限エラーを単独の経路に出させる。REQ-39・REQ-33）。
+/// OS の引数長の上限で実バイナリには渡せないため、委ねる関数を直接呼ぶ。
+#[test]
+fn req39_oversized_text_is_not_delegated() {
+    use fandhe_edge_cli::args::{InferArgs, InferSource};
+    use fandhe_edge_cli::serve_client::{Delegation, try_delegate_in};
+    let (ws, dir) = (workspace("big"), serve_dir("big"));
+    let _server = Server::start(&ws, &dir, "c", &[]);
+    let mk = |len: usize| InferArgs {
+        package: PathBuf::from("c"),
+        source: InferSource::Text {
+            text: "a".repeat(len),
+            id: None,
+        },
+        version: None,
+    };
+    let mut out = Vec::new();
+    let big = try_delegate_in(&mut out, &mk(1_048_577), &ws, Some(dir.clone())).expect("io");
+    assert_eq!(big, Delegation::Standalone("input is too large"));
+    assert!(out.is_empty());
+    // 上限ちょうどは委ねる（応答が返る）。
+    let ok = try_delegate_in(&mut out, &mk(1_048_576), &ws, Some(dir.clone())).expect("io");
+    assert!(matches!(ok, Delegation::Done(_)), "{ok:?}");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// 応答の前に常駐が終わった（判定中に kill）ときは、クライアントが単独で判定して exit 0。
+#[test]
+fn serve_killed_while_judging_falls_back_to_standalone() {
+    let (ws, dir) = (workspace("kill"), serve_dir("kill"));
+    let server = Server::start(
+        &ws,
+        &dir,
+        "c",
+        &[("FANDHE_EDGE_SERVE_TEST_DELAY_MS", "5000")],
+    );
+    let run = thread::scope(|s| {
+        let h = s.spawn(|| infer(&ws, &dir, "c", false, "hello world"));
+        thread::sleep(Duration::from_millis(1500));
+        let _ = server.stop();
+        h.join().expect("join")
+    });
+    assert_eq!(
+        run.code,
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    assert_eq!(
+        run.stderr.trim_end(),
+        "serve: standalone (serve closed the connection)"
+    );
+    assert!(run.stdout.starts_with(b"{"));
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// 試しの接続ができない（残ったソケット）ときは、ONNX を読む検査より先に単独へ戻る
+/// （パッケージを壊しても理由は `cannot connect` で、`package check failed` にならない）。
+#[test]
+fn stale_socket_returns_before_reading_the_package() {
+    let (ws, dir) = (workspace("stale"), serve_dir("stale"));
+    let mut server = Server::start(&ws, &dir, "c", &[]);
+    let mut c = server.child.take().expect("child");
+    c.kill().expect("kill");
+    c.wait().expect("wait");
+    fs::write(ws.join("c/artifact.json"), "{").expect("corrupt");
+    let run = infer(&ws, &dir, "c", false, "x");
+    assert_eq!(run.code, Some(64));
+    assert_eq!(run.stderr.trim_end(), "serve: standalone (cannot connect)");
+    let _ = fs::remove_dir_all(&ws);
+}
