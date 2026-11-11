@@ -64,10 +64,10 @@
       },
       {
         "name": "rustix",
-        "version": "1.1.5",
-        "approved_on": "2026-09-29",
+        "version": "1.1.6",
+        "approved_on": "2026-11-11",
         "approved_by": "owner",
-        "record": "dependency-policy.md「承認済みの依存」表（2026-09-29 オーナー承認。PR #282）",
+        "record": "dependency-policy.md「承認済みの依存」表（2026-09-29 オーナー承認。PR #282。2026-11-11 に 1.1.5 → 1.1.6 への更新をオーナー承認。RUSTSEC-2026-0486 の解消）",
         "purpose": "openat（O_NOFOLLOW）による経路の閉じ込め",
         "layers": [
           "guard"
