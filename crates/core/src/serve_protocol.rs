@@ -36,6 +36,8 @@ pub const MAX_RESPONSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ID_BYTES: usize = 64;
 
 /// 1 行 JSON の形の版。要求の欄・意味を変えるときに上げる（#709）。
+/// cli のソケットのファイル名（`serve.v<版>.sock`）もこの値に合わせて上げる（版の違う常駐と CLI が
+/// 互いのソケットを見ないようにする。cli 側の単体テストで照合）。
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// `cli_version` の最大バイト数。

@@ -9,6 +9,9 @@
 //!
 //! # 委ねる条件
 //!
+//! ソケットのファイル名は 1 行 JSON の形の版ごとに分かれている（`serve::SOCKET_FILE`）。版の違う常駐の
+//! ソケットは見ない（ソケットが無い扱いで、何も言わず単独で判定する。#709）。
+//!
 //! 置き場所が 0700 でソケットがある・`--text` のみ（`--id`・`--input-file`・`--out`・`--version-ledger` なし）・`FANDHE_EDGE_NO_SERVE` 未設定・
 //! ソケットにつながり、軽い検査（[`check_infer_path_and_format`]。閉じ込め・`artifact.json`・
 //! 形式・`kind_version`。重い shard の検証は常駐の起動時に済み）を通り、`artifact.json` の記録が実体の

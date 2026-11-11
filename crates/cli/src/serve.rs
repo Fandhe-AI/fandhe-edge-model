@@ -41,6 +41,8 @@
 //! - **worker の RSS**（約 50 ms ごと）: 上限を超えたら worker を止める。`ready` の直後に 1 回計測して上限内と
 //!   確かめた後の超過は止めるだけで、判定中の要求には `limit_exceeded` を返す。確かめる前（起動中）の超過は、
 //!   作り直しても同じなので親ごと exit 20（[`worker_rss_action`]）
+//! - **worker の回収**: 止めた worker の回収は有界（kill の後 [`WORKER_REAP_TIMEOUT`] まで）。回収できなければ
+//!   親ごと exit 70（止められない worker を抱えたまま判定スレッドを止めない）
 //! - **親自身の RSS**: 上限を超えたら exit 20。RSS を読めなければ（親・worker とも）fail-closed で exit 70
 //! - **作り直し**: worker が止まったら（親が止めた・自分で終わった・外から kill された）、判定スレッドが次の
 //!   要求を待つ前に起動し直す。常駐は続き、次の要求は読み込み時間を払わない。ハード期限で計算スレッドを
@@ -58,10 +60,16 @@
 //! # 置き場所と権限（REQ-39）
 //!
 //! 既定は `$HOME/Library/Application Support/fandhe-edge/`、`FANDHE_EDGE_SERVE_DIR` で変えられる。
-//! ディレクトリは 0700、ソケット `serve.sock` は作成後 0600、二重起動防止は `serve.lock` の
+//! ディレクトリは 0700、ソケット `serve.v1.sock` は作成後 0600、二重起動防止は `serve.lock` の
 //! `File::try_lock`。`unsafe` を使わないため umask の設定はせず、0700 のディレクトリの中に作る。
 //! SIGTERM は既定の動き（即終了）で、残ったソケットは次の起動が `serve.lock` を取れたら消して作り直す。
 //! 待ち受けは Unix ソケットのみで、ネットワークには公開しない（REQ-38）。
+//!
+//! ソケットのファイル名は 1 行 JSON の形の版（`PROTOCOL_VERSION`）ごとに分ける（[`SOCKET_FILE`]。プロトコルを
+//! 上げるときはファイル名も上げる）。版の違う常駐と CLI は互いのソケットを見ないので、古い常駐が新しい要求を
+//! 「不正な要求」（exit 64）と答えたものを CLI が判定結果として採用することがない（CLI からは常駐が無い扱いで、
+//! 何も言わず単独で判定する）。ロックのファイル名は版で分けないので、常駐は版をまたいで同時に 1 つだけで、
+//! 起動時にロックを取れたら、残っている古い名前のソケット（[`LEGACY_SOCKET_FILES`]）も消す。
 //!
 //! # 限界（証拠種別: テストハーネス）
 //!
@@ -110,7 +118,20 @@ pub const SERVE_DIR_ENV: &str = "FANDHE_EDGE_SERVE_DIR";
 /// 設定されていれば `infer` が常駐へ委ねない環境変数。
 pub const NO_SERVE_ENV: &str = "FANDHE_EDGE_NO_SERVE";
 /// ソケットのファイル名。
-pub const SOCKET_FILE: &str = "serve.sock";
+///
+/// 名前の数字は `PROTOCOL_VERSION` と一致させる（単体テストで照合）。プロトコルを上げるときは、ここも上げて
+/// 今の名前を [`LEGACY_SOCKET_FILES`] へ移す。
+pub const SOCKET_FILE: &str = "serve.v1.sock";
+/// 以前の版のソケットのファイル名。起動時にロックを取れたら消す（持ち主はもういない。古い CLI が死んだ
+/// ソケットへつなぎに行かないように）。
+const LEGACY_SOCKET_FILES: [&str; 1] = ["serve.sock"];
+/// worker を kill してから回収できるまで待つ上限。ガード層の監督（`resource::KILL_WAIT_TIMEOUT`）と同じ 2 秒。
+/// SIGKILL の後の回収は通常数 ms で済み、これを超えるのは終了が完了しない異常なので、親ごと終える。
+const WORKER_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+/// 親が終わるときに worker の回収を待つ上限（終了を遅らせすぎない。回収できなくても終える）。
+const EXIT_REAP_TIMEOUT: Duration = Duration::from_millis(200);
+/// 回収待ちの間隔。
+const REAP_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const LOCK_FILE: &str = "serve.lock";
 
 /// 判定待ちの上限（判定中の 1 件を除く）。超えたら `limit_exceeded`。
@@ -599,30 +620,73 @@ static WORKER: Mutex<WorkerSlot> = Mutex::new(WorkerSlot {
     kill_at: None,
 });
 
-/// ロックの中では待つ処理をしない（kill・計測・フラグの読み書きだけ）。
+/// ソケットを作って待ち受けを始めたか。偽の間（起動中）に親が終わるときは、stdout にエラー JSON を出す。
+static SERVING: AtomicBool = AtomicBool::new(false);
+
+/// ロックの中では長く待つ処理をしない（kill・計測・フラグの読み書きだけ）。
 fn worker_slot() -> MutexGuard<'static, WorkerSlot> {
     WORKER.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// 親が終わる前に worker を止める（7B の読み込みを続ける孤児を残さない）。回収はしない（親の終了で init が回収する）。
-fn kill_worker() {
-    if let Some(child) = worker_slot().child.as_mut() {
-        let _ = child.kill();
+/// kill してから、`timeout` まで短い間隔で回収を試みる（無期限の `wait` をしない。REQ-39）。回収できたら真。
+/// kill の失敗は、既に終わっていて回収できた場合だけ成功として扱う。`try_wait` は回収できたら `Ok(true)`。
+fn kill_and_reap(
+    kill: impl FnOnce() -> io::Result<()>,
+    mut try_wait: impl FnMut() -> io::Result<bool>,
+    timeout: Duration,
+) -> bool {
+    let kill_failed = kill().is_err();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match try_wait() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+        // kill できず、まだ終わってもいない worker は待っても終わらない。
+        if kill_failed || Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(REAP_POLL_INTERVAL);
     }
 }
 
-/// worker を止めて回収する。戻り値は、見張りが上限で止めていたか。
+fn kill_and_reap_child(child: &mut Child, timeout: Duration) -> bool {
+    // `kill` と `try_wait` が同じ `child` を可変で借りるため、内部可変性で 1 つずつ使う。
+    let child = std::cell::RefCell::new(child);
+    kill_and_reap(
+        || child.borrow_mut().kill(),
+        || child.borrow_mut().try_wait().map(|status| status.is_some()),
+        timeout,
+    )
+}
+
+/// 親が終わる前に worker を止める（7B の読み込みを続ける孤児を残さない）。回収は [`EXIT_REAP_TIMEOUT`] まで
+/// 待つだけで、できなくても終了を続ける（残りは親の終了で init が回収する）。
+fn kill_worker() {
+    if let Some(child) = worker_slot().child.as_mut() {
+        let _ = kill_and_reap_child(child, EXIT_REAP_TIMEOUT);
+    }
+}
+
+/// worker を止めて回収する（[`WORKER_REAP_TIMEOUT`] まで）。戻り値は、見張りが上限で止めていたか。
+/// 回収できなければ、止められない worker を抱えたまま続けず、理由をログに出して親ごと exit 70 で終える。
 fn reap_worker() -> bool {
     let (child, limit_killed) = {
         let mut slot = worker_slot();
-        if let Some(child) = slot.child.as_mut() {
-            let _ = child.kill();
-        }
         (slot.child.take(), slot.limit_killed)
     };
-    if let Some(mut child) = child {
-        // SIGKILL の後なので待ちは短い。
-        let _ = child.wait();
+    if let Some(mut child) = child
+        && !kill_and_reap_child(&mut child, WORKER_REAP_TIMEOUT)
+    {
+        // 終了処理が最後にもう一度だけ kill を試みられるよう、戻してから終える。
+        worker_slot().child = Some(child);
+        fatal_exit(
+            ExitCode::RuntimeError,
+            "cannot stop worker; exiting",
+            !SERVING.load(Ordering::SeqCst),
+        );
     }
     limit_killed
 }
@@ -801,8 +865,7 @@ fn run_parent<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result
     // 起動時から、単独の監督と同じ種類別の RSS の上限で自分と worker を見張る。
     let limits = peek_checked_kind(cwd, &args.package)
         .map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(k.as_str()));
-    let loaded = Arc::new(AtomicBool::new(false));
-    if spawn_guard_thread(limits, Arc::clone(&loaded)).is_err() {
+    if spawn_guard_thread(limits).is_err() {
         return emit_startup_error(out, &runtime("cannot start serve guard thread"));
     }
     let (listener, io, identity, _lock) = match start(args, cwd, limits) {
@@ -814,7 +877,7 @@ fn run_parent<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result
             });
         }
     };
-    loaded.store(true, Ordering::SeqCst);
+    SERVING.store(true, Ordering::SeqCst);
     let identity = Arc::new(identity);
     let (tx, rx) = mpsc::sync_channel::<Job>(QUEUE_DEPTH);
     let ctx = JudgeCtx {
@@ -887,6 +950,13 @@ fn start(
     let dir = serve_dir().ok_or_else(|| invalid("serve directory is not configured"))?;
     let dir_meta = ensure_dir(&dir)?;
     let lock = acquire_lock(&dir, &dir_meta)?;
+    // 以前の版の名前で残っているソケットを消す（ロックを取れたので持ち主はいない。ソケット以外は触らない）。
+    for name in LEGACY_SOCKET_FILES {
+        let legacy = dir.join(name);
+        if fs::symlink_metadata(&legacy).is_ok_and(|m| m.file_type().is_socket()) {
+            let _ = fs::remove_file(&legacy);
+        }
+    }
     let io = spawn_worker(args, cwd)?;
     let identity = match await_ready(&io, limits.time().get(), None) {
         Startup::Ready(identity) => identity,
@@ -1237,14 +1307,14 @@ fn guard_tick(limits: SafetyLimits, startup: bool) {
     }
 }
 
-/// 資源の見張りのスレッド（約 50 ms ごとに [`guard_tick`]。REQ-39・#708・#709）。`loaded` が偽の間は起動中。
-fn spawn_guard_thread(limits: SafetyLimits, loaded: Arc<AtomicBool>) -> io::Result<()> {
+/// 資源の見張りのスレッド（約 50 ms ごとに [`guard_tick`]。REQ-39・#708・#709）。[`SERVING`] が偽の間は起動中。
+fn spawn_guard_thread(limits: SafetyLimits) -> io::Result<()> {
     thread::Builder::new()
         .name("serve-guard".to_string())
         .spawn(move || {
             loop {
                 thread::sleep(GUARD_POLL_INTERVAL);
-                guard_tick(limits, !loaded.load(Ordering::SeqCst));
+                guard_tick(limits, !SERVING.load(Ordering::SeqCst));
             }
         })
         .map(|_| ())
@@ -1253,6 +1323,70 @@ fn spawn_guard_thread(limits: SafetyLimits, loaded: Arc<AtomicBool>) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #709: ソケットのファイル名の数字は `PROTOCOL_VERSION` と一致し、以前の名前とは重ならない。
+    #[test]
+    fn socket_file_name_carries_protocol_version() {
+        use fandhe_edge_core::serve_protocol::PROTOCOL_VERSION;
+        assert_eq!(SOCKET_FILE, format!("serve.v{PROTOCOL_VERSION}.sock"));
+        assert_eq!(SOCKET_FILE, "serve.v1.sock");
+        assert_eq!(LEGACY_SOCKET_FILES, ["serve.sock"]);
+        assert!(!LEGACY_SOCKET_FILES.contains(&SOCKET_FILE));
+    }
+
+    /// REQ-39・#709: worker の回収は有界。kill の後に終われば成功、期限まで終わらなければ失敗、
+    /// kill に失敗しても既に終わっていれば成功、kill に失敗して終わってもいなければ待たずに失敗。
+    #[test]
+    fn req39_kill_and_reap_is_bounded() {
+        let ok = || Ok(());
+        let failed = || Err(io::Error::other("kill failed"));
+        let long = Duration::from_secs(5);
+        // 3 回目の確認で回収できる。
+        let mut polls = 0;
+        let reaped = kill_and_reap(
+            ok,
+            || {
+                polls += 1;
+                Ok(polls >= 3)
+            },
+            long,
+        );
+        assert!(reaped);
+        assert_eq!(polls, 3);
+        // 終わらない worker は期限で諦める（無期限に待たない）。
+        let started = Instant::now();
+        assert!(!kill_and_reap(ok, || Ok(false), Duration::from_millis(50)));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // kill の失敗: 既に終わっていれば成功、終わっていなければ待たずに失敗。
+        assert!(kill_and_reap(failed, || Ok(true), long));
+        let started = Instant::now();
+        assert!(!kill_and_reap(failed, || Ok(false), long));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // 回収の確認自体の失敗は失敗。EINTR は続ける。
+        assert!(!kill_and_reap(
+            ok,
+            || Err(io::Error::other("wait failed")),
+            long
+        ));
+        let mut first = true;
+        let reaped = kill_and_reap(
+            ok,
+            || {
+                if std::mem::take(&mut first) {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(true)
+                }
+            },
+            long,
+        );
+        assert!(reaped);
+    }
 
     /// REQ-39: 改行までの 1 行を返し、上限を超える行は拒否する。
     #[test]

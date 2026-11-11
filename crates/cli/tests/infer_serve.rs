@@ -21,6 +21,11 @@ use fandhe_edge_core::serve_protocol::{
     PROTOCOL_VERSION, PackageIdentity, ServeRequest, ServeResponse, decode_response, encode_request,
 };
 
+use fandhe_edge_cli::serve::SOCKET_FILE;
+
+/// 以前の版（#708）のソケットのファイル名。
+const LEGACY_SOCKET_FILE: &str = "serve.sock";
+
 /// 常駐と同じ CLI の版（このテストは cli crate の一部なので同じ値になる）。
 const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -122,7 +127,7 @@ impl Server {
 
     /// ソケットが 0600 で現れ、接続できるまで待つ（chmod が bind の後のため）。
     fn wait_ready(&mut self) {
-        let sock = self.dir.join("serve.sock");
+        let sock = self.dir.join(SOCKET_FILE);
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             let child = self.child.as_mut().expect("child");
@@ -301,7 +306,7 @@ fn req39_queue_overflow_returns_limit_exceeded() {
     });
     let mut held = Vec::new();
     for i in 0..9 {
-        let mut s = UnixStream::connect(dir.join("serve.sock")).expect("connect");
+        let mut s = UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect");
         s.write_all(&request).expect("write");
         held.push(s);
         // 1 本目は判定スレッドが取り出して待ちに入るまで、以降は待ち行列に入るまで待つ。
@@ -435,7 +440,7 @@ fn req39_startup_verification_failure_creates_no_socket() {
     assert_eq!(out.status.code(), Some(64));
     assert_eq!(out.status.code(), alone.code);
     assert_eq!(out.stdout, alone.stdout);
-    assert!(!dir.join("serve.sock").exists());
+    assert!(!dir.join(SOCKET_FILE).exists());
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&ws);
 }
@@ -448,7 +453,7 @@ fn req39_dir_and_socket_permissions() {
         let _server = Server::start(&ws, &dir, "c", &[]);
         let mode = |p: &Path| fs::metadata(p).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700);
-        assert_eq!(mode(&dir.join("serve.sock")), 0o600);
+        assert_eq!(mode(&dir.join(SOCKET_FILE)), 0o600);
     }
     fs::create_dir_all(&dir).expect("mkdir");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -465,7 +470,7 @@ fn req39_dir_and_socket_permissions() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert!(!dir.join("serve.sock").exists());
+    assert!(!dir.join(SOCKET_FILE).exists());
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&ws);
 }
@@ -495,7 +500,7 @@ fn req39_second_start_fails_and_stale_socket_is_replaced() {
     );
 
     // SIGKILL ではソケットが残る。そこへつなぐ `infer` は単独へ戻る。
-    let sock = dir.join("serve.sock");
+    let sock = dir.join(SOCKET_FILE);
     let mut first = first;
     let mut c = first.child.take().expect("child");
     c.kill().expect("kill");
@@ -592,7 +597,7 @@ fn req39_malformed_request_is_rejected_and_serve_survives() {
     let (ws, dir) = (workspace("raw"), serve_dir("raw"));
     let _server = Server::start(&ws, &dir, "c", &[]);
     let call = |line: &[u8]| {
-        let mut s = UnixStream::connect(dir.join("serve.sock")).expect("connect");
+        let mut s = UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect");
         s.write_all(line).expect("write");
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).expect("read");
@@ -705,7 +710,7 @@ fn stale_socket_returns_before_reading_the_package() {
 
 /// 生のソケットへ 1 行送り、応答の 1 行を読む。
 fn raw_call(dir: &Path, line: &[u8]) -> ServeResponse {
-    let mut s = UnixStream::connect(dir.join("serve.sock")).expect("connect");
+    let mut s = UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect");
     s.write_all(line).expect("write");
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).expect("read");
@@ -876,7 +881,7 @@ fn req33_version_mismatch_response_falls_back_to_standalone() {
     let (ws, dir) = (workspace("fake"), serve_dir("fake"));
     fs::create_dir_all(&dir).expect("mkdir");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
-    let listener = UnixListener::bind(dir.join("serve.sock")).expect("bind");
+    let listener = UnixListener::bind(dir.join(SOCKET_FILE)).expect("bind");
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
@@ -933,7 +938,7 @@ fn req39_worker_rss_over_limit_at_startup_exits_without_socket() {
         String::from_utf8_lossy(&out.stdout),
         "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n"
     );
-    assert!(!dir.join("serve.sock").exists());
+    assert!(!dir.join(SOCKET_FILE).exists());
     // kill は送信済み。プロセスが消えるまで少し待つ。
     let deadline = Instant::now() + Duration::from_secs(5);
     while count_processes(&package) > 0 && Instant::now() < deadline {
@@ -951,10 +956,26 @@ fn req39_connection_limit_returns_limit_exceeded_for_large_request() {
     let (ws, dir) = (workspace("conn"), serve_dir("conn"));
     let _server = Server::start(&ws, &dir, "c", &[]);
     let held: Vec<UnixStream> = (0..64)
-        .map(|_| UnixStream::connect(dir.join("serve.sock")).expect("connect"))
+        .map(|_| UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect"))
         .collect();
-    // 接続スレッドが 64 本とも数えられるまで待つ。
-    thread::sleep(Duration::from_millis(500));
+    // 常駐が 64 本とも受け付けて数えるまで待つ（負荷で受け付けが遅れても決定的にする）: 何も送らない
+    // 追加の接続に、読まずに `limit_exceeded` が返ってくれば上限に達している。
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let mut probe = UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect");
+        probe
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let mut buf = Vec::new();
+        let _ = probe.read_to_end(&mut buf);
+        if buf.starts_with(b"{\"status\":\"ok\",\"exit_code\":20,") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the connection limit was not reached"
+        );
+    }
     // 引数 1 つの長さの上限（Linux は 128 KiB）に収まり、ソケットのバッファ（macOS は 8 KiB）より大きい入力。
     let text = "a".repeat(120_000);
     assert_limit_exceeded(&infer(&ws, &dir, "c", false, &text));
@@ -1066,5 +1087,92 @@ fn req39_three_barren_restarts_stop_the_parent() {
     let run = infer(&ws, &dir, "c", false, "zzz");
     assert_eq!(run.code, Some(0));
     assert_eq!(run.stderr.trim_end(), "serve: standalone (cannot connect)");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-21・REQ-33・#709: 以前の版（#708）の常駐が古い名前のソケットで動いていても、`infer` はそれを見ずに
+/// 単独で判定する（古い常駐が新しい要求に返す `invalid serve request`・exit 64 を判定結果として採用しない）。
+/// 常駐を使っていない環境と同じく、stderr に `serve:` の行は出ない。
+#[test]
+fn req33_legacy_socket_is_ignored() {
+    let (ws, dir) = (workspace("legacy"), serve_dir("legacy"));
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let listener = UnixListener::bind(dir.join(LEGACY_SOCKET_FILE)).expect("bind");
+    let connections = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&connections);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let _ = stream.write_all(
+                b"{\"status\":\"ok\",\"exit_code\":64,\"stdout\":\"{\\\"code\\\":\\\"invalid_input\\\",\\\"message\\\":\\\"invalid serve request\\\"}\\n\"}\n",
+            );
+        }
+    });
+    for t in C1_INPUTS {
+        let run = infer(&ws, &dir, "c", false, t);
+        let alone = infer(&ws, &dir, "c", true, t);
+        assert_eq!(
+            run.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+        assert_eq!(run.stdout, alone.stdout);
+        assert_eq!(run.stderr, "");
+    }
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "the legacy socket must not be used"
+    );
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・#709: 新しい `serve` の起動で、残っていた古い名前のソケットが消える（ソケット以外は消さない）。
+/// 古い常駐が動いている（ロックを持っている）間は、新しい `serve` は起動せず、古いソケットも消さない。
+#[test]
+fn req39_startup_removes_legacy_socket() {
+    let (ws, dir) = (workspace("legrm"), serve_dir("legrm"));
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let legacy = dir.join(LEGACY_SOCKET_FILE);
+    // 持ち主のいない古いソケット（listener を落としてもファイルは残る）。
+    drop(UnixListener::bind(&legacy).expect("bind"));
+    assert!(legacy.exists());
+
+    // 古い常駐に見立てて `serve.lock` を持っている間は、起動が断られ、古いソケットは残る。
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("serve.lock"))
+        .expect("lock file");
+    lock.try_lock().expect("lock");
+    let refused = Command::new(env!("CARGO_BIN_EXE_fandhe-edge"))
+        .args(["serve", "--package", "c"])
+        .current_dir(&ws)
+        .env("FANDHE_EDGE_SERVE_DIR", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(refused.status.code(), Some(64));
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("serve already running"),
+        "{}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert!(legacy.exists());
+    assert!(!dir.join(SOCKET_FILE).exists());
+    drop(lock);
+
+    let server = Server::start(&ws, &dir, "c", &[]);
+    assert!(!legacy.exists(), "the legacy socket must be removed");
+    assert!(dir.join(SOCKET_FILE).exists());
+    assert_parity(&ws, &dir, "c", "zzz");
+    // Drop が置き場所を消すので、先に常駐を止める。
+    drop(server);
     let _ = fs::remove_dir_all(&ws);
 }
