@@ -2,8 +2,13 @@
 //!
 //! # 役割と呼び出し文脈
 //!
-//! `stages::infer::run` が薄く包んで呼ぶ。書く場所は `infer` のプロセス（常駐へ委ねる経路でも単独でも同じ
-//! worker 内の `run`）の 1 か所だけで、常駐プロセス（`serve`）側では書かない。
+//! `infer_supervisor::run`（利用者が起動した一番外側の `infer` プロセス）が薄く包んで呼ぶ。書く場所はここ 1 か所
+//! だけで、監督下の worker・常駐プロセス（`serve`）側では書かない（worker には有効化の環境変数を渡さない）。
+//! 結果を stdout へ出し終えた後に書くので、結果の出どころ（常駐へ委ねた・単独・監督が worker を止めた）に
+//! 関わらず 1 件 1 行になる。
+//!
+//! - 保存は監督の時間・RSS の上限の外で行い、独立した上限 [`SAVE_LIMIT`] を持つ。別スレッドで書き、間に合わなければ
+//!   待たずに戻る（プロセスの終了でスレッドは捨てる）。保存が停滞しても、出し終えた判定と終了コードは変わらない
 //!
 //! - 既定は無効。環境変数 `FANDHE_EDGE_HISTORY` が `"1"` と完全一致するときだけ有効で、それ以外は
 //!   ファイルもディレクトリも作らない。**有効にすると入力の全文が手元のファイルに残る**
@@ -23,7 +28,10 @@
 //! - `output` は読み直した JSON なので、キーの順・数値の表記は stdout のバイト列と一致しないことがある
 //! - 所有者が他人の置き場所（`FANDHE_EDGE_SERVE_DIR` を他人の 0700 のディレクトリへ向けて root で実行した場合）
 //!   には書かない。自分の uid は、置き場所に新規作成してすぐ消す空ファイルの所有者から得る（guard 側の doc）
-//! - 限界: 監督が worker を止めた場合（時間・RSS の超過）は履歴が残らない
+//! - 監督が worker を止めた場合（時間・RSS の超過）も、外側が出した `limit_exceeded` の行が残る
+//! - 限界: 保存を上限で打ち切った場合、その 1 行は残らないことがある。追記は 1 行 1 回の `write` なので通常は
+//!   行が欠けて残らないが、`write` が一部だけ書いて戻った（ディスクの空きが尽きた等）直後に打ち切ると、
+//!   長さを戻す前に終わって欠けた行が残りうる
 //! - 履歴に関する失敗は全部黙って捨てる。stdout・stderr・終了コードは有効でも無効でも変えない（REQ-33）
 //! - 通信はしない（REQ-38）。消すには `history.jsonl*` を消すだけ
 
@@ -31,6 +39,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fandhe_edge_core::exitcode::ExitCode;
@@ -53,6 +62,10 @@ pub(crate) const CAPTURE_LIMIT: usize = 64 * 1024;
 const MAX_HISTORY_BYTES: u64 = 64 * 1024 * 1024;
 const LOCK_TRIES: u32 = 5;
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+/// 保存を待つ上限。通常の保存は数 ms、ロック待ちは最大 `LOCK_TRIES × LOCK_RETRY_INTERVAL` = 100 ms なので、
+/// その数倍を取る。超えるのは置き場所が応答しないとき（止まったネットワーク上の置き場所等）だけで、
+/// そのときは保存を捨てて `infer` を終える（REQ-33・REQ-39・#711）。
+const SAVE_LIMIT: Duration = Duration::from_millis(500);
 
 /// 書き込みをそのまま `inner` へ通しつつ、先頭 [`CAPTURE_LIMIT`] バイトまでを控える。
 pub(crate) struct Tee<'a, W: Write> {
@@ -90,7 +103,8 @@ pub(crate) fn begin(args: &InferArgs) -> Option<Instant> {
     (enabled && matches!(args.source, InferSource::Text { .. })).then(Instant::now)
 }
 
-/// 1 行を追記する。失敗は全部捨てる。
+/// 1 行を追記する。失敗は全部捨て、[`SAVE_LIMIT`] を超えたら待たずに戻る。
+/// 呼び出し側は、結果を stdout へ出し終えてから呼ぶ。
 pub(crate) fn record(args: &InferArgs, started: Instant, captured: &[u8], code: ExitCode) {
     let InferSource::Text { text, .. } = &args.source else {
         return;
@@ -108,7 +122,23 @@ pub(crate) fn record(args: &InferArgs, started: Instant, captured: &[u8], code: 
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     if let Some(line) = encode(&rec) {
-        let _ = append(&line);
+        bounded(SAVE_LIMIT, move || {
+            let _ = append(&line);
+        });
+    }
+}
+
+/// `work` を別スレッドで走らせ、終わるか `limit` が過ぎるまでだけ待つ。過ぎたら `work` を置いて戻る
+/// （スレッドはプロセスの終了で捨てる）。スレッドを起こせなければ何もしない。
+fn bounded(limit: Duration, work: impl FnOnce() + Send + 'static) {
+    let (done, wait) = mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new().spawn(move || {
+        work();
+        let _ = done.send(());
+    });
+    if spawned.is_ok() {
+        // `work` が panic した場合は送り手が落ちて、すぐ戻る。
+        let _ = wait.recv_timeout(limit);
     }
 }
 
@@ -262,6 +292,27 @@ mod tests {
         assert!(restore_on_err(&f, 0, Ok(())).is_ok());
         assert_eq!(read(&d, HISTORY_FILE), "keep\n");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// REQ-33・#711: 保存が停滞しても、上限だけ待って戻る（停滞した処理の終わりを待たない）。
+    /// 終わる処理は上限まで待たずに戻り、最後まで走っている。
+    #[test]
+    fn bounded_returns_at_limit_without_waiting_for_stalled_work() {
+        let started = Instant::now();
+        bounded(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        assert!(waited < Duration::from_secs(10), "{waited:?}");
+
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        bounded(Duration::from_secs(30), move || {
+            let _ = tx.send(7);
+        });
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(rx.try_recv(), Ok(7));
     }
 
     /// #711: 控えは 64 KiB で打ち切るが、内側への書き込みは全部通る。
