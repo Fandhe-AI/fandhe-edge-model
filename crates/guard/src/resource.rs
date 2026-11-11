@@ -926,8 +926,21 @@ impl RssProbe for SystemRssProbe {
 /// プロセスの状態を読めないとき（呼び出し側は fail-closed で扱う）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn current_process_rss_bytes() -> io::Result<Option<u64>> {
+    process_rss_bytes(std::process::id())
+}
+
+/// `pid` の RSS（バイト）。常駐プロセス `serve` の親が worker 子の RSS を見張るための入口（REQ-39・#709）。
+/// 計測は [`current_process_rss_bytes`] と同じ実装。
+///
+/// `Ok(None)` は終了済みで未回収（ゾンビ）・終了処理中などで観測できないことを表す。呼び出し側は、回収済みの
+/// pid を渡さないこと（別プロセスへの再利用・「存在しない」を計測失敗と取り違えるのを避ける）。
+///
+/// # Errors
+/// プロセスの状態を読めないとき（呼び出し側は fail-closed で扱う）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn process_rss_bytes(pid: u32) -> io::Result<Option<u64>> {
     SystemRssProbe
-        .rss_bytes(std::process::id())
+        .rss_bytes(pid)
         .map_err(|_| io::Error::other("rss probe failed"))
 }
 

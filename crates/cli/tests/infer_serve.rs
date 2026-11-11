@@ -1,4 +1,4 @@
-//! 常駐プロセス `fandhe-edge serve` と、`infer --text` から委ねる経路（#708。REQ-21・REQ-28・REQ-33・
+//! 常駐プロセス `fandhe-edge serve` と、`infer --text` から委ねる経路（#708・#709。REQ-21・REQ-28・REQ-33・
 //! REQ-38・REQ-39。証拠種別: テストハーネス〔実バイナリ・合成パッケージ〕）。
 //!
 //! 共有 fixture の C1（`fixtures/onnx_parity`）と合成 `qwen2_lora`（`fixtures/qwen2_parity`）で組んだ
@@ -10,7 +10,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,8 +18,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fandhe_edge_core::serve_protocol::{
-    PackageIdentity, ServeRequest, ServeResponse, decode_response, encode_request,
+    PROTOCOL_VERSION, PackageIdentity, ServeRequest, ServeResponse, decode_response, encode_request,
 };
+
+/// 常駐と同じ CLI の版（このテストは cli crate の一部なので同じ値になる）。
+const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const C1_DEFINITION: &str = r#"{"schema":"fandhe-edge-model-definition/v1","name":"kv","version":1,"judgment_type":"single_select","options":[{"id":"alpha","display_name":"a","description":"d"},{"id":"beta","display_name":"b","description":"d"},{"id":"gamma","display_name":"g","description":"d"}],"io":{"input":"bytes"}}"#;
 const C1_INPUTS: [&str; 3] = ["hello world", "foo bar", "zzz"];
@@ -290,6 +293,8 @@ fn req39_queue_overflow_returns_limit_exceeded() {
         &[("FANDHE_EDGE_SERVE_TEST_DELAY_MS", "3000")],
     );
     let request = encode_request(&ServeRequest {
+        protocol: PROTOCOL_VERSION,
+        cli_version: CLI_VERSION.into(),
         id: "held".into(),
         text: "hello world".into(),
         package: c_identity(&ws),
@@ -605,6 +610,8 @@ fn req39_malformed_request_is_rejected_and_serve_survives() {
     }
     // 別のパッケージを名乗る要求は package_mismatch。
     let request = encode_request(&ServeRequest {
+        protocol: PROTOCOL_VERSION,
+        cli_version: CLI_VERSION.into(),
         id: "t1".into(),
         text: "x".into(),
         package: PackageIdentity {
@@ -692,6 +699,372 @@ fn stale_socket_returns_before_reading_the_package() {
     fs::write(ws.join("c/artifact.json"), "{").expect("corrupt");
     let run = infer(&ws, &dir, "c", false, "x");
     assert_eq!(run.code, Some(64));
+    assert_eq!(run.stderr.trim_end(), "serve: standalone (cannot connect)");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// 生のソケットへ 1 行送り、応答の 1 行を読む。
+fn raw_call(dir: &Path, line: &[u8]) -> ServeResponse {
+    let mut s = UnixStream::connect(dir.join("serve.sock")).expect("connect");
+    s.write_all(line).expect("write");
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).expect("read");
+    decode_response(&buf).expect("decode")
+}
+
+/// `c` パッケージ宛ての正しい要求（生ソケット用）。
+fn c_request(ws: &Path, text: &str) -> ServeRequest {
+    ServeRequest {
+        protocol: PROTOCOL_VERSION,
+        cli_version: CLI_VERSION.into(),
+        id: "raw".into(),
+        text: text.into(),
+        package: c_identity(ws),
+    }
+}
+
+/// `parent` の直接の子（worker）の pid。
+fn child_pids(parent: u32) -> Vec<u32> {
+    let out = Command::new("pgrep")
+        .args(["-P", &parent.to_string()])
+        .output()
+        .expect("pgrep");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+/// コマンドラインに `needle` を含むプロセスの数。
+fn count_processes(needle: &str) -> usize {
+    let out = Command::new("pgrep")
+        .args(["-f", needle])
+        .output()
+        .expect("pgrep");
+    String::from_utf8_lossy(&out.stdout).lines().count()
+}
+
+fn assert_limit_exceeded(run: &Run) {
+    assert_eq!(run.code, Some(20), "{}", run.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n"
+    );
+    assert_eq!(run.stderr.trim_end(), "serve: delegated");
+}
+
+/// REQ-39・REQ-21・#709: worker が固まったら親が期限で止めて `limit_exceeded`（exit 20）を返し、worker を
+/// 作り直す。その後の要求は委ねられて単独と同じ結果になる（常駐は続く）。
+#[test]
+fn req39_hung_worker_is_killed_and_restarted() {
+    let (ws, dir) = (workspace("hang"), serve_dir("hang"));
+    let server = Server::start(
+        &ws,
+        &dir,
+        "c",
+        &[
+            ("FANDHE_EDGE_SERVE_TEST_HANG_TEXT", "hang-here"),
+            ("FANDHE_EDGE_SERVE_TEST_TIME_MS", "1000"),
+        ],
+    );
+    let before = child_pids(server.child.as_ref().expect("child").id());
+    assert_eq!(before.len(), 1, "one worker: {before:?}");
+    let started = Instant::now();
+    assert_limit_exceeded(&infer(&ws, &dir, "c", false, "hang-here"));
+    // 親の期限（1 秒 + 余裕 1 秒）で返る。worker 自身の時間上限（10 秒）までは待たない。
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    for t in C1_INPUTS {
+        assert_parity(&ws, &dir, "c", t);
+    }
+    let after = child_pids(server.child.as_ref().expect("child").id());
+    assert_eq!(after.len(), 1, "one worker: {after:?}");
+    assert_ne!(before, after, "the worker must have been replaced");
+    let log = server.stop();
+    assert!(
+        log.contains("judge time limit exceeded; stopping worker"),
+        "{log}"
+    );
+    assert!(log.contains("worker ready"), "{log}");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・#709: worker を外から kill しても親が作り直し、その後の要求は委ねられて単独と同じ結果になる。
+#[test]
+fn req39_externally_killed_worker_is_restarted() {
+    let (ws, dir) = (workspace("wkill"), serve_dir("wkill"));
+    let server = Server::start(&ws, &dir, "c", &[]);
+    assert_parity(&ws, &dir, "c", C1_INPUTS[0]);
+    let workers = child_pids(server.child.as_ref().expect("child").id());
+    assert_eq!(workers.len(), 1, "one worker: {workers:?}");
+    let killed = Command::new("kill")
+        .args(["-9", &workers[0].to_string()])
+        .status()
+        .expect("kill");
+    assert!(killed.success());
+    // 作り直しの前でも後でも、要求は委ねられる（途中なら作り直しを待つ）。
+    for t in C1_INPUTS {
+        assert_parity(&ws, &dir, "c", t);
+    }
+    let after = child_pids(server.child.as_ref().expect("child").id());
+    assert_eq!(after.len(), 1, "one worker: {after:?}");
+    assert_ne!(workers, after);
+    // 親を止めたら、作り直した worker も（stdin の EOF で）消える。
+    let _ = server.stop();
+    let alive = |pid: u32| {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0")
+            .success()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(after[0]) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!alive(after[0]), "the worker must exit after its parent");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・#709: `protocol`・`cli_version` の違う要求には判定せず `version_mismatch` を返し、常駐は続く。
+/// 将来の版が欄を増やした要求も、不正な要求ではなく版の食い違いとして断る。
+#[test]
+fn req39_version_mismatch_is_answered_and_serve_survives() {
+    let (ws, dir) = (workspace("ver"), serve_dir("ver"));
+    let server = Server::start(&ws, &dir, "c", &[]);
+    let mut other_protocol = c_request(&ws, "zzz");
+    other_protocol.protocol = PROTOCOL_VERSION + 1;
+    let mut other_cli = c_request(&ws, "zzz");
+    other_cli.cli_version = format!("{CLI_VERSION}-other");
+    let future = String::from_utf8(encode_request(&other_protocol))
+        .expect("utf8")
+        .replacen('{', "{\"future_field\":1,", 1);
+    for line in [
+        encode_request(&other_protocol),
+        encode_request(&other_cli),
+        future.into_bytes(),
+    ] {
+        assert_eq!(
+            encode_response_line(&raw_call(&dir, &line)),
+            "{\"status\":\"version_mismatch\"}\n"
+        );
+    }
+    // 版が合う要求は判定される。
+    assert!(matches!(
+        raw_call(&dir, &encode_request(&c_request(&ws, "zzz"))),
+        ServeResponse::Ok { exit_code: 0, .. }
+    ));
+    assert_parity(&ws, &dir, "c", "zzz");
+    // 版の違う要求は判定されていない（ログの判定行は、生の 1 件と委ねた 1 件だけ）。
+    let log = server.stop();
+    assert_eq!(log.matches("exit_code=").count(), 2, "{log}");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+fn encode_response_line(response: &ServeResponse) -> String {
+    String::from_utf8(fandhe_edge_core::serve_protocol::encode_response(response)).expect("utf8")
+}
+
+/// REQ-21・REQ-33・#709: 常駐が `version_mismatch` を返したら、`infer` は単独で判定して単独と同じ stdout・
+/// 終了コードで終わる（偽の常駐: 何を受けても `version_mismatch` を返す）。
+#[test]
+fn req33_version_mismatch_response_falls_back_to_standalone() {
+    let (ws, dir) = (workspace("fake"), serve_dir("fake"));
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let listener = UnixListener::bind(dir.join("serve.sock")).expect("bind");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            // 試しの接続は何も送らずに閉じる。要求の接続は 1 行送ってくる。
+            let mut buf = [0u8; 65536];
+            let mut seen = false;
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen = true;
+                if buf[..n].contains(&b'\n') {
+                    break;
+                }
+            }
+            if seen {
+                let _ = stream.write_all(b"{\"status\":\"version_mismatch\"}\n");
+            }
+        }
+    });
+    for t in C1_INPUTS {
+        let run = infer(&ws, &dir, "c", false, t);
+        let alone = infer(&ws, &dir, "c", true, t);
+        assert_eq!(
+            run.stderr.trim_end(),
+            "serve: standalone (version mismatch)"
+        );
+        assert_eq!(run.code, Some(0));
+        assert_eq!(run.code, alone.code);
+        assert_eq!(run.stdout, alone.stdout);
+    }
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・REQ-21・#709: 読み込んだ worker の RSS が上限を超えていたら、ソケットを作らず `limit_exceeded` の
+/// JSON 1 つ・exit 20 で終わり、worker も残さない。
+#[test]
+fn req39_worker_rss_over_limit_at_startup_exits_without_socket() {
+    let (ws, dir) = (workspace("rss"), serve_dir("rss"));
+    // worker をコマンドラインで見分けられるよう、パッケージ名を一意にする。
+    let package = format!("pk-{}", unique("rss"));
+    copy_dir(&ws.join("c"), &ws.join(&package));
+    let out = Command::new(env!("CARGO_BIN_EXE_fandhe-edge"))
+        .args(["serve", "--package", &package])
+        .current_dir(&ws)
+        .env("FANDHE_EDGE_SERVE_DIR", &dir)
+        .env("FANDHE_EDGE_SERVE_TEST_RSS_LIMIT_BYTES", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(20));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n"
+    );
+    assert!(!dir.join("serve.sock").exists());
+    // kill は送信済み。プロセスが消えるまで少し待つ。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while count_processes(&package) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(count_processes(&package), 0, "no worker may remain");
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・REQ-21・#709: 接続数が上限（64 本）のとき、常駐は要求を読まずに `limit_exceeded` を返して閉じる。
+/// 大きい要求を書いている途中で閉じられた `infer` も、その応答を受け取って exit 20 で終わる（70 にしない）。
+#[test]
+fn req39_connection_limit_returns_limit_exceeded_for_large_request() {
+    let (ws, dir) = (workspace("conn"), serve_dir("conn"));
+    let _server = Server::start(&ws, &dir, "c", &[]);
+    let held: Vec<UnixStream> = (0..64)
+        .map(|_| UnixStream::connect(dir.join("serve.sock")).expect("connect"))
+        .collect();
+    // 接続スレッドが 64 本とも数えられるまで待つ。
+    thread::sleep(Duration::from_millis(500));
+    // 引数 1 つの長さの上限（Linux は 128 KiB）に収まり、ソケットのバッファ（macOS は 8 KiB）より大きい入力。
+    let text = "a".repeat(120_000);
+    assert_limit_exceeded(&infer(&ws, &dir, "c", false, &text));
+    drop(held);
+    // 接続が空けば委ねられる（接続スレッドが抜けるまでの間は `limit_exceeded` が返りうるので、上限つきで待つ）。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while infer(&ws, &dir, "c", false, "zzz").code != Some(0) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_parity(&ws, &dir, "c", "zzz");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・REQ-21・#709: 待っている間に期限を過ぎた要求は判定せず `limit_exceeded` を返す。
+///
+/// 1 件の判定を 3 秒に遅らせ、親の 1 件の期限を 4 秒にして、生のソケットで 0.1 秒おきに 3 件送る
+/// （受け付けの順と間隔を決定的にする）。
+/// - 1 件目: すぐ渡され、3 秒後に応答（親の待ちの上限 5 秒まで 2 秒の余裕）
+/// - 2 件目: 3 秒後に取り出され、待ちは 2.9 秒（期限 4 秒まで 1.1 秒の余裕）で判定される
+/// - 3 件目: 6 秒後に取り出され、待ちは 5.8 秒（期限 4 秒を 1.8 秒超過）で判定されない
+#[test]
+fn req39_request_expired_while_waiting_is_not_judged() {
+    let (ws, dir) = (workspace("wait"), serve_dir("wait"));
+    let server = Server::start(
+        &ws,
+        &dir,
+        "c",
+        &[
+            ("FANDHE_EDGE_SERVE_TEST_DELAY_MS", "3000"),
+            ("FANDHE_EDGE_SERVE_TEST_TIME_MS", "4000"),
+        ],
+    );
+    let responses: Vec<ServeResponse> = thread::scope(|s| {
+        let handles: Vec<_> = C1_INPUTS
+            .iter()
+            .map(|text| {
+                let h = s.spawn(|| raw_call(&dir, &encode_request(&c_request(&ws, text))));
+                thread::sleep(Duration::from_millis(100));
+                h
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect()
+    });
+    for judged in &responses[..2] {
+        assert!(
+            matches!(judged, ServeResponse::Ok { exit_code: 0, .. }),
+            "{judged:?}"
+        );
+    }
+    assert_eq!(
+        responses[2],
+        ServeResponse::Ok {
+            exit_code: 20,
+            stdout: "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n"
+                .into(),
+        }
+    );
+    let log = server.stop();
+    assert_eq!(log.matches("exit_code=").count(), 2, "{log}");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・#709: 1 件も判定しないまま worker が終わる作り直しが 3 回続いたら、親は exit 70 で終わる
+/// （外からの kill の繰り返しで回り続けない）。その後の `infer` は単独で判定する。
+#[test]
+fn req39_three_barren_restarts_stop_the_parent() {
+    let (ws, dir) = (workspace("barren"), serve_dir("barren"));
+    let mut server = Server::start(&ws, &dir, "c", &[]);
+    let parent = server.child.as_ref().expect("child").id();
+    let mut last = 0;
+    for round in 0..3 {
+        // 作り直された（前回と違う pid の）worker が現れるまで待ってから kill する。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let worker = loop {
+            match child_pids(parent).first() {
+                Some(&pid) if pid != last => break pid,
+                _ => assert!(Instant::now() < deadline, "no new worker in round {round}"),
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        // `ready` の後（作り直しの完了後）に kill するよう少し待つ。
+        thread::sleep(Duration::from_millis(500));
+        let killed = Command::new("kill")
+            .args(["-9", &worker.to_string()])
+            .status()
+            .expect("kill");
+        assert!(killed.success());
+        last = worker;
+    }
+    let mut child = server.child.take().expect("child");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the parent must exit");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(70));
+    let out = child.wait_with_output().expect("output");
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        log.contains("worker stopped without judging 3 times in a row; exiting"),
+        "{log}"
+    );
+    let run = infer(&ws, &dir, "c", false, "zzz");
+    assert_eq!(run.code, Some(0));
     assert_eq!(run.stderr.trim_end(), "serve: standalone (cannot connect)");
     let _ = fs::remove_dir_all(&ws);
 }
