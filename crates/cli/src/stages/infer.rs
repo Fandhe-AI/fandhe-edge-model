@@ -244,6 +244,10 @@ pub(crate) fn light_package_identity(
 
 /// `infer` を実行し、結果（または `ErrorReport`）を `out` へ書く。
 ///
+/// 判定履歴（#711）はここでは書かない。監督下の worker の中で書くと、保存の停滞で worker が時間上限に
+/// 掛かり、取得済みの判定が `limit_exceeded` に置き換わるため、一番外側の `infer`
+/// （[`crate::infer_supervisor::run`]）が結果を出し終えた後に書く（REQ-33）。
+///
 /// # Errors
 /// `out` への書き込み失敗（呼び出し側は exit 70 に写し、追加の出力をしない）。
 pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<ExitCode> {

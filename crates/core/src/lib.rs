@@ -67,6 +67,8 @@ pub mod evaluation_record;
 pub mod exitcode;
 pub mod fs;
 pub mod hash;
+/// 操作アダプター（cli）専用の判定履歴の型。判定・評価の契約には入らない（#711）。
+pub mod infer_history;
 pub mod infer_input;
 pub mod judgment;
 pub mod limits;

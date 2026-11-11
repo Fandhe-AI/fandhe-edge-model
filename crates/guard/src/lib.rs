@@ -33,6 +33,8 @@ pub mod kind_version;
 pub mod model_file;
 pub mod package;
 pub mod path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod private_file;
 pub mod resource;
 pub mod split_files;
 pub mod version_ledger;

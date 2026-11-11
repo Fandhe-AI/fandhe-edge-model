@@ -213,9 +213,32 @@ fn limit_report(w: Workload, e: &ResourceLimitExceeded) -> ErrorReport {
 
 /// `infer` を worker として起動し、時間・RSS を監視して結果を `out` へ中継する。
 ///
+/// `FANDHE_EDGE_HISTORY=1` で `--text` のときだけ、結果を `out` へ出し終えた（flush した）後に判定履歴を
+/// 1 行追記する（既定は無効。入力の全文が手元の `history.jsonl` に残る。常駐経由でも単独でも、監督が worker を
+/// 止めた `limit_exceeded` でも、ここ 1 か所。保存は監督の上限の外で、独立した短い上限つき。履歴の失敗・停滞は
+/// 捨て、出力・終了コードは変えない。`--input-file` は対象外。[`crate::infer_history`]。#711・REQ-33・REQ-38・REQ-39）。
+///
 /// # Errors
 /// `out` への書き込み失敗（呼び出し側は exit 70 に写す）。
 pub fn run<W: Write>(
+    out: &mut W,
+    args: &InferArgs,
+    raw_args: impl IntoIterator<Item = OsString>,
+    cwd: &Path,
+) -> io::Result<ExitCode> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(started) = crate::infer_history::begin(args) {
+        let mut tee = crate::infer_history::Tee::new(out);
+        let code = run_plain(&mut tee, args, raw_args, cwd)?;
+        // 判定の出力を先に届けてから履歴を書く。flush の失敗は run の失敗と同じ扱いで、履歴は書かない。
+        tee.flush()?;
+        crate::infer_history::record(args, started, &tee.captured, code);
+        return Ok(code);
+    }
+    run_plain(out, args, raw_args, cwd)
+}
+
+fn run_plain<W: Write>(
     out: &mut W,
     args: &InferArgs,
     raw_args: impl IntoIterator<Item = OsString>,
@@ -407,6 +430,7 @@ fn launch<W: Write>(
                 if std::env::var_os(crate::serve::NO_SERVE_ENV).is_some() {
                     cmd = cmd.env(crate::serve::NO_SERVE_ENV, "1");
                 }
+                // 判定履歴（#711）は親（`run`）が書く。worker には有効化の環境変数を渡さない。
             }
             Ok((cmd, config))
         });

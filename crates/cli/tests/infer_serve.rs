@@ -975,30 +975,45 @@ fn req39_worker_rss_over_limit_at_startup_exits_without_socket() {
 fn req39_connection_limit_returns_limit_exceeded_for_large_request() {
     let (ws, dir) = (workspace("conn"), serve_dir("conn"));
     let _server = Server::start(&ws, &dir, "c", &[]);
-    let held: Vec<UnixStream> = (0..64)
-        .map(|_| UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect"))
-        .collect();
-    // 常駐が 64 本とも受け付けて数えるまで待つ（負荷で受け付けが遅れても決定的にする）: 何も送らない
-    // 追加の接続に、読まずに `limit_exceeded` が返ってくれば上限に達している。
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        let mut probe = UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect");
-        probe
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .expect("timeout");
-        let mut buf = Vec::new();
-        let _ = probe.read_to_end(&mut buf);
-        if buf.starts_with(b"{\"status\":\"ok\",\"exit_code\":20,") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the connection limit was not reached"
-        );
-    }
     // 引数 1 つの長さの上限（Linux は 128 KiB）に収まり、ソケットのバッファ（macOS は 8 KiB）より大きい入力。
     let text = "a".repeat(120_000);
-    assert_limit_exceeded(&infer(&ws, &dir, "c", false, &text));
+    // 何も送らない接続は、常駐が読み取りの期限（10 秒）で閉じて枠を空ける。負荷で `infer` の起動が遅れると
+    // 枠が空いた後に届いて委ねられてしまうので、塞ぎ直して数回まで試す（上限に達した状態で届いた 1 回を見る）。
+    let mut run = None;
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        held = (0..64)
+            .map(|_| UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect"))
+            .collect::<Vec<UnixStream>>();
+        // 常駐が 64 本とも受け付けて数えるまで待つ: 何も送らない追加の接続に、読まずに `limit_exceeded` が
+        // 返ってくれば上限に達している。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let mut probe = UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect");
+            probe
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            let mut buf = Vec::new();
+            let _ = probe.read_to_end(&mut buf);
+            if buf.starts_with(b"{\"status\":\"ok\",\"exit_code\":20,") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the connection limit was not reached"
+            );
+        }
+        let filled = Instant::now();
+        let got = infer(&ws, &dir, "c", false, &text);
+        // 塞いでから 5 秒以内に終わっていれば、枠はまだ空いていない（読み取りの期限 10 秒の半分）。
+        let in_time = filled.elapsed() < Duration::from_secs(5);
+        let limited = got.code == Some(20);
+        run = Some(got);
+        if in_time || limited {
+            break;
+        }
+    }
+    assert_limit_exceeded(&run.expect("at least one attempt"));
     drop(held);
     // 接続が空けば委ねられる（接続スレッドが抜けるまでの間は `limit_exceeded` が返りうるので、上限つきで待つ）。
     let deadline = Instant::now() + Duration::from_secs(10);
