@@ -917,6 +917,20 @@ impl RssProbe for SystemRssProbe {
     }
 }
 
+/// 自プロセスの RSS（バイト）。常駐プロセス `serve` が自分の RSS を見張るための入口（REQ-39・#708）。
+/// 計測は子の監視（[`run_with_limits`]）と同じ実装（Linux は `/proc`、macOS は libproc）。
+///
+/// `Ok(None)` は終了処理中などで観測できないことを表す。
+///
+/// # Errors
+/// プロセスの状態を読めないとき（呼び出し側は fail-closed で扱う）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn current_process_rss_bytes() -> io::Result<Option<u64>> {
+    SystemRssProbe
+        .rss_bytes(std::process::id())
+        .map_err(|_| io::Error::other("rss probe failed"))
+}
+
 /// kill を送り、有界の間だけ回収を待つ。
 fn kill_and_reap<C: ChildControl, K: Clock>(child: &mut C, clock: &K) -> Result<(), GuardRunError> {
     let give_up = clock
