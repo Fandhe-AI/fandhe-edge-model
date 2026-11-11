@@ -663,6 +663,9 @@ fn req39_oversized_text_is_not_delegated() {
 }
 
 /// 応答の前に常駐が終わった（判定中に kill）ときは、クライアントが単独で判定して exit 0。
+///
+/// REQ-39・#709: 親が SIGKILL されたら、判定中の worker も自分の見張りで親の不在に気づいてすぐ終わる
+/// （判定の遅延 10 秒の終わりを待たない。親の見張りを失ったまま動き続けない）。
 #[test]
 fn serve_killed_while_judging_falls_back_to_standalone() {
     let (ws, dir) = (workspace("kill"), serve_dir("kill"));
@@ -670,13 +673,17 @@ fn serve_killed_while_judging_falls_back_to_standalone() {
         &ws,
         &dir,
         "c",
-        &[("FANDHE_EDGE_SERVE_TEST_DELAY_MS", "5000")],
+        &[("FANDHE_EDGE_SERVE_TEST_DELAY_MS", "10000")],
     );
-    let run = thread::scope(|s| {
+    let workers = child_pids(server.child.as_ref().expect("child").id());
+    assert_eq!(workers.len(), 1, "one worker: {workers:?}");
+    let (run, stop_took, log) = thread::scope(|s| {
         let h = s.spawn(|| infer(&ws, &dir, "c", false, "hello world"));
         thread::sleep(Duration::from_millis(1500));
-        let _ = server.stop();
-        h.join().expect("join")
+        // `stop` は親を kill し、stderr が閉じる（worker も終わる）まで待つ。
+        let stopping = Instant::now();
+        let log = server.stop();
+        (h.join().expect("join"), stopping.elapsed(), log)
     });
     assert_eq!(
         run.code,
@@ -689,6 +696,11 @@ fn serve_killed_while_judging_falls_back_to_standalone() {
         "serve: standalone (serve closed the connection)"
     );
     assert!(run.stdout.starts_with(b"{"));
+    // 遅延の残り（8.5 秒）を待たずに worker が終わっている。
+    assert!(stop_took < Duration::from_secs(4), "{stop_took:?}");
+    assert!(gone_within(workers[0], Duration::from_secs(1)));
+    assert!(log.contains("parent is gone; worker exiting"), "{log}");
+    assert!(!log.contains("exit_code="), "{log}");
     let _ = fs::remove_dir_all(&ws);
 }
 
@@ -726,6 +738,23 @@ fn c_request(ws: &Path, text: &str) -> ServeRequest {
         text: text.into(),
         package: c_identity(ws),
     }
+}
+
+/// `pid` のプロセスが `wait` 以内に消えるか。
+fn gone_within(pid: u32, wait: Duration) -> bool {
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0")
+            .success()
+    };
+    let deadline = Instant::now() + wait;
+    while alive() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    !alive()
 }
 
 /// `parent` の直接の子（worker）の pid。
@@ -819,19 +848,10 @@ fn req39_externally_killed_worker_is_restarted() {
     assert_ne!(workers, after);
     // 親を止めたら、作り直した worker も（stdin の EOF で）消える。
     let _ = server.stop();
-    let alive = |pid: u32| {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(Stdio::null())
-            .status()
-            .expect("kill -0")
-            .success()
-    };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while alive(after[0]) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(!alive(after[0]), "the worker must exit after its parent");
+    assert!(
+        gone_within(after[0], Duration::from_secs(10)),
+        "the worker must exit after its parent"
+    );
     let _ = fs::remove_dir_all(&ws);
 }
 
@@ -1174,5 +1194,48 @@ fn req39_startup_removes_legacy_socket() {
     assert_parity(&ws, &dir, "c", "zzz");
     // Drop が置き場所を消すので、先に常駐を止める。
     drop(server);
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・REQ-21・#709: 起動が worker の `ready` 待ちより前で止まっても（`serve.lock` が読み手のいない FIFO で、
+/// 書き込み専用の open が返らない）、起動全体の期限で `limit_exceeded` の JSON 1 つ・exit 20 で終わり、
+/// ソケットを作らない。
+#[test]
+fn req39_startup_stuck_before_worker_hits_the_startup_limit() {
+    let (ws, dir) = (workspace("fifo"), serve_dir("fifo"));
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let made = Command::new("mkfifo")
+        .arg(dir.join("serve.lock"))
+        .status()
+        .expect("mkfifo");
+    assert!(made.success());
+    let started = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_fandhe-edge"))
+        .args(["serve", "--package", "c"])
+        .current_dir(&ws)
+        .env("FANDHE_EDGE_SERVE_DIR", &dir)
+        .env("FANDHE_EDGE_SERVE_TEST_STARTUP_MS", "500")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(20));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("startup time limit exceeded; exiting"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // 種類別の上限（10 秒）ではなく、縮めた起動の期限で終わっている。
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!dir.join(SOCKET_FILE).exists());
+    let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&ws);
 }

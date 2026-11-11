@@ -55,7 +55,15 @@
 //!   [`MAX_BARREN_RESTARTS`] 回続いた（exit 70）
 //! - **起動**: worker の読み込みの失敗は、単独の `infer` と同じ stdout・終了コードで終わる。`ready` が
 //!   `limits.time()` 以内に来なければ `limit_exceeded`（exit 20）。どちらもソケットは作らない
-//! - 親が終わる経路では worker を止めてから終わる。親が SIGKILL された場合は、worker が stdin の EOF で終わる
+//! - **起動の全体**: 親の見張りは、置き場所・ロックに触る前から待ち受けの開始までの時間も見る。`limits.time()` を
+//!   過ぎても待ち受けに至らなければ `limit_exceeded`（exit 20）の JSON を 1 つ出して終わる（ロックファイルの
+//!   open が止まる場合なども覆う）
+//! - **worker 自身の見張り**（約 50 ms ごと。親の見張りと二重）: 親がいなくなったらすぐ終わる（exit 70）。
+//!   読み込みが `limits.time()` を過ぎた・自分の RSS が `limits.memory()` を超えたら exit 20（RSS を読めなければ
+//!   exit 70）。親は worker の終了コード 20 を回収時に見て、判定中の要求を `limit_exceeded` にする
+//! - 親が終わる経路では worker を止めてから終わる。親が SIGTERM・SIGKILL された場合は、worker が自分の見張りで
+//!   親の不在に気づいて終わる（待機中なら stdin の EOF でも終わる）。終了処理に入った後は、親の見張りは
+//!   何もしない（終了コードを上書きしない）
 //!
 //! # 置き場所と権限（REQ-39）
 //!
@@ -76,8 +84,7 @@
 //! - 接続してきた相手の uid の照合（`getpeereid`）はしない（std で書けない）。0700 のディレクトリと 0600 の
 //!   ソケットで、他の uid は接続できない
 //! - RSS は約 50 ms 間隔のポーリングで、間隔の間は上限を超えうる。見るのは親と worker だけ
-//! - worker は自分の見張りを持たない。親が SIGKILL された後、読み込みや計算の途中の worker は、それが済んで
-//!   stdin を読むまで残る
+//! - worker が親の不在に気づくのは約 50 ms ごとの確認で、その間は動き続ける。worker の子孫プロセスは見ない
 //! - `accept` から close-on-exec の設定までの間に作り直しが走ると、その接続の fd を worker が継承しうる
 //!   （worker は使わない。接続が worker の終了まで閉じ切らないことがある）
 //! - worker の応答と要求の id は照合しない（要求は 1 件ずつ渡し、頼んでいない行が来た worker は作り直す）
@@ -152,6 +159,9 @@ const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// worker 子として起動されたことを示す環境変数（値が `"1"` と完全一致するときだけ worker。#709）。
 pub const SERVE_WORKER_ENV: &str = "FANDHE_EDGE_SERVE_WORKER";
+/// 親が worker 子へ自分の pid を渡す環境変数。worker は親がこの pid でなくなったら終わる（起動時に自分で
+/// 読む親の pid だと、読む前に親が終わっていた場合に気づけないため）。
+const SERVE_PARENT_PID_ENV: &str = "FANDHE_EDGE_SERVE_PARENT_PID";
 /// 要求の `cli_version` と照合する自分の版。
 const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 判定スレッドが、要求を待つ間に worker の生死を確かめる間隔。
@@ -175,6 +185,10 @@ const TEST_HANG_DURATION: Duration = Duration::from_secs(60);
 /// 親の 1 件の期限をこの値（ms）に縮める（デバッグビルド限定）。
 #[cfg(debug_assertions)]
 const TEST_TIME_ENV: &str = "FANDHE_EDGE_SERVE_TEST_TIME_MS";
+/// 親の起動全体の期限をこの値（ms）に縮める（デバッグビルド限定。worker の `ready` 待ちと worker 自身の
+/// 読み込みの期限には効かない）。
+#[cfg(debug_assertions)]
+const TEST_STARTUP_ENV: &str = "FANDHE_EDGE_SERVE_TEST_STARTUP_MS";
 /// 親が worker に使う RSS の上限をこの値（バイト）に縮める（デバッグビルド限定）。
 #[cfg(debug_assertions)]
 const TEST_RSS_LIMIT_ENV: &str = "FANDHE_EDGE_SERVE_TEST_RSS_LIMIT_BYTES";
@@ -341,9 +355,26 @@ fn log_line(msg: std::fmt::Arguments<'_>) {
     }
 }
 
-/// worker を止め、ログを（上限つきで）流し切ってから終了する。stderr が詰まっていても `LOG_DRAIN_WAIT` を
-/// 超えて待たない。worker のロックを持ったまま呼ばないこと。
+/// 終了処理に入ったか。入った後は見張りが何もしない（終了中に別の理由で終了コードを上書きしない）。
+static EXITING: AtomicBool = AtomicBool::new(false);
+
+/// 終了処理に入る。最初に入ったスレッドだけが真を受け取り、終了コードを決める。
+fn begin_exit() -> bool {
+    !EXITING.swap(true, Ordering::SeqCst)
+}
+
+/// 終了する。先に別のスレッドが終了処理に入っていたら、そちらの終了を待つ（終了コードを上書きしない）。
+/// worker のロックを持ったまま呼ばないこと。
 fn exit_with(code: ExitCode) -> ! {
+    if !begin_exit() {
+        wait_for_exit();
+    }
+    finish_exit(code)
+}
+
+/// worker を止め、ログを（上限つきで）流し切ってから終了する。stderr が詰まっていても `LOG_DRAIN_WAIT` を
+/// 超えて待たない。[`begin_exit`] で終了処理に入ったスレッドだけが呼ぶ。
+fn finish_exit(code: ExitCode) -> ! {
     kill_worker();
     let deadline = Instant::now() + LOG_DRAIN_WAIT;
     while LOG_PENDING.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
@@ -382,14 +413,14 @@ fn unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// 終了を決めた別のスレッド（stdout へ JSON を書いている側）がプロセスを終えるのを待つ。stdout で詰まっても
-/// 残り続けないよう、期限つき。
+/// 終了を決めた別のスレッド（stdout へ JSON を書いている側・終了処理に入った側）がプロセスを終えるのを待つ。
+/// 相手が詰まっても残り続けないよう、期限つき。
 fn wait_for_exit() -> ! {
     let deadline = Instant::now() + STARTUP_ERROR_WAIT;
     while Instant::now() < deadline {
         thread::park_timeout(Duration::from_millis(100));
     }
-    exit_with(ExitCode::RuntimeError)
+    finish_exit(ExitCode::RuntimeError)
 }
 
 /// 起動失敗の 1 行を stdout へ 1 回だけ書く。先に見張りのスレッドが書く（終了する）側なら、その終了を待つ。
@@ -459,6 +490,15 @@ fn job_budget(limits: SafetyLimits) -> Duration {
     limits.time().get().saturating_add(SINGLE_HARD_LIMIT_GRACE)
 }
 
+/// 親の起動（待ち受けの開始まで）に許す時間（種類別の時間の上限と同じ値）。
+fn startup_budget(limits: SafetyLimits) -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = test_env_u64(TEST_STARTUP_ENV) {
+        return Duration::from_millis(ms);
+    }
+    limits.time().get()
+}
+
 /// 親が worker 子に許す RSS（種類別の安全上限と同じ値）。
 fn worker_rss_limit(limits: SafetyLimits) -> u64 {
     #[cfg(debug_assertions)]
@@ -492,6 +532,13 @@ fn read_pipe_line<R: BufRead>(reader: &mut R, limit: usize) -> io::Result<Option
 /// stdin が EOF（親が終わった）なら exit 0。ハード期限で計算スレッドを切り離したら、応答を書いた後に exit 20
 /// （切り離したスレッドとメモリを積み上げない。親が作り直す）。
 fn run_worker<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result<ExitCode> {
+    let loaded = Arc::new(AtomicBool::new(false));
+    if spawn_worker_guard(args, cwd, Arc::clone(&loaded)).is_err() {
+        let report = runtime("cannot start serve worker guard thread");
+        out.write_all(&encode_response(&error_response(&report)))?;
+        out.flush()?;
+        return Ok(report.code);
+    }
     let infer_args = InferArgs {
         package: args.package.clone(),
         source: InferSource::Text {
@@ -521,6 +568,7 @@ fn run_worker<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result
     } = prepared;
     let io_schema = definition.io().clone();
     let pipeline = Arc::new(pipeline);
+    loaded.store(true, Ordering::SeqCst);
     send(&ServeResponse::Ready {
         package: identity,
         cli_version: CLI_VERSION.to_string(),
@@ -594,6 +642,87 @@ fn run_worker<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result
     }
 }
 
+/// worker 自身の見張りが終了を決めたときの終了コードとログの文。`None` は続行。
+///
+/// - 親が `expected_parent` でなくなった: 親の見張りを失ったまま動き続けないよう、すぐ終わる（exit 70）
+/// - 読み込み中（`startup`）に `time_limit` を過ぎた: exit 20
+/// - 自分の RSS が `memory_limit` を超えた: exit 20。読めなければ fail-closed で exit 70
+fn worker_guard_verdict(
+    parent: u32,
+    expected_parent: u32,
+    startup_elapsed: Option<Duration>,
+    time_limit: Duration,
+    rss: io::Result<Option<u64>>,
+    memory_limit: u64,
+) -> Option<(ExitCode, &'static str)> {
+    if parent != expected_parent {
+        return Some((ExitCode::RuntimeError, "parent is gone; worker exiting"));
+    }
+    if startup_elapsed.is_some_and(|elapsed| elapsed > time_limit) {
+        return Some((
+            ExitCode::LimitExceeded,
+            "worker startup time limit exceeded; worker exiting",
+        ));
+    }
+    match rss {
+        Ok(Some(rss)) if rss > memory_limit => Some((
+            ExitCode::LimitExceeded,
+            "worker memory limit exceeded; worker exiting",
+        )),
+        Ok(_) => None,
+        Err(_) => Some((
+            ExitCode::RuntimeError,
+            "worker memory probe failed; worker exiting",
+        )),
+    }
+}
+
+/// worker 自身の見張りのスレッド（約 50 ms ごと。REQ-39・#709）。親の見張りと二重で、先に気づいた側が止める。
+/// 親が SIGTERM・SIGKILL で消えた後も、読み込み・判定の途中の worker が上限なしで動き続けないためのもの。
+///
+/// 上限は親と同じ求め方（`kind` の先読み）。読み込み中（`loaded` が偽）に上限で終わるときは、親が起動の失敗
+/// として同じ終了コードを出せるよう、エラーの 1 行を stdout に書いてから終わる（読み込み中は main スレッドが
+/// stdout に書かない）。読み込み後は何も書かずに終わり、親は終了コード 20 を回収時に見て `limit_exceeded` にする。
+fn spawn_worker_guard(args: &ServeArgs, cwd: &Path, loaded: Arc<AtomicBool>) -> io::Result<()> {
+    let limits = peek_checked_kind(cwd, &args.package)
+        .map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(k.as_str()));
+    let expected_parent = std::env::var(SERVE_PARENT_PID_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(std::os::unix::process::parent_id);
+    let started = Instant::now();
+    thread::Builder::new()
+        .name("serve-worker-guard".to_string())
+        .spawn(move || {
+            loop {
+                thread::sleep(GUARD_POLL_INTERVAL);
+                let startup = !loaded.load(Ordering::SeqCst);
+                let Some((code, msg)) = worker_guard_verdict(
+                    std::os::unix::process::parent_id(),
+                    expected_parent,
+                    startup.then(|| started.elapsed()),
+                    limits.time().get(),
+                    current_process_rss_bytes(),
+                    limits.memory().get(),
+                ) else {
+                    continue;
+                };
+                if !begin_exit() {
+                    wait_for_exit();
+                }
+                log_line(format_args!("{msg}"));
+                if startup && arm_exit_deadline(code) {
+                    let report = ErrorReport::new(code, default_message(code));
+                    let mut stdout = io::stdout().lock();
+                    let _ = stdout.write_all(&encode_response(&error_response(&report)));
+                    let _ = stdout.flush();
+                }
+                finish_exit(code);
+            }
+        })
+        .map(|_| ())
+}
+
 // ───────────────────────── 親: worker 子の持ち方 ─────────────────────────
 
 /// 親が持つ worker 子の状態。見張り（計測・kill）・判定スレッド（回収・作り直し）・終了処理（kill）が同じ
@@ -665,21 +794,27 @@ fn kill_and_reap_child(child: &mut Child, timeout: Duration) -> bool {
 /// 親が終わる前に worker を止める（7B の読み込みを続ける孤児を残さない）。回収は [`EXIT_REAP_TIMEOUT`] まで
 /// 待つだけで、できなくても終了を続ける（残りは親の終了で init が回収する）。
 fn kill_worker() {
-    if let Some(child) = worker_slot().child.as_mut() {
-        let _ = kill_and_reap_child(child, EXIT_REAP_TIMEOUT);
+    let mut slot = worker_slot();
+    if let Some(child) = slot.child.as_mut()
+        && kill_and_reap_child(child, EXIT_REAP_TIMEOUT)
+    {
+        // 回収済みの pid を残さない（見張りが消えた pid を計測しない）。
+        slot.child = None;
     }
 }
 
-/// worker を止めて回収する（[`WORKER_REAP_TIMEOUT`] まで）。戻り値は、見張りが上限で止めていたか。
+/// worker を止めて回収する（[`WORKER_REAP_TIMEOUT`] まで）。戻り値は、上限で止まったか（親の見張りが止めた、
+/// または worker が自分の見張りで exit 20 で終わっていた）。判定中の要求を `limit_exceeded` にするのに使う。
 /// 回収できなければ、止められない worker を抱えたまま続けず、理由をログに出して親ごと exit 70 で終える。
 fn reap_worker() -> bool {
     let (child, limit_killed) = {
         let mut slot = worker_slot();
         (slot.child.take(), slot.limit_killed)
     };
-    if let Some(mut child) = child
-        && !kill_and_reap_child(&mut child, WORKER_REAP_TIMEOUT)
-    {
+    let Some(mut child) = child else {
+        return limit_killed;
+    };
+    if !kill_and_reap_child(&mut child, WORKER_REAP_TIMEOUT) {
         // 終了処理が最後にもう一度だけ kill を試みられるよう、戻してから終える。
         worker_slot().child = Some(child);
         fatal_exit(
@@ -688,7 +823,10 @@ fn reap_worker() -> bool {
             !SERVING.load(Ordering::SeqCst),
         );
     }
-    limit_killed
+    // 回収済みなので、保持されている終了状態を読むだけ（kill が効く前に自分で終わっていれば終了コードが残る）。
+    let self_limited = child.try_wait().ok().flatten().and_then(|s| s.code())
+        == Some(i32::from(ExitCode::LimitExceeded.code()));
+    limit_killed || self_limited
 }
 
 /// 判定スレッドが持つ worker との口（stdin と、stdout の行を渡す受け口）。
@@ -714,6 +852,7 @@ fn spawn_worker(args: &ServeArgs, cwd: &Path) -> Result<WorkerIo, ErrorReport> {
         .arg("--package")
         .arg(&args.package)
         .env(SERVE_WORKER_ENV, "1")
+        .env(SERVE_PARENT_PID_ENV, std::process::id().to_string())
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -857,6 +996,8 @@ pub fn run<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result<Ex
         return run_worker(out, args, cwd);
     }
     let result = run_parent(out, args, cwd);
+    // 起動失敗で戻る。見張りに終了コードを上書きさせず、worker を止めてから終わる。
+    let _ = begin_exit();
     kill_worker();
     result
 }
@@ -1206,6 +1347,9 @@ fn respawn(ctx: &JudgeCtx, streak: &mut u32) -> WorkerIo {
 /// stdout に 1 回だけ出す（先に取った側だけが書く。`STDOUT_CLAIMED`）。先に別のスレッドが取っていたら、
 /// そちらが終えるのを待つ（JSON は 1 つだけ。終了コードは先に取った側のもの）。
 fn fatal_exit(code: ExitCode, msg: &'static str, startup: bool) -> ! {
+    if !begin_exit() {
+        wait_for_exit();
+    }
     log_line(format_args!("{msg}"));
     if startup {
         if !claim_stdout() {
@@ -1216,7 +1360,7 @@ fn fatal_exit(code: ExitCode, msg: &'static str, startup: bool) -> ! {
             let _ = write_error_report(&mut io::stdout().lock(), &report);
         }
     }
-    exit_with(code)
+    finish_exit(code)
 }
 
 /// worker の RSS を見た後の動き。
@@ -1253,6 +1397,9 @@ fn worker_rss_action(rss: Option<u64>, limit: u64, settled: bool) -> WorkerActio
 /// worker の計測は回収と同じロックの下で行う（回収済みの pid を計測しない）。親を終えるときは
 /// ロックを離してから終える（終了処理が worker を止める）。
 fn guard_tick(limits: SafetyLimits, startup: bool) {
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
     match current_process_rss_bytes() {
         Ok(Some(rss)) if rss > limits.memory().get() => {
             fatal_exit(
@@ -1269,6 +1416,10 @@ fn guard_tick(limits: SafetyLimits, startup: bool) {
         ),
     }
     let mut slot = worker_slot();
+    // ロックを待つ間に終了処理が始まっていたら（worker を回収している）、何もしない。
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
     let Some(pid) = slot.child.as_ref().map(Child::id) else {
         return;
     };
@@ -1308,13 +1459,27 @@ fn guard_tick(limits: SafetyLimits, startup: bool) {
 }
 
 /// 資源の見張りのスレッド（約 50 ms ごとに [`guard_tick`]。REQ-39・#708・#709）。[`SERVING`] が偽の間は起動中。
+///
+/// 起動の全体（このスレッドの起動＝置き場所・ロックに触る前から、待ち受けの開始まで）にも期限を掛ける。
+/// `startup_budget` を過ぎても待ち受けに至らなければ、worker がいれば止めて、`limit_exceeded` の JSON を
+/// stdout に 1 つ出して exit 20（ロックファイルの open など、worker の `ready` 待ち以外で止まる場合も覆う）。
 fn spawn_guard_thread(limits: SafetyLimits) -> io::Result<()> {
+    let started = Instant::now();
+    let budget = startup_budget(limits);
     thread::Builder::new()
         .name("serve-guard".to_string())
         .spawn(move || {
             loop {
                 thread::sleep(GUARD_POLL_INTERVAL);
-                guard_tick(limits, !SERVING.load(Ordering::SeqCst));
+                let startup = !SERVING.load(Ordering::SeqCst);
+                if startup && started.elapsed() > budget {
+                    fatal_exit(
+                        ExitCode::LimitExceeded,
+                        "startup time limit exceeded; exiting",
+                        true,
+                    );
+                }
+                guard_tick(limits, startup);
             }
         })
         .map(|_| ())
@@ -1323,6 +1488,43 @@ fn spawn_guard_thread(limits: SafetyLimits) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-39・#709: worker 自身の見張り。親の不在は最優先で exit 70、読み込み中の時間切れと RSS 超過は
+    /// exit 20、RSS を読めなければ exit 70。上限ちょうど・読み込み後の経過時間では止めない。
+    #[test]
+    fn req39_worker_guard_verdict_branches() {
+        let t = Duration::from_secs(10);
+        let code = |v: Option<(ExitCode, &str)>| v.map(|(c, _)| c);
+        let over = Some(Duration::from_secs(11));
+        assert_eq!(
+            worker_guard_verdict(7, 7, Some(t), t, Ok(Some(100)), 100),
+            None
+        );
+        assert_eq!(worker_guard_verdict(7, 7, None, t, Ok(None), 100), None);
+        assert_eq!(
+            worker_guard_verdict(1, 7, over, t, Ok(Some(101)), 100),
+            Some((ExitCode::RuntimeError, "parent is gone; worker exiting"))
+        );
+        assert_eq!(
+            code(worker_guard_verdict(7, 7, over, t, Ok(Some(1)), 100)),
+            Some(ExitCode::LimitExceeded)
+        );
+        assert_eq!(
+            code(worker_guard_verdict(7, 7, None, t, Ok(Some(101)), 100)),
+            Some(ExitCode::LimitExceeded)
+        );
+        assert_eq!(
+            code(worker_guard_verdict(
+                7,
+                7,
+                None,
+                t,
+                Err(io::Error::other("probe")),
+                100
+            )),
+            Some(ExitCode::RuntimeError)
+        );
+    }
 
     /// #709: ソケットのファイル名の数字は `PROTOCOL_VERSION` と一致し、以前の名前とは重ならない。
     #[test]
