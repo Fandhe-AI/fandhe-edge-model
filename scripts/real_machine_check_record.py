@@ -369,9 +369,9 @@ class Interrupted(BaseException):  # Exception で捕まえられないよう Ba
 _interrupt_requested = False
 # 中断シグナルを受けた回数。2 回目以降は後始末の完了を待たず強制終了する（`_on_signal`。REQ-39）
 _signal_count = 0
-# 実行中の子のプロセスグループ id。`Popen` 生成直後に立て、回収の直後に下ろす（`run_cmd`）。
-# 2 回目のシグナルのハンドラが KILL を送る宛先。回収から下ろすまでの数命令の窓で pid が
-# 再利用される誤爆の余地は既知の限界（確率は無視できる）
+# 実行中の子のプロセスグループ id。`Popen` 生成直後に立て、回収後もグループが消えるまで保持して
+# 下ろす（`run_cmd`）。2 回目のシグナルのハンドラが KILL を送る宛先。グループが残る間は id が
+# 再利用されない。消滅から下ろすまでの窓（ポーリング間隔以下）の誤爆は既知の限界（確率は無視できる）
 _active_pgid: int | None = None
 # `Popen` の呼び出しから `_active_pgid` の登録までの間だけ立てる印。この間は宛先の pgid が
 # まだ無いため、2 回目のシグナルでも強制終了せず `_force_pending` を立てて戻る（REQ-39）
@@ -732,6 +732,29 @@ def _kill_group(pid: int) -> bool:
     return True
 
 
+def _wait_group_gone(pgid: int) -> bool:
+    """KILL を送ったグループの全員が消えるまで上限つきで待つ。リーダーの回収後に呼ぶ（REQ-39）。
+
+    リーダーを回収しても、孫が実行中の `write` 1 回分を書き終えてから止まることがある（#715）。
+    グループが残る間は pgid が再利用されないため、回収後のシグナル 0 の確認は誤爆しない。
+    消えれば True、`REAP_WAIT_LIMIT_SECONDS` 内に消えない・確かめられなければ False。
+    macOS は、孫が回収待ち（zombie）の間 `EPERM` を返す（数 ms。実機）。まだ居るとして待つ。
+    """
+    deadline = time.monotonic() + REAP_WAIT_LIMIT_SECONDS
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        except OSError:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
 def _resolve_exe(name: str) -> str | None:
     """実行ファイルの絶対パスを返す。`/` を含まない名前は PATH から探す。無ければ None。"""
     exe = name if "/" in name else shutil.which(name)
@@ -853,17 +876,22 @@ def run_cmd(
                     time.sleep(0.02)
             finally:
                 # 例外・中断・期限超過で抜けたら、リーダーが未回収（poll が None）のうちに KILL する
-                if proc.poll() is None and not _kill_group(proc.pid):
-                    # グループへ送れなかったときは孫が残りうる。回収の成否に関わらず残留の可能性を
-                    # 記録し、結果は採用しない（fail-closed。REQ-39）。せめてリーダーだけでも止める
-                    # pgid は残さない: リーダーが回収されると pid が再利用されうるため、回収済みの
-                    # id への再送は無関係なグループを止めうる。未回収のまま残る場合だけ下で保持する
-                    _child_may_remain = True
-                    reason = REASON_UNREAPED  # timeout 等より優先（次の回を始めさせない）
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+                # 正常終了でも、`GROUP_WRAPPER` がグループへ KILL を送っている
+                group_killed = reap_group
+                if proc.poll() is None:
+                    group_killed = _kill_group(proc.pid)
+                    if not group_killed:
+                        # グループへ送れなかったときは孫が残りうる。回収の成否に関わらず
+                        # 残留の可能性を記録し、結果は採用しない（fail-closed。REQ-39）。
+                        # せめてリーダーだけでも止める。pgid は残さない: リーダーが回収されると
+                        # pid が再利用されうるため、回収済みの id への再送は無関係なグループを
+                        # 止めうる。未回収のまま残る場合だけ下で保持する
+                        _child_may_remain = True
+                        reason = REASON_UNREAPED  # timeout 等より優先（次の回を始めさせない）
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
                 try:
                     proc.wait(timeout=REAP_WAIT_LIMIT_SECONDS)
                 except subprocess.TimeoutExpired:
@@ -871,6 +899,10 @@ def run_cmd(
                     _child_may_remain = True
                     _leftover_procs.append(proc)
                     reason = REASON_UNREAPED
+                else:
+                    if group_killed and not _wait_group_gone(proc.pid):
+                        _child_may_remain = True  # 孫が止まり切らない（fail-closed。#715）
+                        reason = REASON_UNREAPED
                 finally:
                     _active_pgid = None
     except (OSError, ValueError):
@@ -2666,13 +2698,16 @@ def run_bounded(
     finally:
         # リーダーが未回収のうちにグループごと KILL してから回収する（pid の再利用を避ける）
         global _child_may_remain
-        if proc.poll() is None and not _kill_group(proc.pid):
-            # グループへ送れなかった。孫が残りうるので記録し、せめてリーダーだけでも止める
-            _child_may_remain = True
-            try:
-                proc.kill()
-            except OSError:
-                pass
+        group_killed = False
+        if proc.poll() is None:
+            group_killed = _kill_group(proc.pid)
+            if not group_killed:
+                # グループへ送れなかった。孫が残りうるので記録し、せめてリーダーだけでも止める
+                _child_may_remain = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
         try:
             proc.wait(timeout=REAP_WAIT_LIMIT_SECONDS)
         except subprocess.TimeoutExpired:
@@ -2681,6 +2716,10 @@ def run_bounded(
             _child_may_remain = True
             _leftover_procs.append(proc)
             reason = REASON_UNREAPED
+        else:
+            if group_killed and not _wait_group_gone(proc.pid):
+                _child_may_remain = True  # 孫が止まり切らない（fail-closed。#715）
+                reason = REASON_UNREAPED
     if reason is None and (
         os.fstat(out.fileno()).st_size > out_cap or os.fstat(err.fileno()).st_size > err_cap
     ):
