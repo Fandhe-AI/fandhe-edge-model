@@ -1,0 +1,43 @@
+#!/bin/sh
+# Claude Code プラグインの判定ラッパー（REQ-33・REQ-36・REQ-38・#726・#729）。
+#
+# skill `judge` から `fandhe-edge-judge --text "<入力>"` の形で呼ばれる。
+# 呼ぶたびに常駐 `fandhe-edge serve` を裏で起動し（動いていれば serve 側が
+# 読み込み前に終わる）、続けて `fandhe-edge infer` を実行して、その stdout
+# （JSON 1 つ）と終了コード（REQ-21 の 7 種）をそのまま返す。初回の判定は
+# 常駐の準備を待たず、infer が単独で行う。
+#
+# 環境変数:
+#   FANDHE_EDGE_PACKAGE         必須。パッケージのパス。ガード層の閉じ込めにより、
+#                               呼び出し時のカレントディレクトリ配下に限られる
+#   FANDHE_EDGE_IDLE_EXIT_SECS  任意（既定 600。#710 の計測後に見直す推定値）。
+#                               使われない常駐が自分で終わるまでの秒数
+#
+# 名前を `fandhe-edge` にしないのは、PATH 上の本体を隠して自分自身を
+# 呼ぶ再帰を避けるため。引数は "$@" のみで、eval・文字列連結は使わない。
+
+# エラーは CLI の ErrorReport と同形の JSON 1 行を stdout へ出す。
+# メッセージは固定文で、環境変数の値や入力を埋め込まない。
+fail() {
+    printf '{"code":"%s","message":"%s"}\n' "$1" "$2"
+    exit "$3"
+}
+
+if [ -z "${FANDHE_EDGE_PACKAGE:-}" ]; then
+    fail invalid_input "FANDHE_EDGE_PACKAGE is not set" 64
+fi
+
+idle="${FANDHE_EDGE_IDLE_EXIT_SECS:-600}"
+case "$idle" in
+    '' | *[!0-9]* | 0 | 0[0-9]*)
+        fail invalid_input "FANDHE_EDGE_IDLE_EXIT_SECS must be an integer of 1 or more" 64
+        ;;
+esac
+
+if ! command -v fandhe-edge >/dev/null 2>&1; then
+    fail runtime_error "fandhe-edge is not installed: cargo install --git https://github.com/Fandhe-AI/fandhe-edge-model --tag v0.1.0 --locked fandhe-edge-cli" 70
+fi
+
+nohup fandhe-edge serve --package "$FANDHE_EDGE_PACKAGE" --idle-exit-secs "$idle" >/dev/null 2>&1 </dev/null &
+
+exec fandhe-edge infer --package "$FANDHE_EDGE_PACKAGE" "$@"

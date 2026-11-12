@@ -1,0 +1,15 @@
+{
+  "name": "fandhe-edge-model",
+  "owner": {
+    "name": "Fandhe-AI"
+  },
+  "description": "fandhe-edge-model の Claude Code プラグイン",
+  "plugins": [
+    {
+      "name": "fandhe-edge",
+      "source": "./plugin",
+      "description": "ローカルの判定モデルを常駐 serve 経由で呼ぶ。",
+      "version": "0.1.0"
+    }
+  ]
+}

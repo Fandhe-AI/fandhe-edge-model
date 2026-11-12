@@ -1,0 +1,10 @@
+{
+  "name": "fandhe-edge",
+  "version": "0.1.0",
+  "description": "fandhe-edge-model の判定モデルを、常駐 serve 経由で Claude Code から呼ぶ。",
+  "author": {
+    "name": "Fandhe-AI"
+  },
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/Fandhe-AI/fandhe-edge-model"
+}
