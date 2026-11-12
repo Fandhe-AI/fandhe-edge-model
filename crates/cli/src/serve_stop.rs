@@ -104,6 +104,22 @@ fn is_timeout(e: &io::Error) -> bool {
     )
 }
 
+/// ブロッキング処理 `f` を別スレッドで走らせ、`deadline` までに終わらなければ `None`（REQ-39）。
+///
+/// `UnixStream::connect` は接続キュー満杯時に期限なく待ちうるため、この形で期限を保証する。
+/// 超過した処理のスレッドは放置する（`serve --stop` は直後にプロセスが終わる）。
+fn within<T: Send + 'static>(
+    deadline: Instant,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+}
+
 /// 置き場所 `dir` の常駐へ停止要求を送り、終わるのを待つ。
 fn request_stop(dir: &Path) -> Outcome {
     let sock = dir.join(SOCKET_FILE);
@@ -113,10 +129,12 @@ fn request_stop(dir: &Path) -> Outcome {
         return Outcome::NotRunning;
     }
     let deadline = Instant::now() + STOP_WAIT;
-    let mut stream = match UnixStream::connect(&sock) {
-        Ok(s) => s,
+    let sock_owned = sock.clone();
+    let mut stream = match within(deadline, move || UnixStream::connect(sock_owned)) {
+        None => return Outcome::TimedOut,
+        Some(Ok(s)) => s,
         // 持ち主の居ない残ったソケット。
-        Err(e)
+        Some(Err(e))
             if matches!(
                 e.kind(),
                 io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
@@ -124,7 +142,7 @@ fn request_stop(dir: &Path) -> Outcome {
         {
             return Outcome::NotRunning;
         }
-        Err(_) => return Outcome::Failed,
+        Some(Err(_)) => return Outcome::Failed,
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
     if stream.set_write_timeout(Some(remaining)).is_err() {
@@ -185,6 +203,18 @@ mod tests {
         drop(UnixListener::bind(dir.join(SOCKET_FILE)).unwrap());
         assert_eq!(request_stop(&dir), Outcome::NotRunning);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-39・#728: 接続が停滞しても期限で打ち切る（`connect` は `within` 経由で、超過は exit 20 の `TimedOut`）。
+    #[test]
+    fn req39_stalled_blocking_call_times_out() {
+        let t = Instant::now();
+        let r = within(t + Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        assert!(r.is_none());
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert_eq!(within(Instant::now() + STOP_WAIT, || 7), Some(7));
     }
 
     /// REQ-33・#728: 出力は固定の 1 行 JSON で、終了コードは 0・20・70。
