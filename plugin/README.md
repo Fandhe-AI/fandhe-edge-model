@@ -3,7 +3,7 @@
 fandhe-edge-model で作った判定モデルを、Claude Code から呼ぶプラグイン。
 skill `judge` と、常駐 `serve` を裏で起動して `infer` を呼ぶラッパー
 `fandhe-edge-judge` を持つ。hook は置かない。モデルとバイナリは同梱しない。
-導入手順の詳細は #730 で文書化する。
+導入手順と実機確認の手順は [plugin-install-procedure](../docs/design/plugin-install-procedure.md) を参照。
 
 ## 前提
 
