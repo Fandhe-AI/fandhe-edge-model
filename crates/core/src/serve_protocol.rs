@@ -11,6 +11,12 @@
 //! 未知の欄を許して読み、食い違えば [`ProtocolError::VersionMismatch`] を返す（将来の版が欄を増やしても
 //! 「不正な要求」ではなく「版の食い違い」として断り、CLI が単独へ戻れるようにする）。一致したときだけ厳密に読む。
 //!
+//! # 停止要求（#728）
+//!
+//! `serve --stop` は `{"protocol":1,"op":"stop"}` の 1 行を送る。`cli_version` は含めない（CLI を更新した後でも
+//! 古い版の常駐を止められるようにするため）。形は [`is_stop_request`] が厳密に判定し、常駐は通常の要求より先に
+//! これを見る。受け付けた常駐は [`ServeResponse::Stopped`] を返して終わる。パス・pid・コマンドは運ばない（REQ-39）。
+//!
 //! 操作アダプター（cli の `serve` と `infer` の委ねる処理）専用の型で、推論・学習の層からは参照しない。
 //!
 //! - REQ-21・REQ-33: 応答の `stdout` は加工せずそのまま運び、単独実行と stdout のバイト列・終了コードを同一にする
@@ -34,6 +40,9 @@ pub const MAX_RESPONSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// `id` の最大バイト数。
 pub const MAX_ID_BYTES: usize = 64;
+
+/// 停止要求 1 行の最大バイト数（固定形の 1 行なので十分小さく取る。REQ-39）。
+pub const MAX_STOP_REQUEST_LINE_BYTES: usize = 256;
 
 /// 1 行 JSON の形の版。要求の欄・意味を変えるときに上げる（#709）。
 /// cli のソケットのファイル名（`serve.v<版>.sock`）もこの値に合わせて上げる（版の違う常駐と CLI が
@@ -130,6 +139,16 @@ pub enum ServeResponse {
     /// 最後に自分で終わる（親は次の要求を渡さずに作り直す）。親はクライアントへ `Ok` として返す。
     /// ソケットには流れない。CLI が受け取ったら不正な応答として扱う（#709）。
     OkRetiring { exit_code: u8, stdout: String },
+    /// 停止要求を受け付けた。常駐はこの直後に終わる（#728）。
+    Stopped,
+}
+
+/// 停止要求の線上表現。未知の欄は拒否する。
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopRequest {
+    protocol: u32,
+    op: String,
 }
 
 /// 応答の線上表現。内部タグ付き enum の単位 variant は `deny_unknown_fields` が効かないため、
@@ -151,6 +170,7 @@ enum Wire {
         exit_code: u8,
         stdout: String,
     },
+    Stopped {},
 }
 
 /// 版の 2 欄だけを先に読むための型。未知の欄を許し、型の違いも読めるよう値のまま受ける。
@@ -255,6 +275,24 @@ pub fn decode_request(
     Ok(req)
 }
 
+/// 停止要求を 1 行（末尾 `\n`）へ直列化する（#728）。
+pub fn encode_stop_request() -> Vec<u8> {
+    to_line(&StopRequest {
+        protocol: PROTOCOL_VERSION,
+        op: "stop".into(),
+    })
+}
+
+/// 1 行が停止要求か。長さ上限・`protocol`・`op`・未知の欄なしをすべて満たすときだけ `true`（#728）。
+/// 通常の要求・不正な行・版違いはすべて `false`（常駐は通常の要求として扱う）。
+pub fn is_stop_request(line: &[u8]) -> bool {
+    let Ok(body) = trim_line(line, MAX_STOP_REQUEST_LINE_BYTES) else {
+        return false;
+    };
+    serde_json::from_slice::<StopRequest>(body)
+        .is_ok_and(|r| r.protocol == PROTOCOL_VERSION && r.op == "stop")
+}
+
 /// 応答を 1 行（末尾 `\n`）へ直列化する。
 pub fn encode_response(res: &ServeResponse) -> Vec<u8> {
     to_line(&match res {
@@ -275,6 +313,7 @@ pub fn encode_response(res: &ServeResponse) -> Vec<u8> {
             exit_code: *exit_code,
             stdout: stdout.clone(),
         },
+        ServeResponse::Stopped => Wire::Stopped {},
     })
 }
 
@@ -298,6 +337,7 @@ pub fn decode_response(line: &[u8]) -> Result<ServeResponse, ProtocolError> {
             }
         }
         Wire::OkRetiring { exit_code, stdout } => ServeResponse::OkRetiring { exit_code, stdout },
+        Wire::Stopped {} => ServeResponse::Stopped,
     })
 }
 
@@ -584,5 +624,43 @@ mod tests {
             b"{\"status\":\"ok_retiring\",\"exit_code\":20,\"stdout\":\"x\\n\"}\n"
         );
         assert_eq!(decode_response(&bytes), Ok(retiring));
+    }
+
+    /// #728: 停止要求の線上表現と、判定が厳密であること。
+    #[test]
+    fn stop_request_wire_format_and_strictness() {
+        let bytes = encode_stop_request();
+        assert_eq!(bytes, b"{\"protocol\":1,\"op\":\"stop\"}\n");
+        assert!(is_stop_request(&bytes));
+        assert!(is_stop_request(&bytes[..bytes.len() - 1]));
+        for bad in [
+            &b"{\"protocol\":1,\"op\":\"stop\",\"cli_version\":\"1.2.3\"}"[..],
+            b"{\"protocol\":1,\"op\":\"stop\",\"x\":1}",
+            b"{\"protocol\":1,\"op\":\"x\"}",
+            b"{\"protocol\":2,\"op\":\"stop\"}",
+            b"{\"op\":\"stop\"}",
+            b"not json",
+            b"",
+        ] {
+            assert!(!is_stop_request(bad), "{}", String::from_utf8_lossy(bad));
+        }
+        assert!(!is_stop_request(&encode_request(&req("t"))));
+        let big = format!(
+            "{{\"protocol\":1,\"op\":\"stop\"{}}}",
+            " ".repeat(MAX_STOP_REQUEST_LINE_BYTES)
+        );
+        assert!(!is_stop_request(big.as_bytes()));
+    }
+
+    /// #728: `stopped` の線上表現と往復、未知の欄の拒否。
+    #[test]
+    fn stopped_response_roundtrip() {
+        let bytes = encode_response(&ServeResponse::Stopped);
+        assert_eq!(bytes, b"{\"status\":\"stopped\"}\n");
+        assert_eq!(decode_response(&bytes), Ok(ServeResponse::Stopped));
+        assert!(matches!(
+            decode_response(b"{\"status\":\"stopped\",\"x\":1}"),
+            Err(ProtocolError::InvalidJson(_))
+        ));
     }
 }

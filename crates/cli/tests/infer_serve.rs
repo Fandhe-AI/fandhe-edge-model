@@ -151,6 +151,21 @@ impl Server {
         self.child.as_ref().expect("child").id()
     }
 
+    /// 常駐が `wait` 以内に終わるのを待つ（終わったら終了コード）。
+    fn wait_exit(&mut self, wait: Duration) -> Option<i32> {
+        let child = self.child.as_mut().expect("child");
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                return status.code();
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// kill して stderr を返す。
     fn stop(mut self) -> String {
         let mut child = self.child.take().expect("child");
@@ -1300,4 +1315,173 @@ fn req39_startup_stuck_before_worker_hits_the_startup_limit() {
     assert!(!dir.join(SOCKET_FILE).exists());
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&ws);
+}
+
+/// `serve --stop` を実行する。
+fn serve_stop(dir: &Path) -> (Option<i32>, String, Duration) {
+    let started = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_fandhe-edge"))
+        .args(["serve", "--stop"])
+        .env("FANDHE_EDGE_SERVE_DIR", dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run serve --stop");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        started.elapsed(),
+    )
+}
+
+const STOPPED: &str = "{\"status\":\"stopped\"}\n";
+const NOT_RUNNING: &str = "{\"status\":\"not_running\"}\n";
+
+/// REQ-33・REQ-39・#728: 動いている常駐が `serve --stop` で止まる。worker も消え、ソケットは消えて
+/// ロックは残る。その後の `infer` は常駐が居ない扱い（無言）で単独に判定される。
+#[test]
+fn req33_serve_stop_stops_running_serve() {
+    let (ws, dir) = (workspace("stop"), serve_dir("stop"));
+    let mut server = Server::start(&ws, &dir, "c", &[]);
+    let workers = child_pids(server.child.as_ref().expect("child").id());
+    assert_eq!(workers.len(), 1, "one worker: {workers:?}");
+    let (code, stdout, took) = serve_stop(&dir);
+    assert_eq!((code, stdout.as_str()), (Some(0), STOPPED));
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert_eq!(server.wait_exit(Duration::from_secs(2)), Some(0));
+    assert!(gone_within(workers[0], Duration::from_secs(1)));
+    assert!(!dir.join(SOCKET_FILE).exists());
+    assert!(dir.join("serve.lock").exists());
+    assert_eq!(
+        fs::metadata(&dir).expect("dir").permissions().mode() & 0o777,
+        0o700
+    );
+    let run = infer(&ws, &dir, "c", false, "hello world");
+    assert_eq!(run.code, Some(0));
+    assert_eq!(run.stderr, "");
+    assert_eq!(serve_stop(&dir).1, NOT_RUNNING);
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-33・#728: 常駐が居なければ `not_running`（exit 0）。置き場所は作らない。残ったソケットも同じ。
+#[test]
+fn req33_serve_stop_without_serve_reports_not_running() {
+    // (a) 置き場所が無い。
+    let dir = serve_dir("stop-none");
+    assert_eq!(serve_stop(&dir).0, Some(0));
+    assert_eq!(serve_stop(&dir).1, NOT_RUNNING);
+    assert!(!dir.exists(), "serve --stop must not create the directory");
+    // (b) 0700 の空ディレクトリ。
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(serve_stop(&dir).1, NOT_RUNNING);
+    // (c) 持ち主の居ない残ったソケット。
+    drop(UnixListener::bind(dir.join(SOCKET_FILE)).expect("bind"));
+    assert_eq!(serve_stop(&dir).1, NOT_RUNNING);
+    assert!(
+        dir.join(SOCKET_FILE).exists(),
+        "a stale socket is left as is"
+    );
+    // (d) 0755 の置き場所は接続しない。
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert_eq!(serve_stop(&dir).1, NOT_RUNNING);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// REQ-33・REQ-21・#728: 止めた瞬間に判定中だった要求は `runtime_error` を返さず、単独の判定へ戻る。
+#[test]
+fn req33_serve_stop_while_judging_falls_back_to_standalone() {
+    let (ws, dir) = (workspace("stop-judge"), serve_dir("stop-judge"));
+    let mut server = Server::start(
+        &ws,
+        &dir,
+        "c",
+        &[("FANDHE_EDGE_SERVE_TEST_DELAY_MS", "10000")],
+    );
+    let workers = child_pids(server.child.as_ref().expect("child").id());
+    let (run, stopped) = thread::scope(|s| {
+        let h = s.spawn(|| infer(&ws, &dir, "c", false, "hello world"));
+        thread::sleep(Duration::from_millis(1500));
+        let stopped = serve_stop(&dir);
+        (h.join().expect("join"), stopped)
+    });
+    assert_eq!((stopped.0, stopped.1.as_str()), (Some(0), STOPPED));
+    assert_eq!(
+        run.code,
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    assert!(run.stdout.starts_with(b"{") && !run.stdout.starts_with(b"{\"code\""));
+    assert_eq!(
+        run.stderr.trim_end(),
+        "serve: standalone (serve closed the connection)"
+    );
+    assert_eq!(server.wait_exit(Duration::from_secs(2)), Some(0));
+    assert!(gone_within(workers[0], Duration::from_secs(1)));
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・#728: 停止要求の形は厳密。未知の欄・別の版は止めず、通常の要求として扱われる。
+#[test]
+fn req39_stop_request_shape_is_strict() {
+    let (ws, dir) = (workspace("stop-strict"), serve_dir("stop-strict"));
+    let mut server = Server::start(&ws, &dir, "c", &[]);
+    for line in [
+        &b"{\"protocol\":1,\"op\":\"stop\",\"x\":1}\n"[..],
+        b"{\"protocol\":2,\"op\":\"stop\"}\n",
+        b"{\"protocol\":1,\"op\":\"stop\",\"cli_version\":\"0.0.0\"}\n",
+    ] {
+        assert_ne!(raw_call(&dir, line), ServeResponse::Stopped);
+    }
+    assert_eq!(server.wait_exit(Duration::from_millis(300)), None);
+    let run = infer(&ws, &dir, "c", false, "hello world");
+    assert_eq!(run.stderr.trim_end(), "serve: delegated");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// 1 行を読んだら `reply`（無ければ何も返さない）を書く偽の常駐。`hold` が真なら接続を閉じない。
+fn fake_serve(dir: &Path, reply: Option<&'static str>, hold: bool) {
+    fs::create_dir_all(dir).expect("mkdir");
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let listener = UnixListener::bind(dir.join(SOCKET_FILE)).expect("bind");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n > 0 {
+                if let Some(r) = reply {
+                    let _ = stream.write_all(r.as_bytes());
+                }
+                if hold {
+                    thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+    });
+}
+
+/// REQ-21・#728: 受け付けたのに常駐が終わらなければ `limit_exceeded`（exit 20）、停止要求を知らない
+/// 旧い常駐（`version_mismatch`）や応答なしの切断は `runtime_error`（exit 70）。
+#[test]
+fn req21_serve_stop_failures_map_to_exit_codes() {
+    let dir = serve_dir("stop-fake-timeout");
+    fake_serve(&dir, Some("{\"status\":\"stopped\"}\n"), true);
+    let (code, stdout, took) = serve_stop(&dir);
+    assert_eq!(code, Some(20), "{stdout}");
+    assert!(stdout.contains("limit_exceeded"), "{stdout}");
+    assert!(took >= Duration::from_millis(900) && took < Duration::from_secs(4));
+    let _ = fs::remove_dir_all(&dir);
+
+    for (tag, reply) in [
+        ("old", Some("{\"status\":\"version_mismatch\"}\n")),
+        ("none", None),
+    ] {
+        let dir = serve_dir(&format!("stop-fake-{tag}"));
+        fake_serve(&dir, reply, false);
+        let (code, stdout, _) = serve_stop(&dir);
+        assert_eq!(code, Some(70), "{tag}: {stdout}");
+        assert!(stdout.contains("runtime_error"), "{tag}: {stdout}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -250,12 +250,20 @@ const EVALUATE_OPTS: &[OptSpec] = &[
         "Evaluated project of the same candidate trained with another seed (repeatable; at least 2 for a reproducibility check)",
     ),
 ];
-const SERVE_OPTS: &[OptSpec] = &[opt(
-    "--package",
-    "PATH",
-    true,
-    "Path to the package to serve",
-)];
+const SERVE_OPTS: &[OptSpec] = &[
+    opt(
+        "--package",
+        "PATH",
+        false,
+        "Path to the package to serve (exactly one of --package / --stop)",
+    ),
+    OptSpec {
+        name: "--stop",
+        value: None,
+        required: false,
+        help: "Stop the running serve process (exactly one of --package / --stop)",
+    },
+];
 const INFER_OPTS: &[OptSpec] = &[
     opt("--package", "PATH", true, "Path to the package"),
     opt(
@@ -448,6 +456,8 @@ pub enum Invocation {
     Run(Command),
     /// 常駐プロセス（7 工程の `Command` には入れない。#708）。
     Serve(ServeArgs),
+    /// 動いている常駐を止める（`serve --stop`。#728）。
+    ServeStop,
     Help(Option<Subcommand>),
 }
 
@@ -489,6 +499,10 @@ pub enum ArgsError {
     ConflictingTrainTarget,
     /// `train` に `--candidate` も `--all` も指定されていない。
     MissingTrainTarget,
+    /// `serve` に `--package` と `--stop` の両方が指定された（#728）。
+    ConflictingServeTarget,
+    /// `serve` に `--package` も `--stop` も指定されていない（#728）。
+    MissingServeTarget,
     /// `train --status` に学習専用のオプションが併用された（#485）。
     IncompatibleWithStatus {
         option: &'static str,
@@ -562,6 +576,10 @@ impl fmt::Display for ArgsError {
                 f.write_str("options --candidate and --all cannot be used together")
             }
             ArgsError::MissingTrainTarget => f.write_str("one of --candidate or --all is required"),
+            ArgsError::ConflictingServeTarget => {
+                f.write_str("options --package and --stop cannot be used together")
+            }
+            ArgsError::MissingServeTarget => f.write_str("one of --package or --stop is required"),
             ArgsError::IncompatibleWithStatus { option } => {
                 write!(f, "option {option} cannot be used with --status")
             }
@@ -664,9 +682,15 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, Ar
         }
     }
     if sub == Subcommand::Serve {
-        return Ok(Invocation::Serve(ServeArgs {
-            package: Values(values).path("--package")?,
-        }));
+        let mut values = Values(values);
+        return match (values.take("--stop").is_some(), values.take("--package")) {
+            (true, Some(_)) => Err(ArgsError::ConflictingServeTarget),
+            (true, None) => Ok(Invocation::ServeStop),
+            (false, Some(package)) => Ok(Invocation::Serve(ServeArgs {
+                package: PathBuf::from(package),
+            })),
+            (false, None) => Err(ArgsError::MissingServeTarget),
+        };
     }
     build(sub, values).map(Invocation::Run)
 }
@@ -1054,13 +1078,22 @@ mod tests {
                 package: PathBuf::from("pkg")
             }))
         );
+        assert_eq!(p(&["serve"]), Err(ArgsError::MissingServeTarget));
+        // #728: --stop は --package と排他。
+        assert_eq!(p(&["serve", "--stop"]), Ok(Invocation::ServeStop));
         assert_eq!(
-            p(&["serve"]),
-            Err(ArgsError::MissingRequired {
-                option: "--package"
-            })
+            p(&["serve", "--stop", "--package", "pkg"]),
+            Err(ArgsError::ConflictingServeTarget)
+        );
+        assert_eq!(
+            p(&["serve", "--stop=x"]),
+            Err(ArgsError::FlagTakesNoValue { option: "--stop" })
         );
         assert!(!render_help(None).contains("serve"));
+        let Ok(Invocation::Help(topic)) = p(&["serve", "--help"]) else {
+            panic!("serve --help must parse");
+        };
+        assert!(render_help(topic).contains("--stop"));
     }
 
     fn p(args: &[&str]) -> Result<Invocation, ArgsError> {
@@ -1584,6 +1617,8 @@ mod tests {
             ArgsError::InvalidBudgetSeconds,
             ArgsError::ConflictingTrainTarget,
             ArgsError::MissingTrainTarget,
+            ArgsError::ConflictingServeTarget,
+            ArgsError::MissingServeTarget,
         ] {
             assert_eq!(args_error_report(&e).code, ExitCode::InvalidInput);
         }
