@@ -16,7 +16,7 @@ spec の内容は要約であり、詳細は spec の各 REQ を参照する。
    - `cargo install --git https://github.com/Fandhe-AI/fandhe-edge-model --tag <版> --locked fandhe-edge-cli`
    - `<版>` は導入するプラグインの `plugin.json` の version に `v` を付けたもの。CLI とプラグインの版は一致させる。
    - `command -v fandhe-edge` で PATH にあることを確かめる。
-   - CLI の版が常駐と違うと `version_mismatch` で単独の判定に戻る（無言）。CLI を更新したら `fandhe-edge serve --stop` で旧い常駐を止める。
+   - 常駐のソケットは版ごとに分かれる（`serve.v<版>.sock`）。更新後の CLI の `serve --stop` では旧版の常駐が見えず `not_running` になる。CLI を更新する前に、旧版の `fandhe-edge serve --stop` で常駐を止める。止め忘れた旧版の常駐は、アイドル終了を待つか手で止める。
 2. パッケージ
    - 利用者が用意する。モデルは同梱も取得もしない。完全性は既存の sha256 照合に任せる。
    - 第三者の重みを含む場合の再配布可否は、[licensing](../../.claude/rules/licensing.md) に従い利用者が判断する。
