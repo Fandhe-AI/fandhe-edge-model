@@ -54,6 +54,7 @@ def test_req33_structure() -> None:
     head = skill.split("---")[1]
     assert "name: judge" in head
     assert "description:" in head
+    assert "${CLAUDE_PLUGIN_ROOT}/bin/fandhe-edge-judge" in skill
     assert os.access(WRAPPER, os.X_OK)
     subprocess.run(["sh", "-n", str(WRAPPER)], check=True)  # noqa: S603, S607
 
@@ -113,7 +114,7 @@ def test_req33_idle_exit_secs_env(tmp_path: Path) -> None:
             break
         time.sleep(0.1)
     assert "--idle-exit-secs 30\n" in (tmp_path / "log" / "serve.args").read_text()
-    for bad in ["0", "abc", "-1", "1.5"]:
+    for bad in ["0", "abc", "-1", "1.5", "18446744073709551616"]:
         env = {"FANDHE_EDGE_PACKAGE": "pkg", "FANDHE_EDGE_IDLE_EXIT_SECS": bad}
         r = _run(tmp_path, env)
         assert r.returncode == 64

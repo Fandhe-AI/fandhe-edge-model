@@ -33,6 +33,10 @@ case "$idle" in
         fail invalid_input "FANDHE_EDGE_IDLE_EXIT_SECS must be an integer of 1 or more" 64
         ;;
 esac
+# 20 桁以上は u64 を超えうる（CLI の idle_exit_secs は u64）。19 桁までに限る
+if [ "${#idle}" -gt 19 ]; then
+    fail invalid_input "FANDHE_EDGE_IDLE_EXIT_SECS is too large" 64
+fi
 
 if ! command -v fandhe-edge >/dev/null 2>&1; then
     fail runtime_error "fandhe-edge is not installed: cargo install --git https://github.com/Fandhe-AI/fandhe-edge-model --tag v0.1.0 --locked fandhe-edge-cli" 70

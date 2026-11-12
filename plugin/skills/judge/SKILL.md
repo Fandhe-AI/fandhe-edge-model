@@ -10,7 +10,7 @@ description: 利用者が用意した判定モデル（fandhe-edge-model のパ�
 ## 呼び方
 
 ```sh
-fandhe-edge-judge --text "<入力>"
+"${CLAUDE_PLUGIN_ROOT}/bin/fandhe-edge-judge" --text "<入力>"
 ```
 
 - `--package` は付けない。環境変数 `FANDHE_EDGE_PACKAGE` から渡される
