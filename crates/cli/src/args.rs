@@ -250,12 +250,15 @@ const EVALUATE_OPTS: &[OptSpec] = &[
         "Evaluated project of the same candidate trained with another seed (repeatable; at least 2 for a reproducibility check)",
     ),
 ];
-const SERVE_OPTS: &[OptSpec] = &[opt(
-    "--package",
-    "PATH",
-    true,
-    "Path to the package to serve",
-)];
+const SERVE_OPTS: &[OptSpec] = &[
+    opt("--package", "PATH", true, "Path to the package to serve"),
+    opt(
+        "--idle-exit-secs",
+        "SECS",
+        false,
+        "Exit after SECS seconds without requests (1 or more, default: never)",
+    ),
+];
 const INFER_OPTS: &[OptSpec] = &[
     opt("--package", "PATH", true, "Path to the package"),
     opt(
@@ -428,6 +431,8 @@ pub struct InferArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServeArgs {
     pub package: PathBuf,
+    /// 最後の要求からこの秒数、要求が無ければ自分で終わる。`None` は終わらない（#727・REQ-39）。
+    pub idle_exit_secs: Option<u64>,
 }
 
 /// 解析済みのコマンド。
@@ -485,6 +490,8 @@ pub enum ArgsError {
     InvalidBatchSize,
     /// `--budget-seconds` が `1..=MAX_SEARCH_BUDGET_SECONDS` の整数でない。
     InvalidBudgetSeconds,
+    /// `--idle-exit-secs` が 1 以上の整数でない。
+    InvalidIdleExitSecs,
     /// `train` に `--candidate` と `--all` の両方が指定された。
     ConflictingTrainTarget,
     /// `train` に `--candidate` も `--all` も指定されていない。
@@ -557,6 +564,9 @@ impl fmt::Display for ArgsError {
             }
             ArgsError::InvalidBudgetSeconds => {
                 f.write_str("option --budget-seconds must be an integer in the range 1 to 921600")
+            }
+            ArgsError::InvalidIdleExitSecs => {
+                f.write_str("option --idle-exit-secs must be an integer of 1 or more")
             }
             ArgsError::ConflictingTrainTarget => {
                 f.write_str("options --candidate and --all cannot be used together")
@@ -664,8 +674,10 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, Ar
         }
     }
     if sub == Subcommand::Serve {
+        let mut values = Values(values);
         return Ok(Invocation::Serve(ServeArgs {
-            package: Values(values).path("--package")?,
+            package: values.path("--package")?,
+            idle_exit_secs: values.idle_exit_secs()?,
         }));
     }
     build(sub, values).map(Invocation::Run)
@@ -819,6 +831,18 @@ impl Values {
                     .ok()
                     .filter(|n| (1..=MAX_QWEN2_LORA_BATCH_SIZE).contains(n))
                     .ok_or(ArgsError::InvalidBatchSize)
+            })
+            .transpose()
+    }
+    fn idle_exit_secs(&mut self) -> Result<Option<u64>, ArgsError> {
+        self.take("--idle-exit-secs")
+            .map(|v| {
+                v.into_string()
+                    .map_err(|_| ArgsError::NonUtf8Argument)?
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or(ArgsError::InvalidIdleExitSecs)
             })
             .transpose()
     }
@@ -1051,9 +1075,31 @@ mod tests {
         assert_eq!(
             p(&["serve", "--package", "pkg"]),
             Ok(Invocation::Serve(ServeArgs {
-                package: PathBuf::from("pkg")
+                package: PathBuf::from("pkg"),
+                idle_exit_secs: None,
             }))
         );
+        for (flag, want) in [
+            (&["--idle-exit-secs", "600"][..], 600),
+            (&["--idle-exit-secs=7"][..], 7),
+        ] {
+            let mut a = vec!["serve", "--package", "pkg"];
+            a.extend_from_slice(flag);
+            assert_eq!(
+                p(&a),
+                Ok(Invocation::Serve(ServeArgs {
+                    package: PathBuf::from("pkg"),
+                    idle_exit_secs: Some(want),
+                }))
+            );
+        }
+        for bad in ["0", "-1", "abc", ""] {
+            assert_eq!(
+                p(&["serve", "--package", "pkg", "--idle-exit-secs", bad]),
+                Err(ArgsError::InvalidIdleExitSecs),
+                "{bad}"
+            );
+        }
         assert_eq!(
             p(&["serve"]),
             Err(ArgsError::MissingRequired {

@@ -106,8 +106,20 @@ struct Server {
 
 impl Server {
     fn start(ws: &Path, dir: &Path, package: &str, env: &[(&str, &str)]) -> Self {
+        Self::start_with_args(ws, dir, package, &[], env)
+    }
+
+    /// `serve` に追加の引数（`--idle-exit-secs` など）を渡して起動する。
+    fn start_with_args(
+        ws: &Path,
+        dir: &Path,
+        package: &str,
+        extra: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fandhe-edge"));
         cmd.args(["serve", "--package", package])
+            .args(extra)
             .current_dir(ws)
             .env("FANDHE_EDGE_SERVE_DIR", dir)
             .env_remove("FANDHE_EDGE_NO_SERVE")
@@ -1299,5 +1311,128 @@ fn req39_startup_stuck_before_worker_hits_the_startup_limit() {
     );
     assert!(!dir.join(SOCKET_FILE).exists());
     let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// 親が `wait` 以内に自分で終わるのを待ち、終了状態と stdout を返す。
+fn wait_exit(server: &mut Server, wait: Duration) -> (std::process::ExitStatus, Vec<u8>) {
+    let child = server.child.as_mut().expect("child");
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let mut out = Vec::new();
+            child
+                .stdout
+                .take()
+                .expect("stdout")
+                .read_to_end(&mut out)
+                .expect("read");
+            return (status, out);
+        }
+        assert!(Instant::now() < deadline, "serve did not exit by itself");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// REQ-39・#727: `--idle-exit-secs` で要求が無ければ、親も worker も消え（exit 0・stdout 空）、
+/// ソケットは消えるが `serve.lock` は残る。次の起動はすぐ取れる。
+#[test]
+fn req39_idle_exit_stops_parent_and_worker() {
+    let (ws, dir) = (workspace("idle"), serve_dir("idle"));
+    let mut server = Server::start_with_args(&ws, &dir, "c", &["--idle-exit-secs", "2"], &[]);
+    let parent = server.child.as_ref().expect("child").id();
+    let workers = child_pids(parent);
+    assert_eq!(workers.len(), 1, "{workers:?}");
+    let (status, stdout) = wait_exit(&mut server, Duration::from_secs(15));
+    assert_eq!(status.code(), Some(0));
+    assert!(stdout.is_empty(), "{stdout:?}");
+    assert!(gone_within(parent, Duration::from_secs(5)));
+    assert!(gone_within(workers[0], Duration::from_secs(5)));
+    assert!(!dir.join(SOCKET_FILE).exists());
+    assert!(dir.join("serve.lock").exists());
+    // ロックとソケットがすぐ取り直せる。
+    let again = Server::start(&ws, &dir, "c", &[]);
+    let run = infer(&ws, &dir, "c", false, "hello world");
+    assert!(run.stderr.contains("serve: delegated"), "{}", run.stderr);
+    let log = again.stop();
+    assert!(!log.contains("hello world"), "{log}");
+    drop(server);
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・#727: 要求が来るたびに終了までの時間が延び、最後の要求から N 秒より前には終わらない。
+#[test]
+fn req39_idle_timer_extends_on_each_request() {
+    let (ws, dir) = (workspace("idleext"), serve_dir("idleext"));
+    let mut server = Server::start_with_args(&ws, &dir, "c", &["--idle-exit-secs", "4"], &[]);
+    let line = encode_request(&c_request(&ws, "hello world"));
+    let mut last = Instant::now();
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(1500));
+        let resp = raw_call(&dir, &line);
+        last = Instant::now();
+        assert!(
+            matches!(resp, ServeResponse::Ok { exit_code: 0, .. }),
+            "{resp:?}"
+        );
+        assert!(
+            server
+                .child
+                .as_mut()
+                .expect("child")
+                .try_wait()
+                .expect("try_wait")
+                .is_none()
+        );
+    }
+    let (status, _) = wait_exit(&mut server, Duration::from_secs(15));
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        last.elapsed() >= Duration::from_secs(4),
+        "{:?}",
+        last.elapsed()
+    );
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・#727: 処理中の要求がある間はアイドルとみなさず、応答してから数え直す。
+#[test]
+fn req39_idle_exit_waits_for_inflight_request() {
+    let (ws, dir) = (workspace("idleinfl"), serve_dir("idleinfl"));
+    let mut server = Server::start_with_args(
+        &ws,
+        &dir,
+        "c",
+        &["--idle-exit-secs", "1"],
+        &[("FANDHE_EDGE_SERVE_TEST_DELAY_MS", "3000")],
+    );
+    let line = encode_request(&c_request(&ws, "hello world"));
+    let resp = raw_call(&dir, &line);
+    assert!(
+        matches!(resp, ServeResponse::Ok { exit_code: 0, .. }),
+        "{resp:?}"
+    );
+    let (status, _) = wait_exit(&mut server, Duration::from_secs(15));
+    assert_eq!(status.code(), Some(0));
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// REQ-39・#727: 未指定なら終わらない。
+#[test]
+fn req39_without_idle_option_keeps_running() {
+    let (ws, dir) = (workspace("noidle"), serve_dir("noidle"));
+    let mut server = Server::start(&ws, &dir, "c", &[]);
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        server
+            .child
+            .as_mut()
+            .expect("child")
+            .try_wait()
+            .expect("try_wait")
+            .is_none()
+    );
+    let run = infer(&ws, &dir, "c", false, "hello world");
+    assert!(run.stderr.contains("serve: delegated"), "{}", run.stderr);
     let _ = fs::remove_dir_all(&ws);
 }
