@@ -16,7 +16,9 @@ spec の内容は要約であり、詳細は spec の各 REQ を参照する。
    - `cargo install --git https://github.com/Fandhe-AI/fandhe-edge-model --tag <版> --locked fandhe-edge-cli`
    - `<版>` は導入するプラグインの `plugin.json` の version に `v` を付けたもの。CLI とプラグインの版は一致させる。
    - `command -v fandhe-edge` で PATH にあることを確かめる。
-   - 常駐のソケットは版ごとに分かれる（`serve.v<版>.sock`）。更新後の CLI の `serve --stop` では旧版の常駐が見えず `not_running` になる。CLI を更新する前に、旧版の `fandhe-edge serve --stop` で常駐を止める。止め忘れた旧版の常駐は、アイドル終了を待つか手で止める。
+   - `cargo build -p fandhe-edge-cli` を使う場合、バイナリは `target/debug/` に出るだけで PATH に入らない。`export PATH="$PWD/target/debug:$PATH"` を実行したシェルから Claude Code を起動して引き継ぐ。判定ラッパーの `command -v` が失敗すると exit 70 になる。
+   - 常駐のソケット名（`serve.v1.sock` の `v1`）は通信プロトコル版（`PROTOCOL_VERSION`）に対応し、プラグインのリリース版ではない。同じプロトコル版なら新旧の CLI は同じソケットを使うため、更新後の `serve --stop` で旧版の常駐も止まる。ただし停止要求を知らない旧版の常駐は停止できず、版の違う要求は `version_mismatch` で拒否される。ソケットが分かれるのはプロトコル版が変わる場合で、そのとき新版からは旧版の常駐が見えず `not_running` になる。
+   - いずれの場合も、CLI を更新する前に旧版の `fandhe-edge serve --stop` で常駐を止める。止め忘れた旧版の常駐は、アイドル終了を待つか手で止める。
 2. パッケージ
    - 利用者が用意する。モデルは同梱も取得もしない。完全性は既存の sha256 照合に任せる。
    - 第三者の重みを含む場合の再配布可否は、[licensing](../../.claude/rules/licensing.md) に従い利用者が判断する。
