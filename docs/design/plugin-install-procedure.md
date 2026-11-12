@@ -42,7 +42,7 @@ spec の内容は要約であり、詳細は spec の各 REQ を参照する。
 ### 共通の準備
 
 - 合成パッケージを `tmp-plugin-check/` に作る。作り方は [claude-code-permission-prompt-procedure.md](claude-code-permission-prompt-procedure.md) の第 3 節に従う（`fixtures/onnx_parity/c1.onnx` と heredoc）。
-- `cargo install --path crates/cli --locked` か `cargo build -p fandhe-edge-cli` で `fandhe-edge` を PATH に載せる。
+- `cargo install --path crates/cli --locked` で `fandhe-edge` を PATH に載せる。`cargo build -p fandhe-edge-cli` を使う場合、バイナリは `target/debug/` に出るだけで PATH に入らない。`export PATH="$PWD/target/debug:$PATH"` を実行したシェルから Claude Code を起動し、PATH を引き継ぐ。判定ラッパーの `command -v` が失敗すると exit 70 になる。
 - `FANDHE_EDGE_SERVE_DIR` を一時ディレクトリへ向ける（普段使いの常駐とぶつけない）。`env` にも同じ値を書く。
 - `FANDHE_EDGE_IDLE_EXIT_SECS` は 30 など短い値にする。実測は設定値に対する値として記録する。
 - 低電力モードはオフ（[ci](../../.claude/rules/ci.md) の基準）。数値にモードを明記する。
