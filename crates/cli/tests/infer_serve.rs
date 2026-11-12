@@ -445,6 +445,53 @@ fn req39_startup_verification_failure_creates_no_socket() {
     let _ = fs::remove_dir_all(&ws);
 }
 
+/// REQ-39・#723: 置き場所を作った後に、パス指定で権限を変えない。umask で 0700 にならなければ起動しない。
+#[test]
+fn req39_created_dir_is_not_chmoded() {
+    let (ws, dir) = (workspace("umask"), serve_dir("umask"));
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "umask 277; exec \"$0\" \"$@\""])
+        .arg(env!("CARGO_BIN_EXE_fandhe-edge"))
+        .args(["serve", "--package", "c"])
+        .current_dir(&ws)
+        .env("FANDHE_EDGE_SERVE_DIR", &dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    // 権限を直してしまう退行では常駐が起動して終わらないため、期限つきで待つ。
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("serve started despite a non-0700 directory");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+    assert_eq!(status.code(), Some(64));
+    assert_eq!(
+        stdout,
+        "{\"code\":\"invalid_input\",\"message\":\"serve directory must be a real directory with mode 0700\"}\n"
+    );
+    let mode = fs::metadata(&dir).expect("dir").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o500);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(fs::read_dir(&dir).expect("ls").count(), 0);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&ws);
+}
+
 /// REQ-39: ディレクトリは 0700・ソケットは 0600。既存のディレクトリが 0700 でなければ起動しない。
 #[test]
 fn req39_dir_and_socket_permissions() {
