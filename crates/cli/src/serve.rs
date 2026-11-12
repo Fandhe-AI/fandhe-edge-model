@@ -261,6 +261,8 @@ pub(crate) fn read_line_bounded(
 }
 
 /// 置き場所を作る（無ければ 0700）。あれば symlink でない 0700 のディレクトリであることを確かめる。
+/// 作成後にパス指定で権限を変えない（差し替えられた symlink の先を変えてしまうため。#723）。
+/// umask で 0700 にならなければ、後の検査で起動しない。
 fn ensure_dir(dir: &Path) -> Result<fs::Metadata, ErrorReport> {
     let create = match fs::symlink_metadata(dir) {
         Ok(_) => false,
@@ -272,7 +274,6 @@ fn ensure_dir(dir: &Path) -> Result<fs::Metadata, ErrorReport> {
             .recursive(true)
             .mode(0o700)
             .create(dir)
-            .and_then(|()| fs::set_permissions(dir, fs::Permissions::from_mode(0o700)))
             .map_err(|_| runtime("cannot create serve directory"))?;
     }
     let meta = fs::symlink_metadata(dir).map_err(|_| runtime("cannot inspect serve directory"))?;
