@@ -194,10 +194,12 @@ pub fn try_delegate_in<W: Write>(
                 Err(_) => runtime_failed(out),
             }
         }
-        // `ready`・`ok_retiring` は常駐の親と worker 子の間専用で、ソケットに流れてきたら不正な応答。
-        Ok(ServeResponse::Ready { .. } | ServeResponse::OkRetiring { .. }) | Err(_) => {
-            runtime_failed(out)
-        }
+        // `ready`・`ok_retiring` は常駐の親と worker 子の間専用、`stopped` は停止要求（#728）への応答専用で、
+        // 判定の要求への応答として流れてきたら不正な応答。
+        Ok(
+            ServeResponse::Ready { .. } | ServeResponse::OkRetiring { .. } | ServeResponse::Stopped,
+        )
+        | Err(_) => runtime_failed(out),
     }
 }
 

@@ -41,8 +41,16 @@ fn main() -> std::process::ExitCode {
                 Err(_) => ExitCode::RuntimeError.into(),
             };
         }
+        // 停止要求（#728）。ログも置き場所の作成も要らないので `serve::run` は通さない。
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Ok(Invocation::ServeStop) => {
+            return match fandhe_edge_cli::serve_stop::run_stop(&mut std::io::stdout()) {
+                Ok(code) => code.into(),
+                Err(_) => ExitCode::RuntimeError.into(),
+            };
+        }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        Ok(Invocation::Serve(_)) => ErrorReport::new(
+        Ok(Invocation::Serve(_) | Invocation::ServeStop) => ErrorReport::new(
             ExitCode::InvalidInput,
             "serve is not supported on this platform",
         ),

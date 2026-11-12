@@ -79,6 +79,7 @@
 //! ディレクトリは 0700、ソケット `serve.v1.sock` は作成後 0600、二重起動防止は `serve.lock` の
 //! `File::try_lock`。`unsafe` を使わないため umask の設定はせず、0700 のディレクトリの中に作る。
 //! SIGTERM は既定の動き（即終了）で、残ったソケットは次の起動が `serve.lock` を取れたら消して作り直す。
+//! 止めるには `serve --stop`（[`crate::serve_stop`]。#728）を使う。pid を使った kill はしない。
 //! 待ち受けは Unix ソケットのみで、ネットワークには公開しない（REQ-38）。
 //!
 //! ソケットのファイル名は 1 行 JSON の形の版（`PROTOCOL_VERSION`）ごとに分ける（[`SOCKET_FILE`]。プロトコルを
@@ -86,6 +87,18 @@
 //! 「不正な要求」（exit 64）と答えたものを CLI が判定結果として採用することがない（CLI からは常駐が無い扱いで、
 //! 何も言わず単独で判定する）。ロックのファイル名は版で分けないので、常駐は版をまたいで同時に 1 つだけで、
 //! 起動時にロックを取れたら、残っている古い名前のソケット（[`LEGACY_SOCKET_FILES`]）も消す。
+//!
+//! # 停止要求（#728）
+//!
+//! ソケットで [`is_stop_request`] を満たす 1 行を受けたら、通常の終了経路（`exit_with` → worker を止めてから終了。
+//! 終了コード 0）で終わる。停止処理の流れは次のとおり。
+//!
+//! - 先に [`STOPPING`] を立てる。判定中だった要求は、worker が止まった時点の `runtime_error` を書かず、接続を
+//!   閉じるだけにする（委ねた `infer` は EOF を見て単独の判定へ戻る。判定結果を二重に出さない）
+//! - 自分が作ったソケット（`bind` 直後に記録した dev・ino と一致するもの）だけを消す。一致しなければ消さない。
+//!   `serve.lock` は消さない（ロックファイルの削除は並行起動の排他を壊す。プロセスの終了で解放される）
+//! - 停止要求への `stopped` は、終了の直前に同じ接続へ書く。接続はプロセスの終了まで閉じない
+//!   （`serve --stop` が終了を待てるように）
 //!
 //! # 限界（証拠種別: テストハーネス）
 //!
@@ -114,7 +127,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::serve_protocol::{
     MAX_REQUEST_LINE_BYTES, MAX_RESPONSE_LINE_BYTES, PackageIdentity, ProtocolError, ServeResponse,
-    decode_request, decode_response, encode_response,
+    decode_request, decode_response, encode_response, is_stop_request,
 };
 use fandhe_edge_guard::resource::{
     SafetyLimits, current_process_rss_bytes, process_rss_bytes, safety_limits_for_kind,
@@ -366,6 +379,13 @@ fn log_line(msg: std::fmt::Arguments<'_>) {
 
 /// 終了処理に入ったか。入った後は見張りが何もしない（終了中に別の理由で終了コードを上書きしない）。
 static EXITING: AtomicBool = AtomicBool::new(false);
+
+/// 停止要求を受けて終了処理に入ったか（#728）。立った後は、接続スレッドが応答を書かずに接続を閉じる
+/// （worker を止めたことによる `runtime_error` を、判定結果としてクライアントへ返さないため）。
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// 自分が作ったソケットの識別（パス・dev・ino）。停止時に、差し替えられたものを消さないために使う（#728）。
+static OWN_SOCKET: OnceLock<(PathBuf, u64, u64)> = OnceLock::new();
 
 /// 終了処理に入る。最初に入ったスレッドだけが真を受け取り、終了コードを決める。
 fn begin_exit() -> bool {
@@ -1286,6 +1306,9 @@ fn start(
     let sock = dir.join(SOCKET_FILE);
     remove_stale_socket(&sock)?;
     let listener = UnixListener::bind(&sock).map_err(|_| runtime("cannot bind serve socket"))?;
+    if let Ok(m) = fs::symlink_metadata(&sock) {
+        let _ = OWN_SOCKET.set((sock.clone(), m.dev(), m.ino()));
+    }
     if fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)).is_err() {
         let _ = fs::remove_file(&sock);
         return Err(runtime("cannot restrict serve socket").into());
@@ -1293,8 +1316,18 @@ fn start(
     Ok((listener, io, identity, lock))
 }
 
-/// 応答を書いて閉じる（失敗は無視。相手が既にいない）。
+/// `sock` が「ソケットで、dev・ino が一致する」ときだけ消す（検証してから操作する。#728）。消したら真。
+fn remove_socket_if_same(sock: &Path, dev: u64, ino: u64) -> bool {
+    fs::symlink_metadata(sock)
+        .is_ok_and(|m| m.file_type().is_socket() && m.dev() == dev && m.ino() == ino)
+        && fs::remove_file(sock).is_ok()
+}
+
+/// 応答を書いて閉じる（失敗は無視。相手が既にいない）。停止処理中は何も書かずに閉じる（#728）。
 fn reply(mut stream: UnixStream, response: &ServeResponse) {
+    if STOPPING.load(Ordering::SeqCst) {
+        return;
+    }
     let _ = stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT));
     let _ = stream.write_all(&encode_response(response));
     let _ = stream.flush();
@@ -1302,19 +1335,35 @@ fn reply(mut stream: UnixStream, response: &ServeResponse) {
 
 /// 1 接続: 要求を読み、版とパッケージを照合し、判定スレッドへ渡して応答を返す。
 fn handle(mut stream: UnixStream, identity: &PackageIdentity, tx: &SyncSender<Job>) {
-    let response = respond(&mut stream, identity, tx);
+    let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
+    let Ok(line) = read_line_bounded(&mut stream, MAX_REQUEST_LINE_BYTES, deadline) else {
+        reply(stream, &error_response(&invalid("invalid serve request")));
+        return;
+    };
+    if is_stop_request(&line) {
+        stop(stream);
+    }
+    let response = respond(line, identity, tx);
     reply(stream, &response);
 }
 
-fn respond(
-    stream: &mut UnixStream,
-    identity: &PackageIdentity,
-    tx: &SyncSender<Job>,
-) -> ServeResponse {
-    let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
-    let Ok(mut line) = read_line_bounded(stream, MAX_REQUEST_LINE_BYTES, deadline) else {
-        return error_response(&invalid("invalid serve request"));
-    };
+/// 停止要求の処理（#728）。`stopped` を書いてから通常の終了経路で終わる。戻らない。
+fn stop(mut stream: UnixStream) -> ! {
+    // 先に立てる。以後、判定中だった要求の応答は書かれない。
+    STOPPING.store(true, Ordering::SeqCst);
+    if let Some((sock, dev, ino)) = OWN_SOCKET.get() {
+        remove_socket_if_same(sock, *dev, *ino);
+    }
+    log_line(format_args!("stop requested; exiting"));
+    let _ = stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT));
+    let _ = stream.write_all(&encode_response(&ServeResponse::Stopped));
+    let _ = stream.flush();
+    // `stream` は閉じずにプロセスの終了まで持つ（`serve --stop` は EOF で終了を知る）。
+    let _keep = stream;
+    exit_with(ExitCode::Ok)
+}
+
+fn respond(mut line: Vec<u8>, identity: &PackageIdentity, tx: &SyncSender<Job>) -> ServeResponse {
     let request = match decode_request(&line, CLI_VERSION) {
         Ok(request) => request,
         // 版の違う CLI には判定せず、単独へ戻らせる（#709）。
@@ -1476,6 +1525,10 @@ fn ask_worker(io: &mut WorkerIo, line: &[u8], budget: Duration) -> Asked {
 /// 起動の失敗（検証の失敗・時間切れ）・worker の版や同一性が起動時と違う・`ready` 直後の RSS が上限超・
 /// 1 件も判定しないまま worker が終わる作り直しが [`MAX_BARREN_RESTARTS`] 回続いた。
 fn respawn(ctx: &JudgeCtx, streak: &mut u32) -> WorkerIo {
+    // 終了処理中（停止要求を含む）に新しい worker を起こさない。
+    if EXITING.load(Ordering::SeqCst) {
+        wait_for_exit();
+    }
     reap_worker();
     *streak = barren_streak(*streak, worker_slot().judged);
     if *streak >= MAX_BARREN_RESTARTS {
@@ -1485,6 +1538,9 @@ fn respawn(ctx: &JudgeCtx, streak: &mut u32) -> WorkerIo {
         exit_with(ExitCode::RuntimeError);
     }
     log_line(format_args!("worker stopped; restarting"));
+    if EXITING.load(Ordering::SeqCst) {
+        wait_for_exit();
+    }
     let wait = ctx.limits.time().get();
     let (reason, code) = match spawn_worker(&ctx.args, &ctx.cwd) {
         Ok(io) => match await_ready(&io, wait, Some(&ctx.identity)) {
@@ -1655,6 +1711,34 @@ fn spawn_guard_thread(limits: SafetyLimits) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-39・#728: 停止時のソケット削除は、dev・ino が一致するソケットだけを消す。
+    #[test]
+    fn req39_remove_socket_if_same_checks_identity() {
+        let dir = PathBuf::from(format!("/tmp/fe-rm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let sock = dir.join("a.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let m = fs::symlink_metadata(&sock).unwrap();
+        // 別の inode 指定・無いパス・通常ファイルは消さない。
+        assert!(!remove_socket_if_same(&sock, m.dev(), m.ino() + 1));
+        assert!(!remove_socket_if_same(&dir.join("none"), m.dev(), m.ino()));
+        let file = dir.join("f");
+        fs::write(&file, b"x").unwrap();
+        let fm = fs::symlink_metadata(&file).unwrap();
+        assert!(!remove_socket_if_same(&file, fm.dev(), fm.ino()));
+        assert!(file.exists() && sock.exists());
+        // symlink は辿らず、ソケットでないので消さない。
+        let link = dir.join("l");
+        std::os::unix::fs::symlink(&sock, &link).unwrap();
+        assert!(!remove_socket_if_same(&link, m.dev(), m.ino()));
+        assert!(sock.exists());
+        assert!(remove_socket_if_same(&sock, m.dev(), m.ino()));
+        assert!(!sock.exists());
+        drop(listener);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// REQ-39・#709: worker 自身の見張り。親の不在は最優先で exit 70、読み込み中の時間切れと RSS 超過は
     /// exit 20、RSS を読めなければ exit 70。上限ちょうど・読み込み後の経過時間では止めない。
