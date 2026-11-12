@@ -29,6 +29,14 @@
 //!   作り直しの固定の文だけ）。書くのは専用スレッドで、有界の待ち行列に `try_send` する（満杯なら捨てる）ため、
 //!   stderr の詰まりで判定・応答が止まらない
 //!
+//! # アイドル終了（`--idle-exit-secs SECS`。REQ-39・#727）
+//!
+//! 指定したときだけ、最後の要求（接続の受け付けと終了）から SECS 秒、処理中の接続が無ければ、worker を先に
+//! 止め、自分が bind したソケット（dev・ino が一致するもののみ）を消して exit 0 で終わる。待ち受けを始めた
+//! 時刻が最終活動の初期値。`serve.lock` のファイルは消さない（flock はプロセス終了で解放される）。終了の確定と
+//! 接続の受け付けは同じロックの下にあり、確定後の接続は返事をせず閉じる（委ねる側は単独へ戻る）。
+//! 未指定なら終わらない。確認は約 0.2 秒ごと。
+//!
 //! # 見張りと作り直し（REQ-39・#709）
 //!
 //! 上限は単独の監督と同じ種類別の値（`safety_limits_for_kind`）。1 件の時間の上限の値は変えていない
@@ -1055,19 +1063,39 @@ fn run_parent<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result
     {
         return emit_startup_error(out, &runtime("cannot start serve judge thread"));
     }
+    let activity = Arc::new(Activity::new(Instant::now()));
+    if let Some(secs) = args.idle_exit_secs {
+        let socket = listener
+            .local_addr()
+            .ok()
+            .and_then(|a| a.as_pathname().map(Path::to_path_buf))
+            .and_then(|path| SocketId::of(&path).map(|id| (path, id)));
+        if spawn_idle_thread(
+            Duration::from_secs(secs),
+            secs,
+            Arc::clone(&activity),
+            socket,
+        )
+        .is_err()
+        {
+            return emit_startup_error(out, &runtime("cannot start serve idle thread"));
+        }
+    }
     log_line(format_args!("ready"));
-    let active = Arc::new(AtomicUsize::new(0));
     loop {
         let Ok((stream, _)) = listener.accept() else {
             thread::sleep(Duration::from_millis(50));
             continue;
         };
-        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            active.fetch_sub(1, Ordering::SeqCst);
-            reply(stream, &limit_response());
-            continue;
-        }
-        let guard = ConnGuard(Arc::clone(&active));
+        let guard = match activity.admit(Instant::now()) {
+            Admit::Ok => ConnGuard(Arc::clone(&activity)),
+            Admit::Full => {
+                reply(stream, &limit_response());
+                continue;
+            }
+            // アイドル終了が確定した後の接続。返事をせず閉じる（委ねる側は単独へ戻る）。
+            Admit::Closing => continue,
+        };
         let (identity, tx) = (Arc::clone(&identity), tx.clone());
         // 起動に失敗したらクロージャごと guard が落ち、接続も閉じる。
         let _ = thread::Builder::new()
@@ -1079,13 +1107,147 @@ fn run_parent<W: Write>(out: &mut W, args: &ServeArgs, cwd: &Path) -> io::Result
     }
 }
 
+/// 接続の出入りと最終活動時刻（#727・REQ-39）。同時接続数の上限判定とアイドル終了の判断を同じロックの下に
+/// 置き、「アイドルと決めた直後に来た接続を、worker を止めた後で処理する」競合を作らない。
+struct Activity(Mutex<ActivityState>);
+
+struct ActivityState {
+    active: usize,
+    last: Instant,
+    closing: bool,
+}
+
+/// [`Activity::admit`] の結果。
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Ok,
+    /// 同時接続数が [`MAX_CONNECTIONS`] に達している。
+    Full,
+    /// アイドル終了が確定している。
+    Closing,
+}
+
+impl Activity {
+    fn new(now: Instant) -> Self {
+        Self(Mutex::new(ActivityState {
+            active: 0,
+            last: now,
+            closing: false,
+        }))
+    }
+
+    fn state(&self) -> MutexGuard<'_, ActivityState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 接続を受け入れる。`Ok` のときは呼び出し側が [`ConnGuard`] を作り、終了時に [`Self::release`] を呼ぶ。
+    fn admit(&self, now: Instant) -> Admit {
+        let mut st = self.state();
+        if st.closing {
+            return Admit::Closing;
+        }
+        st.last = now;
+        if st.active >= MAX_CONNECTIONS {
+            return Admit::Full;
+        }
+        st.active += 1;
+        Admit::Ok
+    }
+
+    fn release(&self, now: Instant) {
+        let mut st = self.state();
+        st.active = st.active.saturating_sub(1);
+        st.last = now;
+    }
+
+    /// 処理中の接続が無く、最終活動から `limit` 以上経っていれば、以後の接続を拒否して真を返す（冪等）。
+    fn try_close_if_idle(&self, now: Instant, limit: Duration) -> bool {
+        let mut st = self.state();
+        if st.closing {
+            return true;
+        }
+        if st.active == 0 && now.saturating_duration_since(st.last) >= limit {
+            st.closing = true;
+        }
+        st.closing
+    }
+}
+
 /// 同時接続数の計数を Drop で戻す。
-struct ConnGuard(Arc<AtomicUsize>);
+struct ConnGuard(Arc<Activity>);
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.release(Instant::now());
     }
+}
+
+/// bind したソケットの同一性（dev・ino）。アイドル終了で消すのは、これと一致する自分のソケットだけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketId {
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketId {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = fs::symlink_metadata(path).ok()?;
+        meta.file_type().is_socket().then(|| Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+/// `id` と同一のソケットだけを消す。差し替えられたもの・通常ファイル・symlink には触れない。
+/// 無ければ成功扱い。消せたか（または既に無いか）を返す。
+fn remove_own_socket(path: &Path, id: SocketId) -> bool {
+    match fs::symlink_metadata(path) {
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+        Ok(meta) => {
+            meta.file_type().is_socket()
+                && meta.dev() == id.dev
+                && meta.ino() == id.ino
+                && fs::remove_file(path).is_ok()
+        }
+    }
+}
+
+/// アイドル終了の見張り（`--idle-exit-secs`。REQ-39・#727）。親だけが持つ。
+///
+/// 最後の要求から `limit` 経ったら、worker を先に止め、自分のソケットを消して exit 0 で終わる。
+/// `serve.lock` は消さない（プロセス終了で flock が解放される。ファイルを消すと別プロセスの open と競合する）。
+fn spawn_idle_thread(
+    limit: Duration,
+    secs: u64,
+    activity: Arc<Activity>,
+    socket: Option<(PathBuf, SocketId)>,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("serve-idle".to_string())
+        .spawn(move || {
+            loop {
+                thread::sleep(IDLE_CHECK_INTERVAL);
+                if EXITING.load(Ordering::SeqCst) {
+                    return;
+                }
+                if !activity.try_close_if_idle(Instant::now(), limit) {
+                    continue;
+                }
+                if !begin_exit() {
+                    return;
+                }
+                log_line(format_args!("idle for {secs} s; exiting"));
+                kill_worker();
+                if let Some((path, id)) = &socket
+                    && !remove_own_socket(path, *id)
+                {
+                    log_line(format_args!("cannot remove serve socket"));
+                }
+                finish_exit(ExitCode::Ok);
+            }
+        })
+        .map(|_| ())
 }
 
 /// 起動の失敗。
@@ -1258,6 +1420,10 @@ fn judge_loop(rx: &mpsc::Receiver<Job>, mut io: WorkerIo, ctx: &JudgeCtx) {
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
+        // 終了中（アイドル終了を含む）に worker を作り直さない。
+        if EXITING.load(Ordering::SeqCst) {
+            return;
+        }
         // 待っている間に worker が止まっていたら（外からの kill・見張りによる停止）、次の要求が読み込み時間を
         // 払わずに済むよう先に作り直す。
         if !io.is_idle() {
@@ -1852,5 +2018,67 @@ mod tests {
         assert_eq!(barren_streak(2, true), 0);
         assert_eq!(barren_streak(0, true), 0);
         assert_eq!(barren_streak(u32::MAX, false), u32::MAX);
+    }
+    /// REQ-39・#727: `Activity` のアイドル判断。ちょうど `limit` で真、処理中は経過しても偽、
+    /// 接続が終わると数え直す。確定後の接続は `Closing`、確定は冪等。
+    #[test]
+    fn req39_activity_idle_decision() {
+        let t0 = Instant::now();
+        let limit = Duration::from_secs(10);
+        let a = Activity::new(t0);
+        assert!(!a.try_close_if_idle(t0 + Duration::from_secs(9), limit));
+        assert_eq!(a.admit(t0 + Duration::from_secs(9)), Admit::Ok);
+        // 処理中は何秒経っても閉じない。
+        assert!(!a.try_close_if_idle(t0 + Duration::from_secs(100), limit));
+        a.release(t0 + Duration::from_secs(100));
+        assert!(!a.try_close_if_idle(t0 + Duration::from_secs(109), limit));
+        assert!(a.try_close_if_idle(t0 + Duration::from_secs(110), limit));
+        assert_eq!(a.admit(t0 + Duration::from_secs(111)), Admit::Closing);
+        assert!(a.try_close_if_idle(t0 + Duration::from_secs(111), limit));
+    }
+
+    /// REQ-39・#727: 同時接続の上限は `Activity` の中で判定する。
+    #[test]
+    fn req39_activity_enforces_connection_limit() {
+        let t0 = Instant::now();
+        let a = Activity::new(t0);
+        for _ in 0..MAX_CONNECTIONS {
+            assert_eq!(a.admit(t0), Admit::Ok);
+        }
+        assert_eq!(a.admit(t0), Admit::Full);
+        a.release(t0);
+        assert_eq!(a.admit(t0), Admit::Ok);
+    }
+
+    fn short_dir(tag: &str) -> PathBuf {
+        let dir = PathBuf::from(format!("/tmp/fe-idle-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// REQ-39・#727: 自分が bind したソケット（dev・ino 一致）だけを消す。差し替えられたものには触れず、
+    /// 無ければ成功扱い。
+    #[test]
+    fn req39_remove_own_socket_checks_identity() {
+        let dir = short_dir("own");
+        let sock = dir.join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let id = SocketId::of(&sock).expect("id");
+        assert!(remove_own_socket(&sock, id));
+        assert!(!sock.exists());
+        assert!(remove_own_socket(&sock, id), "missing counts as removed");
+        // 別のソケットに差し替わった（ino が違う）。
+        let other = UnixListener::bind(&sock).expect("bind other");
+        assert_ne!(SocketId::of(&sock), Some(id));
+        assert!(!remove_own_socket(&sock, id));
+        assert!(sock.exists());
+        fs::remove_file(&sock).expect("rm");
+        // 通常ファイルに差し替わった。
+        fs::write(&sock, b"x").expect("write");
+        assert!(!remove_own_socket(&sock, id));
+        assert!(sock.exists());
+        drop((listener, other));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
