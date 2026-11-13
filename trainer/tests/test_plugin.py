@@ -61,7 +61,12 @@ def test_req33_structure() -> None:
 
 
 def _run(
-    tmp_path: Path, env_extra: dict[str, str], *, stub: bool = True
+    tmp_path: Path,
+    env_extra: dict[str, str],
+    *,
+    stub: bool = True,
+    cwd: Path | None = None,
+    path: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     bindir = tmp_path / "bin"
     bindir.mkdir(parents=True, exist_ok=True)
@@ -72,7 +77,7 @@ def _run(
         s.write_text(STUB, encoding="utf-8")
         s.chmod(0o755)
     # 本物の fandhe-edge を拾わないよう PATH は stub と最小限だけにする。
-    env = {"PATH": f"{bindir}:/usr/bin:/bin", "STUB_LOG": str(log), **env_extra}
+    env = {"PATH": path or f"{bindir}:/usr/bin:/bin", "STUB_LOG": str(log), **env_extra}
     return subprocess.run(  # noqa: S603  固定の引数
         ["/bin/sh", str(WRAPPER), "--text", "hello"],
         env=env,
@@ -80,6 +85,7 @@ def _run(
         text=True,
         timeout=30,
         check=False,
+        cwd=cwd,
     )
 
 
@@ -144,3 +150,16 @@ def test_req39_package_outside_cwd(tmp_path: Path) -> None:
     r = _run(tmp_path, {"FANDHE_EDGE_PACKAGE": str(tmp_path / "missing" / "pkg")})
     assert r.returncode == 64
     assert json.loads(r.stdout)["code"] == "invalid_input"
+
+
+def test_req33_relative_path_entry_and_cdpath(tmp_path: Path) -> None:
+    """PATH の相対エントリと CDPATH があっても、呼び出し時の cwd 基準で動き JSON 1 つを返す。"""
+    (tmp_path / "models" / "pkg").mkdir(parents=True)
+    decoy = tmp_path / "decoy"
+    (decoy / "models").mkdir(parents=True)
+    env = {"FANDHE_EDGE_PACKAGE": "models/pkg", "CDPATH": str(decoy)}
+    r = _run(tmp_path, env, cwd=tmp_path, path="bin:/usr/bin:/bin")
+    assert r.returncode == 0
+    assert r.stdout == '{"id":"input","status":"ok"}\n'
+    cwd = Path((tmp_path / "log" / "infer.cwd").read_text().strip())
+    assert cwd.resolve() == (tmp_path / "models").resolve()

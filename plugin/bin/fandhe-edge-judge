@@ -45,14 +45,22 @@ if [ "${#idle}" -gt 19 ]; then
     fail invalid_input "FANDHE_EDGE_IDLE_EXIT_SECS is too large" 64
 fi
 
-if ! command -v fandhe-edge >/dev/null 2>&1; then
+if ! bin=$(command -v fandhe-edge 2>/dev/null); then
     fail runtime_error "fandhe-edge is not installed: cargo install --git https://github.com/Fandhe-AI/fandhe-edge-model --tag v0.1.0 --locked fandhe-edge-cli" 70
 fi
 
+# 移る前に本体を絶対パスで確定する（PATH の相対エントリは cd 後に別物を指す）
+case "$bin" in
+    /*) ;;
+    *) bin="$PWD/$bin" ;;
+esac
+
+# CDPATH を効かせない（別の場所へ移る・移動先が stdout に出て JSON を壊すのを防ぐ）
+unset CDPATH
 pkg_name=$(basename -- "$FANDHE_EDGE_PACKAGE")
 cd -- "$(dirname -- "$FANDHE_EDGE_PACKAGE")" 2>/dev/null ||
     fail invalid_input "cannot enter the parent directory of FANDHE_EDGE_PACKAGE" 64
 
-nohup fandhe-edge serve --package "$pkg_name" --idle-exit-secs "$idle" >/dev/null 2>&1 </dev/null &
+nohup "$bin" serve --package "$pkg_name" --idle-exit-secs "$idle" >/dev/null 2>&1 </dev/null &
 
-exec fandhe-edge infer --package "$pkg_name" "$@"
+exec "$bin" infer --package "$pkg_name" "$@"
