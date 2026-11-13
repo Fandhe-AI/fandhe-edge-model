@@ -21,6 +21,7 @@ WRAPPER = PLUGIN / "bin" / "fandhe-edge-judge"
 # 引数を記録し、serve は標識を書いて終わり、infer は固定 JSON を STUB_RC で返す。
 STUB = """#!/bin/sh
 echo "$@" >> "$STUB_LOG/$1.args"
+pwd > "$STUB_LOG/$1.cwd"
 if [ "$1" = serve ]; then
     : > "$STUB_LOG/serve.started"
     exit 0
@@ -129,3 +130,17 @@ def test_req21_missing_package_env_and_missing_binary(tmp_path: Path) -> None:
     r = _run(tmp_path / "nostub", {"FANDHE_EDGE_PACKAGE": "pkg"}, stub=False)
     assert r.returncode == 70
     assert json.loads(r.stdout)["code"] == "runtime_error"
+
+
+def test_req39_package_outside_cwd(tmp_path: Path) -> None:
+    """プロジェクト外のパッケージは、親へ移って名前だけ渡す（閉じ込めは緩めない）。"""
+    models = tmp_path / "models"
+    (models / "pkg").mkdir(parents=True)
+    r = _run(tmp_path, {"FANDHE_EDGE_PACKAGE": str(models / "pkg")})
+    assert r.returncode == 0
+    log = tmp_path / "log"
+    assert (log / "infer.args").read_text() == "infer --package pkg --text hello\n"
+    assert Path((log / "infer.cwd").read_text().strip()).resolve() == models.resolve()
+    r = _run(tmp_path, {"FANDHE_EDGE_PACKAGE": str(tmp_path / "missing" / "pkg")})
+    assert r.returncode == 64
+    assert json.loads(r.stdout)["code"] == "invalid_input"

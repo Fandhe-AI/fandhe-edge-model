@@ -8,10 +8,17 @@
 # 常駐の準備を待たず、infer が単独で行う。
 #
 # 環境変数:
-#   FANDHE_EDGE_PACKAGE         必須。パッケージのパス。ガード層の閉じ込めにより、
-#                               呼び出し時のカレントディレクトリ配下に限られる
+#   FANDHE_EDGE_PACKAGE         必須。パッケージのパス（絶対パス推奨）。プロジェクトの
+#                               外（例: ~/.fandhe-edge/package）に 1 つ置き、どの
+#                               プロジェクトからも使える
 #   FANDHE_EDGE_IDLE_EXIT_SECS  任意（既定 600。#710 の計測後に見直す推定値）。
 #                               使われない常駐が自分で終わるまでの秒数
+#
+# ガード層（REQ-39）は --package をカレントディレクトリ配下に閉じ込める。
+# パッケージの親ディレクトリへ移ってから名前だけを渡すことで、閉じ込めを
+# 緩めずにプロジェクト外のパッケージを使う。パスは利用者自身の設定から
+# 来るもので、エージェントの入力ではない。移った後は "$@" の相対パスも
+# 親ディレクトリ基準になる（skill はパスを取る引数を渡さない）。
 #
 # 名前を `fandhe-edge` にしないのは、PATH 上の本体を隠して自分自身を
 # 呼ぶ再帰を避けるため。引数は "$@" のみで、eval・文字列連結は使わない。
@@ -42,6 +49,10 @@ if ! command -v fandhe-edge >/dev/null 2>&1; then
     fail runtime_error "fandhe-edge is not installed: cargo install --git https://github.com/Fandhe-AI/fandhe-edge-model --tag v0.1.0 --locked fandhe-edge-cli" 70
 fi
 
-nohup fandhe-edge serve --package "$FANDHE_EDGE_PACKAGE" --idle-exit-secs "$idle" >/dev/null 2>&1 </dev/null &
+pkg_name=$(basename -- "$FANDHE_EDGE_PACKAGE")
+cd -- "$(dirname -- "$FANDHE_EDGE_PACKAGE")" 2>/dev/null ||
+    fail invalid_input "cannot enter the parent directory of FANDHE_EDGE_PACKAGE" 64
 
-exec fandhe-edge infer --package "$FANDHE_EDGE_PACKAGE" "$@"
+nohup fandhe-edge serve --package "$pkg_name" --idle-exit-secs "$idle" >/dev/null 2>&1 </dev/null &
+
+exec fandhe-edge infer --package "$pkg_name" "$@"

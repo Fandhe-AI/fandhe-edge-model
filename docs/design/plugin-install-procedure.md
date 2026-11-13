@@ -22,11 +22,11 @@ spec の内容は要約であり、詳細は spec の各 REQ を参照する。
 2. パッケージ
    - 利用者が用意する。モデルは同梱も取得もしない。完全性は既存の sha256 照合に任せる。
    - 第三者の重みを含む場合の再配布可否は、[licensing](../../.claude/rules/licensing.md) に従い利用者が判断する。
-   - Claude Code を起動するプロジェクトの cwd 配下に置く（例: `.fandhe-edge/package/`）。ガード層の閉じ込めにより cwd の外は使えない（REQ-39）。
+   - 置き場所はどこでもよい（例: `~/.fandhe-edge/package/`）。判定ラッパーがパッケージの親ディレクトリへ移ってから名前だけを渡すため、ガード層の閉じ込め（REQ-39）を緩めずにプロジェクト外のパッケージを使える。
    - 1 置き場所につき 1 パッケージ。
 3. 環境変数
-   - 個人用は `.claude/settings.local.json`（git 管理外）の `env` に書く。例: `{"env":{"FANDHE_EDGE_PACKAGE":".fandhe-edge/package"}}`
-   - 相対パスは、Claude Code をプロジェクトのルートで起動する前提。
+   - 全プロジェクトで使うなら `~/.claude/settings.json`、1 プロジェクトだけなら `.claude/settings.local.json`（git 管理外）の `env` に書く。例: `{"env":{"FANDHE_EDGE_PACKAGE":"/Users/<利用者>/.fandhe-edge/package"}}`
+   - 絶対パスで書く（`~` は展開されない）。相対パスは Claude Code を起動したディレクトリ基準になる。
    - `FANDHE_EDGE_IDLE_EXIT_SECS` は任意。既定 600（推定値。#710 の計測後に見直す）。
 4. 許可ルール
    - `permissions.allow` に、判定ラッパー `bin/fandhe-edge-judge` の呼び出しだけに一致するルールを 1 行足す。

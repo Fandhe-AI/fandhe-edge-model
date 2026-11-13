@@ -36,7 +36,7 @@ stdout に JSON が 1 つ出る。判定結果は `id`・`status`・`predicted_l
 ## 前提
 
 - `fandhe-edge` が PATH にあること（インストールは `plugin/README.md`）
-- `FANDHE_EDGE_PACKAGE` は、カレントディレクトリ配下のパッケージを指すこと（ガード層の制約）
+- `FANDHE_EDGE_PACKAGE` にパッケージの絶対パスが設定されていること
 - モデルはプラグインに同梱しない
 
 ## 常駐
