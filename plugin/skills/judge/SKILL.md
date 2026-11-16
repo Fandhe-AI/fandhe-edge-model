@@ -13,6 +13,7 @@ description: 利用者が用意した判定モデル（fandhe-edge-model のパ�
 "${CLAUDE_PLUGIN_ROOT}/bin/fandhe-edge-judge" --text "<入力>"
 ```
 
+- 上のコマンドを単体で呼ぶ。`; echo "exit=$?"` などを後ろに足したり、`&&`・`|` で他のコマンドとつないだりしない。つなぐと利用者の許可ルールが当たらず、毎回確認画面が出る。終了コードは Bash ツールの結果で分かる
 - `--package` は付けない。環境変数 `FANDHE_EDGE_PACKAGE` から渡される
 - `--id`・`--input-file`・`--out`・`--version-ledger` は付けない。付けると常駐に委ねず単独の判定になる
 - 入力は 1 MiB 以下にする（超えると常駐に委ねない）
@@ -30,7 +31,7 @@ stdout に JSON が 1 つ出る。判定結果は `id`・`status`・`predicted_l
 | 11 | out_of_scope | 範囲外。結果行は出る |
 | 12 | pending | `status` が `abstain` の保留。判断を人へ返す |
 | 20 | limit_exceeded | 時間・サイズ・RSS の上限超過 |
-| 64 | invalid_input | 引数・環境変数の誤り。直して再実行する |
+| 64 | invalid_input | 引数の誤りなら直して再実行する。`FANDHE_EDGE_PACKAGE` の未設定・誤りなら、パッケージを探し回らずに利用者へ報告する（どのモデルを使うかは利用者が決める） |
 | 70 | runtime_error | `fandhe-edge` の不在など。利用者へ報告する |
 
 ## 前提
