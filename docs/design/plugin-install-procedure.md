@@ -32,9 +32,12 @@ spec の内容は要約であり、詳細は spec の各 REQ を参照する。
    - `permissions.allow` に、判定ラッパー `bin/fandhe-edge-judge` の呼び出しだけに一致するルールを 1 行足す。
    - 広い許可（`Bash(*)`・`sh`・`fandhe-edge` 全体）は勧めない。
    - 正確な書式は第 3 節の項目 0 で確定し、本節へ追記する（確定前に書式を断定しない）。
+   - 2026-11-16 の実機確認（Claude Code 2.1.325）では確定できなかった。Claude が呼び出しの後ろに `; echo "exit=$?"` を足し、確認画面が 2 つのコマンドの組として出たため。skill で単体の呼び出しを求めるよう直したので、次の確認で確定する。
 5. marketplace の追加とプラグインの導入
    - `claude plugin marketplace add Fandhe-AI/fandhe-edge-model`（ローカルの clone パスでも可）の後、`claude plugin install fandhe-edge@fandhe-edge-model`。対話では `/plugin` から同じ操作ができる。
-   - コマンドの形は Claude Code の版で変わりうるため `claude plugin --help` で確かめる。実際の形と、プラグインがタグで固定されるか否かは項目 0 で確定し、追記する。
+   - コマンドの形は Claude Code の版で変わりうるため `claude plugin --help` で確かめる。
+   - 2026-11-16 の実機確認（Claude Code 2.1.325）では上の 2 コマンドで導入できた。ローカルの clone を marketplace にした場合、プラグインは clone 先のファイルをそのまま読み、タグでは固定されない（`CLAUDE_PLUGIN_ROOT` が clone 先を指す）。GitHub から追加した場合の固定のされ方は未確認。
+   - プラグインの `bin/` は Bash ツールの PATH に載る（同日の確認。`command -v fandhe-edge-judge` で `plugin/bin/` のパスが出た）。
 6. 動作確認
    - skill `judge` 経由で判定が通り、JSON が返ること。
    - 使い終えたら `fandhe-edge serve --stop` で手で止められること（出力は `{"status":"stopped"}` か `{"status":"not_running"}`）。
@@ -46,7 +49,8 @@ spec の内容は要約であり、詳細は spec の各 REQ を参照する。
 - 合成パッケージを `tmp-plugin-check/` に作る。作り方は [claude-code-permission-prompt-procedure.md](claude-code-permission-prompt-procedure.md) の第 3 節に従う（`fixtures/onnx_parity/c1.onnx` と heredoc）。
 - `cargo install --path crates/cli --locked` で `fandhe-edge` を PATH に載せる。`cargo build -p fandhe-edge-cli` を使う場合、バイナリは `target/debug/` に出るだけで PATH に入らない。`export PATH="$PWD/target/debug:$PATH"` を実行したシェルから Claude Code を起動し、PATH を引き継ぐ。判定ラッパーの `command -v` が失敗すると exit 70 になる。
 - `FANDHE_EDGE_SERVE_DIR` を一時ディレクトリへ向ける（普段使いの常駐とぶつけない）。`env` にも同じ値を書く。
-- `FANDHE_EDGE_IDLE_EXIT_SECS` は 30 など短い値にする。実測は設定値に対する値として記録する。
+- `FANDHE_EDGE_IDLE_EXIT_SECS` は 120 にする。30 秒では、判定の後に `ps` を見る前に常駐が終わってしまう（2026-11-16 の実機確認）。実測は設定値に対する値として記録する。
+- 項目 5 で「無し」を確かめるときは、`FANDHE_EDGE_PACKAGE` を空文字で上書きする。項目を消すだけだと、ユーザー全体の `settings.json` に値があればそちらが使われる。
 - 低電力モードはオフ（[ci](../../.claude/rules/ci.md) の基準）。数値にモードを明記する。
 - 常駐の有無は別ターミナルで確かめる。親と worker で 2 行出る。
 
