@@ -18,7 +18,7 @@
 //!   symlink でない 0700 の実ディレクトリで所有者が自分のときだけ使う。ファイルは 0600。`history.jsonl` が
 //!   通常ファイルでない（symlink 等）・group / other の権限がある・所有者が自分でないなら書かない
 //! - 1 行は [`fandhe_edge_core::infer_history`] の形。`output` は stdout へ出した JSON の先頭 64 KiB までの控え
-//! - 追記は `history.lock` の排他（待ち続けず数回だけ試す）の下で、`history.jsonl` を開いて検査し、その fd の
+//! - 追記は `history.lock` の排他（空くまで待つ。待ち続けにはならない。下の [`SAVE_LIMIT`]）の下で、`history.jsonl` を開いて検査し、その fd の
 //!   長さが上限 [`MAX_HISTORY_BYTES`] を超えていたら `history.jsonl.1` へ回して開き直してから `O_APPEND` で
 //!   1 回の `write_all`。検査に落ちたファイル（symlink・権限が緩い等）は回さず、触らない
 //! - 書き込みが途中で失敗したら、欠けた行が残らないよう元の長さへ戻す。回し（rename）に失敗したら書かない
@@ -60,11 +60,10 @@ pub(crate) const CAPTURE_LIMIT: usize = 64 * 1024;
 /// 履歴ファイルの上限。超えたら `.1` へ回す。
 // ponytail: 1 世代だけの持ち回し。細かい削除が要れば見直す
 const MAX_HISTORY_BYTES: u64 = 64 * 1024 * 1024;
-const LOCK_TRIES: u32 = 5;
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
-/// 保存を待つ上限。通常の保存は数 ms、ロック待ちは最大 `LOCK_TRIES × LOCK_RETRY_INTERVAL` = 100 ms なので、
-/// その数倍を取る。超えるのは置き場所が応答しないとき（止まったネットワーク上の置き場所等）だけで、
-/// そのときは保存を捨てて `infer` を終える（REQ-33・REQ-39・#711）。
+/// 保存を待つ上限。通常の保存は数 ms（ロック待ちも他プロセスの追記 1 回分）。超えるのは置き場所が応答しない
+/// ときや、ロックを持つ相手が止まっているときだけで、そのときは保存を捨てて `infer` を終える。
+/// ロックは `lock()` で空くまで待つが、`record` がこの上限で包むため待ち続けにはならず、
+/// プロセスの終了でロックも外れる（REQ-33・REQ-39・#711・#748）。
 const SAVE_LIMIT: Duration = Duration::from_millis(500);
 
 /// 書き込みをそのまま `inner` へ通しつつ、先頭 [`CAPTURE_LIMIT`] バイトまでを控える。
@@ -157,25 +156,16 @@ fn append(line: &[u8]) -> io::Result<()> {
 }
 
 /// `dir` の `history.lock` の排他の下で、`history.jsonl` が `max` バイトを超えていれば `.1` へ回してから
-/// `line` を 1 回の `write_all` で追記する。ロックは待ち続けず、取れなければ `WouldBlock`。
-/// 回し（rename）に失敗したら書かない。
+/// `line` を 1 回の `write_all` で追記する。ロックは空くまで待つ（競合で行を捨てない。#748）。
+/// 待ち続けにはならない: 呼び出し元の `record` が [`SAVE_LIMIT`] で包み、過ぎたら待たずに戻る。
+/// 待っているスレッドはプロセスの終了で捨てられ、ロックも外れる。回し（rename）に失敗したら書かない。
 ///
 /// 回すかどうかは、検査に通って開けた fd の長さで決める（REQ-39・#711）。検査に落ちた `history.jsonl`
 /// （symlink・権限が緩い・所有者が違う）は回さず、触らずに `Err` で戻る。
 fn append_line(dir: &Path, line: &[u8], max: u64) -> io::Result<()> {
     let dir = PrivateDir::open(dir)?;
     let lock = dir.open_append(LOCK_FILE)?;
-    let mut locked = false;
-    for _ in 0..LOCK_TRIES {
-        if lock.try_lock().is_ok() {
-            locked = true;
-            break;
-        }
-        std::thread::sleep(LOCK_RETRY_INTERVAL);
-    }
-    if !locked {
-        return Err(io::ErrorKind::WouldBlock.into());
-    }
+    lock.lock()?;
     let mut file = dir.open_append(HISTORY_FILE)?;
     let mut len = file.metadata()?.len();
     if len > max {
@@ -211,6 +201,33 @@ mod tests {
 
     fn read(d: &Path, n: &str) -> String {
         fs::read_to_string(d.join(n)).unwrap_or_default()
+    }
+
+    /// REQ-33・#748: 8 スレッドが同じ置き場所へ同時に追記しても、ロックの競合で行が欠けず、ちょうど 8 行・重複なし。
+    /// `SAVE_LIMIT` を通さないので runner の速さに左右されない。同一プロセス内の別 fd 同士でも `File::lock` が
+    /// 排他になること（flock）に依る。
+    #[test]
+    fn concurrent_append_line_keeps_every_line() {
+        let d = tmp("conc");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let d = d.clone();
+                std::thread::spawn(move || {
+                    let line = format!("{{\"n\":{i}}}\n");
+                    append_line(&d, line.as_bytes(), MAX_HISTORY_BYTES).expect("append");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+        let text = read(&d, HISTORY_FILE);
+        let mut got: Vec<&str> = text.lines().collect();
+        got.sort_unstable();
+        let mut want: Vec<String> = (0..8).map(|i| format!("{{\"n\":{i}}}")).collect();
+        want.sort_unstable();
+        assert_eq!(got, want);
+        let _ = fs::remove_dir_all(&d);
     }
 
     /// REQ-39・#711: 上限を超えたときだけ `.1` へ回り（境界は「超えた」）、3 回目で前の `.1` が置き換わって最古が消える。

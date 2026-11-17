@@ -304,9 +304,11 @@ fn make_private_dir(dir: &Path) {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod");
 }
 
-/// REQ-33・#711: 8 プロセス並列でも 8 行すべてが 1 行 1 JSON で読め、入力がそれぞれ 1 回ずつ現れる。
+/// REQ-33・#711・#748: 8 並列でも終了コード 0 で、行は重複せず壊れず、1 行以上 8 行以下。
+/// 8 行ちょうどは求めない: 保存は `SAVE_LIMIT` で打ち切る設計で、遅い runner では行が欠けうる（設計どおり）。
+/// ロックの競合で欠けないことは `infer_history` の単体テスト `concurrent_append_line_keeps_every_line` が確かめる。
 #[test]
-fn history_concurrent_appends_keep_every_line() {
+fn history_concurrent_appends_have_no_duplicate_or_broken_lines() {
     let (ws, dir) = (workspace("par"), dir_for("par"));
     let handles: Vec<_> = (0..8)
         .map(|i| {
@@ -328,10 +330,10 @@ fn history_concurrent_appends_keep_every_line() {
         h.join().expect("join");
     }
     let l = lines(&dir, "history.jsonl");
-    assert_eq!(l.len(), 8);
+    assert!((1..=8).contains(&l.len()), "{}", l.len());
     for i in 0..8 {
         let needle = format!(r#""text":"input-{i}""#);
-        assert_eq!(l.iter().filter(|x| x.contains(&needle)).count(), 1, "{i}");
+        assert!(l.iter().filter(|x| x.contains(&needle)).count() <= 1, "{i}");
     }
     for x in &l {
         assert!(x.starts_with("{\"time\":") && x.ends_with('}'), "{x}");
@@ -341,7 +343,8 @@ fn history_concurrent_appends_keep_every_line() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// REQ-33・REQ-39・#711: `history.lock` が取られたままでも infer は待たずに戻り、出力・終了コードは同じで履歴は増えない。
+/// REQ-33・REQ-39・#711・#748: `history.lock` が取られたままでも、保存は `SAVE_LIMIT` まで待って諦め infer は戻る。
+/// 出力・終了コードは同じで履歴は増えない。
 #[test]
 fn history_lock_held_skips_without_changing_output() {
     let (ws, dir) = (workspace("lock"), dir_for("lock"));
