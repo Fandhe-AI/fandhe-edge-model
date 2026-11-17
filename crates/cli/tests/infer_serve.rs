@@ -1056,9 +1056,13 @@ fn req39_connection_limit_returns_limit_exceeded_for_large_request() {
     let mut run = None;
     let mut held = Vec::new();
     for _ in 0..3 {
+        // 前の回の接続を先に閉じる（閉じずに 64 本を足すと、新しい接続が上限で断られる）。
+        held.clear();
         held = (0..64)
             .map(|_| UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect"))
             .collect::<Vec<UnixStream>>();
+        // 読み取りの期限（10 秒）は常駐が受け付けた時点から数えるので、経過は塞いだ時点から測る（#750）。
+        let filled = Instant::now();
         // 常駐が 64 本とも受け付けて数えるまで待つ: 何も送らない追加の接続に、読まずに `limit_exceeded` が
         // 返ってくれば上限に達している。
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -1077,9 +1081,9 @@ fn req39_connection_limit_returns_limit_exceeded_for_large_request() {
                 "the connection limit was not reached"
             );
         }
-        let filled = Instant::now();
         let got = infer(&ws, &dir, "c", false, &text);
         // 塞いでから 5 秒以内に終わっていれば、枠はまだ空いていない（読み取りの期限 10 秒の半分）。
+        // 上限の確認（最大 8 秒）に時間がかかった回は 5 秒を超えるので、委ねられていれば塞ぎ直す。
         let in_time = filled.elapsed() < Duration::from_secs(5);
         let limited = got.code == Some(20);
         run = Some(got);
