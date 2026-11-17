@@ -1064,10 +1064,12 @@ fn req39_connection_limit_returns_limit_exceeded_for_large_request() {
         let connect = || UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect");
         held.extend((0..64).map(|_| connect()));
         // 常駐が上限まで受け付けて数えるまで待つ: 何も送らない追加の接続に、読まずに `limit_exceeded` が
-        // 返ってくれば上限に達している。達していなければ、断られた分を補うため 8 本足して確かめ直す。
+        // 返ってくれば上限に達している。達していなければ、その接続は受け付けられて枠を 1 つ占めているので、
+        // 閉じずに塞ぐ側へ回し（閉じると枠が空いて次の確認が同じ枠を取り続ける）、断られた分を補うため
+        // 8 本足して確かめ直す（#750）。
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
-            let mut probe = UnixStream::connect(dir.join(SOCKET_FILE)).expect("connect");
+            let mut probe = connect();
             probe
                 .set_read_timeout(Some(Duration::from_millis(200)))
                 .expect("timeout");
@@ -1080,6 +1082,7 @@ fn req39_connection_limit_returns_limit_exceeded_for_large_request() {
                 Instant::now() < deadline,
                 "the connection limit was not reached"
             );
+            held.push(probe);
             held.extend((0..8).map(|_| connect()));
         }
         let got = infer(&ws, &dir, "c", false, &text);
