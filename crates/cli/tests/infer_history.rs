@@ -304,12 +304,22 @@ fn make_private_dir(dir: &Path) {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod");
 }
 
-/// REQ-33・#711・#748: 8 並列でも終了コード 0 で、行は重複せず壊れず、1 行以上 8 行以下。
-/// 8 行ちょうどは求めない: 保存は `SAVE_LIMIT` で打ち切る設計で、遅い runner では行が欠けうる（設計どおり）。
-/// ロックの競合で欠けないことは `infer_history` の単体テスト `concurrent_append_line_keeps_every_line` が確かめる。
+/// REQ-33・#711・#748: 8 プロセス並列でも 8 行すべてが 1 行 1 JSON で読め、入力がそれぞれちょうど 1 回現れ、終了コードは 0。
+/// 意図した欠け（`SAVE_LIMIT` で諦める）は `history_lock_held_skips_without_changing_output` が確かめる。
+/// 単体テスト `concurrent_append_line_keeps_every_line` も `append_line` の競合を確かめる。
+/// 決定的にするため、置き場所（0700）と空の `history.lock`（0600）を先に作る。`history.lock` の初回作成の競合
+/// （guard `private_file` の ENOENT 再試行。#748 の範囲外）をこのテストの対象から外すため。
+/// `history.jsonl` はロックの下で作られるので先には作らない。
 #[test]
-fn history_concurrent_appends_have_no_duplicate_or_broken_lines() {
+fn history_concurrent_appends_keep_every_line() {
     let (ws, dir) = (workspace("par"), dir_for("par"));
+    make_private_dir(&dir);
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(dir.join("history.lock"))
+        .expect("lock file");
     let handles: Vec<_> = (0..8)
         .map(|i| {
             let (ws, dir) = (ws.clone(), dir.clone());
@@ -330,10 +340,10 @@ fn history_concurrent_appends_have_no_duplicate_or_broken_lines() {
         h.join().expect("join");
     }
     let l = lines(&dir, "history.jsonl");
-    assert!((1..=8).contains(&l.len()), "{}", l.len());
+    assert_eq!(l.len(), 8);
     for i in 0..8 {
         let needle = format!(r#""text":"input-{i}""#);
-        assert!(l.iter().filter(|x| x.contains(&needle)).count() <= 1, "{i}");
+        assert_eq!(l.iter().filter(|x| x.contains(&needle)).count(), 1, "{i}");
     }
     for x in &l {
         assert!(x.starts_with("{\"time\":") && x.ends_with('}'), "{x}");
