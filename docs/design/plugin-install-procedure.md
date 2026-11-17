@@ -31,8 +31,9 @@ spec の内容は要約であり、詳細は spec の各 REQ を参照する。
 4. 許可ルール
    - `permissions.allow` に、判定ラッパー `bin/fandhe-edge-judge` の呼び出しだけに一致するルールを 1 行足す。
    - 広い許可（`Bash(*)`・`sh`・`fandhe-edge` 全体）は勧めない。
-   - 正確な書式は第 3 節の項目 0 で確定し、本節へ追記する（確定前に書式を断定しない）。
-   - 2026-11-16 の実機確認（Claude Code 2.1.325）では確定できなかった。Claude が呼び出しの後ろに `; echo "exit=$?"` を足し、確認画面が 2 つのコマンドの組として出たため。skill で単体の呼び出しを求めるよう直したので、次の確認で確定する。
+   - 書式は `Bash(<プラグインの絶対パス>/bin/fandhe-edge-judge *)`。`<プラグインの絶対パス>` は `CLAUDE_PLUGIN_ROOT` の値で、確認画面の「Yes, and don't ask again for:」に表示される。選ぶとプロジェクトの `.claude/settings.local.json` に保存される。
+   - 2026-11-18 の実機確認（Claude Code 2.1.326・ローカルの clone を marketplace にした場合）で確定した。呼び出しは単体で、確認画面にも 1 つのコマンドとして出た。ルールを保存した後の呼び出しでは確認画面が出なかった。
+   - GitHub から追加した場合のプラグインの置き場所と、プラグインを更新したときにルールのパスが変わるかは未確認。
 5. marketplace の追加とプラグインの導入
    - `claude plugin marketplace add Fandhe-AI/fandhe-edge-model`（ローカルの clone パスでも可）の後、`claude plugin install fandhe-edge@fandhe-edge-model`。対話では `/plugin` から同じ操作ができる。
    - コマンドの形は Claude Code の版で変わりうるため `claude plugin --help` で確かめる。
