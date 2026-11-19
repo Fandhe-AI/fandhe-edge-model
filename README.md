@@ -59,6 +59,39 @@
 
 `package` は配布用の `package/artifact.json` に `definition_sha256`（`package/definition.json` のバイト列の sha256）も追記し、`infer` は欄があれば `definition.json` と照合して、不一致を `invalid_input`（`package definition does not match its recorded hash`）で拒否します（欄の無い旧パッケージは照合しません）。あわせて `package` は版管理台帳 `<project>/version_ledger.json` に、配布用 `artifact.json`・`data/train.jsonl`・`selection_record.json` の sha256 を同じ版 ID（`v1`・`v2`…）で記録して読み取り専用にし、stdout の末尾に `"version":{"id","previous"}` を載せます（`--previous-project-dir OLD` で OLD の台帳を照合して引き継ぎます）。`infer --version-ledger L [--version-id V]` は配布用 `artifact.json` を台帳の model 版と照合してから推論します（前版への復帰。定義・ONNX・校正は `artifact.json` の記録を介して束縛されます。台帳ファイル自体の改変は検出しません。REQ-39・#491）。
 
+## Claude Code プラグイン（#726・REQ-33・REQ-36・REQ-38）
+
+自分で作った判定モデルを、Claude Code から skill `judge` で呼べます。プラグインの中身は skill と判定ラッパーだけで、モデルとバイナリは同梱しません。
+
+- 導入: [plugin/README.md](./plugin/README.md)。詳しい手順は [plugin-install-procedure](./docs/design/plugin-install-procedure.md)
+- 公開前に確かめたことと残っていること: [plugin-release-checklist](./docs/design/plugin-release-checklist.md)
+
+### 正答率の目安
+
+モデルは利用者が自分のデータで作るため、正答率は選択肢と例文で変わります。下は本リポジトリで試した 1 つの例で、保証する値ではありません。この例のモデル・例文・評価データは配布していません。
+
+例: Playwright MCP 0.0.83 のツール選択（26 択）。モデルは既定候補のバイト CNN（kind `c3`・配布 0.6 MB）。証拠種別は実機（Mac・Apple Silicon）。
+
+| 何で測ったか | 件数 | 値 | 注 |
+| ------------ | ---- | -- | -- |
+| 凍結した試験データ（1 回だけ適用） | 324 | 84.7% | 学習が 757 場面の時点（#705） |
+| 作り置きの確認用データ（半分は学習に無い画面・目的） | 324 | 93.0 ± 0.8% | 学習 2,946 場面・学習のやり直し 5 回の平均。学習量を決める判断に何度も使ったため、試験より甘く出うる（#705） |
+| 実際の作業で Claude が選んだツールとの一致（1 回目） | 55 | 68%（37.6 件） | 判定を見せずに集めた文。5 回の平均（#704） |
+| 同上（2 回目。中身を読む作業が多め） | 29 | 50%（14.4 件） | 同上（#704） |
+
+- 実際の作業の文は短く、操作の決め手が書かれないことが多いため、作り置きのデータより下がります。Claude の選択が唯一の正解とは限りません
+- 判定にかかる時間は中央値 12 ms・p95 23 ms でした（常駐あり・低電力モードはオフ。#726）
+
+### 既知の制約
+
+- 確かめた環境は macOS（Apple Silicon）と Claude Code 2.1.325・2.1.326 だけです
+- モデル（パッケージ）は同梱しません。`register` から `package` までの工程で自分で作ります。学習ワーカーは Python（uv）と MLX を使います。判定（`infer`・`serve`）は Python なしで動きます
+- バイナリは Rust（cargo）でビルドして入れます。ビルド済みのバイナリは配っていません
+- 置き場所 1 つにつきパッケージ 1 つです。複数のモデルの切り替えは扱いません
+- 常駐に委ねるのは `infer --text`（1 回に 1 文）だけです
+- 判定の履歴は既定で保存しません。有効にすると入力の全文が手元のファイルに平文で残ります（下の「判定の履歴の保存」）
+- 推論・常駐は通信しません。通信するのは導入のとき（`cargo install --git` と marketplace の取得）だけです
+
 ## 常駐プロセス `serve`（#708・#709・REQ-21・REQ-33・REQ-38・REQ-39）
 
 `fandhe-edge serve --package <dir>` は 7 工程の外にある補助コマンドです。前景で動き、起動時に worker 子プロセスを起こし、worker がパッケージを `infer` と同じ検査（sha256 の全量照合を含む）で読み込んで保持します。親は `infer --text` の要求を Unix ソケットで受け、worker へ渡します。親は置き場所・ロック・ソケット・待ち行列・見張りを受け持ちます。複数のプロジェクト・セッションが 1 つの常駐を共有し、重いモデルの読み込みを 1 回に抑えます。
