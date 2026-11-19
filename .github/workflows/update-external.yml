@@ -68,6 +68,10 @@ jobs:
       # JSON の引用符の入れ子で読み違えないよう、引用符を解釈しない folded scalar で渡す
       runner-json: >-
         "ubuntu-latest"
+      # docs/spec は .gitmodules で update = none にしている（spec を読めない利用者の
+      # `cargo install --git` が submodule の取得で失敗しないようにするため。#758）。
+      # 日次の参照更新は続けたいので、checkout で更新させる
+      submodule-force-checkout: true
       # auto-merge はマージ可否を左右する設定のため、組織変数を呼び出し側で解決して渡す。
       # 未設定（null/空）を有効と解釈する composite action の非対称設計に合わせ、
       # 明示的に 'false' へフォールバックしオプトイン運用とする。

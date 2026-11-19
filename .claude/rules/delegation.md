@@ -30,5 +30,5 @@ main が直接ファイルを読むのは、委譲結果の確認や小さなピ
 ## 注意
 
 - spec の内容を報告する際は REQ-n・TASK-n を併記する（[spec-reference](./spec-reference.md)）
-- `docs/spec` は環境によって未解決（private・要アクセス権）。未取得なら `make submodule`（`git submodule update --init`）を案内し、推測で補わない
+- `docs/spec` は環境によって未解決（private・要アクセス権）。未取得なら `make submodule`（`git submodule update --init --checkout`。`.gitmodules` が `update = none` のため `--checkout` が要る。#758）を案内し、推測で補わない
 - 複数の独立した調査は 1 メッセージで並列に委譲する
