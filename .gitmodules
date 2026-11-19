@@ -1,3 +1,4 @@
 [submodule "docs/spec"]
 	path = docs/spec
 	url = https://github.com/Fandhe-AI/fandhe-edge-model-spec.git
+	update = none
