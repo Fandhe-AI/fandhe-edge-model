@@ -20,7 +20,8 @@
 | spec を読めない利用者も `cargo install --git` で導入できる | AI | 済 | テストハーネス。#758（GitHub からの導入は第 3 節） |
 | `claude plugin validate` が marketplace とプラグインの両方で通る | AI | 済 | 手元。2026-11-19。Claude Code 2.1.328 |
 | 版が 3 か所（`Cargo.toml`・`plugin.json`・`marketplace.json`）で揃っている | AI | 済 | 機械照合。`trainer/tests/test_plugin.py`（`make py-ci`） |
-| 入れたバイナリが学習側（Python・MLX）なしで動く | AI | 済 | 実機。2026-11-19。`make check-runtime-linkage`（動的リンクは OS 標準のライブラリだけ。`env -i` で推論が通る。REQ-32） |
+| 推論ランタイムが学習側（Python・MLX）なしで動く | AI | 済 | 実機。2026-11-19。`make check-runtime-linkage`（動的リンクは OS 標準のライブラリだけ。`env -i` で推論するのはランタイムの `env_isolation`、CLI は `infer --help` の起動だけ。REQ-32） |
+| 導入した CLI が `env -i` 下で配布パッケージを読んで推論する | 人 | 未 | 記録なし（AGENTS.md「`env -i` 環境での推論」の未確認範囲。普段の環境での推論は上の #726 の実機確認で済） |
 | 正答率の目安と既知の制約を README に書いた | AI | 済 | #760 |
 | プラグイン一式に資格情報・評価データ・例文・履歴の本文が入っていない | AI | 済 | 手元。2026-11-19。`plugin/`・`.claude-plugin/` は定義・skill・ラッパー・README の 5 ファイルだけ |
 | 依存のライセンスが許可の範囲に収まる | AI | 済 | CI の `cargo deny`（[licensing](../../.claude/rules/licensing.md)）。モデルは同梱しない |
